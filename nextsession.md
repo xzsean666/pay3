@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，并完成 Phase 5 `workers/scanner` tick contract 初版和 `services/collections` prefunded 初版。
+仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，并完成 Phase 5 `workers/scanner` tick contract 初版、`services/collections` prefunded 初版和 collector broadcast tick 初版。
 
 已完成：
 
@@ -50,6 +50,12 @@
   - 只通过 `PaymentPageMatcher` / `TransferLogReader::logs_page` 跑 paged payment matching，不直接扫 RPC。
   - 使用 `commit_scanned_batch` 同事务提交 matched Pay3 payments、订单重算和 `chain_cursors.last_scanned_block` 推进。
   - 空 page 可推进到 KV `last_completed_block`；page limit 未覆盖完整新区块时不推进 cursor。
+- `src/workers/collector.rs`: collector worker broadcast tick contract 初版：
+  - 通过 `CollectionJobPreparer` 调用 `services/collections` 准备 queued collection job。
+  - 只在 service 已返回 persisted outbound + signed tx 后广播 raw signed tx。
+  - 校验链返回的 tx hash 必须等于 signed/outbound tx hash；不一致时 fail closed，不调用 `mark_broadcast`。
+  - 广播成功后调用 `OutboundRepository::mark_broadcast`，让 collections/outbound 状态推进到 confirming/broadcast。
+  - 仍缺重启后扫描 signed/broadcast outbound 的恢复 tick、receipt confirmation sweep、same nonce replacement。
 - 订单 API 初版：
   - `POST /v1/orders`: `orders:create` scope，解析 decimal `amount` -> raw amount，返回 `201 created` 或幂等 `200 ok`。
   - `GET /v1/orders/{id}`: `orders:read` scope。
@@ -83,16 +89,16 @@
 
 - `cargo fmt -- --check`: 通过。
 - `cargo check`: 通过。
-- `cargo test`: 通过，107 个库测试 + 56 个 integration/contract 测试：
+- `cargo test`: 通过，111 个库测试 + 56 个 integration/contract 测试：
   - chain 2、manual verify service 5、migration 6、order verify API 8、payment matching 9、payment window lookup 4、repository 5、signer 5、transfer log redb 7、transfer log store types 5。
 
 ## 多 Agent 审计结论
 
-当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store redb-backed runtime 初版、M12 付款匹配纯 service、手动 verify service/API route contract、scanner worker tick contract 初版和 `services/collections` prefunded 初版已经完成并通过编译/静态 contract 测试，但还没有真实 DB/RPC API wiring、真实 DB 集成测试、Anvil ERC20 集成测试、scanner runtime loop/confirmation sweep/readiness、collector worker runtime loop、collect broadcast/retry/replacement 崩溃恢复、部署工件和演练记录。
+当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store redb-backed runtime 初版、M12 付款匹配纯 service、手动 verify service/API route contract、scanner worker tick contract 初版、`services/collections` prefunded 初版和 collector broadcast tick 初版已经完成并通过编译/静态 contract 测试，但还没有真实 DB/RPC API wiring、真实 DB 集成测试、Anvil ERC20 集成测试、scanner runtime loop/confirmation sweep/readiness、collector worker recovery loop、collect receipt/retry/replacement 崩溃恢复、部署工件和演练记录。
 
 原因：
 
-- 仓库还没有订单 API 的真实 DB/RPC runtime wiring、manual verify 的真实 runtime wiring、scanner runtime loop/confirmation sweep/metrics/readiness、collector worker runtime loop、collect broadcast/retry/replacement 崩溃恢复、真实 DB 集成测试、Anvil ERC20 集成测试、部署和 runbook 演练记录。
+- 仓库还没有订单 API 的真实 DB/RPC runtime wiring、manual verify 的真实 runtime wiring、scanner runtime loop/confirmation sweep/metrics/readiness、collector worker recovery loop、collect receipt/retry/replacement 崩溃恢复、真实 DB 集成测试、Anvil ERC20 集成测试、部署和 runbook 演练记录。
 - 地址复用在 ERC20 场景无法绝对消除迟到付款歧义，已从 MVP 砍掉。
 - collect 不能允许任意 `to_address`，必须固定 treasury。
 - 需要 reorg/finality 处理，否则可能把孤块付款标为 `paid`。
@@ -232,7 +238,9 @@
    - 创建 collection 固定写配置 treasury，要求订单 `paid` 且 chain/token 匹配，生成 canonical request_hash，调用 `CollectionRepository::create_collection_idempotent`。
    - prefunded job 准备流程：claim queued collection、检查 token balance、prefunded gas gate、signer health、reserve nonce、构造 ERC20 transfer calldata、sign、`insert_signed_tx`、`attach_outbound_tx`、audit。
    - 单测覆盖 treasury-only 创建、unpaid 拒绝、余额不足、gas gate 在 nonce/sign 前 fail closed、签名和 outbound 持久化、ERC20 calldata。
-   - 仍需 collector worker runtime loop、broadcast signed tx、broadcast 前/后崩溃恢复、receipt confirmation、same nonce replacement、真实 DB 原子化/并发测试和 API route。
+   - `workers/collector.rs` 已有 broadcast tick 初版：准备 job 后广播 signed raw tx、校验 tx hash、调用 `mark_broadcast`。
+   - collector 单测覆盖 no job、broadcast success、hash mismatch fail closed、不合法 worker id。
+   - 仍需 collector recovery loop、扫描 signed/broadcast outbound、broadcast 前/后崩溃恢复、receipt confirmation、same nonce replacement、真实 DB 原子化/并发测试和 API route。
 21. 用 Anvil + mock ERC20 做全流程 e2e，并补并发、reorg、KVDB rebuild、RPC 切换、崩溃恢复、metrics/alert/runbook drill。
 
 ## 全局进度板
@@ -261,7 +269,7 @@
 | scanner worker | 部分完成 | tick contract 初版已完成：lease/CAS、KV reorg epoch、paged matcher、commit batch；runtime loop、confirmation sweep、rolling lookback/coverage gate、metrics/readiness 未完成 |
 | redb/KVDB | 完成 transfer log KV 初版 | `transfer_log_store/redb_store.rs` + `RedbTransferLogIngestor` 通过 contract；通用 cache 后置 |
 | services/collections | 完成初版 | treasury-only create + prefunded job prepare + signer/outbound/audit contract；collector runtime、broadcast/retry/receipt/replacement/API/真实 DB 原子化测试未做 |
-| collect worker | 未开始 | MVP 只做 prefunded；目标只能 treasury；必须补 broadcast 崩溃恢复、receipt confirmation、same nonce replacement 和 audit |
+| collect worker | 部分完成 | broadcast tick 初版已完成：prepared outbound 后广播并 mark_broadcast；仍需 recovery loop、receipt confirmation、same nonce replacement 和 audit 补强 |
 | 外部 signer adapter | 未开始 | 已有 signer trait/fake；production 需要 KMS/HSM/external signer adapter |
 | 可观测性/告警 | 未开始 | `/metrics`、结构化日志、alert dry-run |
 | e2e 测试 | 未开始 | Anvil + mock ERC20 |
