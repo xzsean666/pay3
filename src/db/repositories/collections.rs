@@ -43,6 +43,8 @@ pub trait CollectionRepository: Send + Sync {
         command: CreateCollectionCommand,
     ) -> Result<CollectionRecord, RepositoryError>;
 
+    async fn get_collection(&self, id: Uuid) -> Result<Option<CollectionRecord>, RepositoryError>;
+
     async fn claim_collection_job(
         &self,
         worker_id: &str,
@@ -112,6 +114,23 @@ impl CollectionRepository for PgCollectionRepository {
 
         tx.commit().await?;
         Ok(collection)
+    }
+
+    async fn get_collection(&self, id: Uuid) -> Result<Option<CollectionRecord>, RepositoryError> {
+        let sql = format!(
+            r#"
+            SELECT {COLLECTION_COLUMNS}
+            FROM collections
+            WHERE id = $1
+            "#
+        );
+
+        sqlx::query(&sql)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| collection_record_from_row(&row))
+            .transpose()
     }
 
     async fn claim_collection_job(

@@ -413,6 +413,13 @@ where
         })
     }
 
+    pub async fn get_collection(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<CollectionRecord>, CollectionServiceError> {
+        Ok(self.collections.get_collection(id).await?)
+    }
+
     pub async fn prepare_next_collection_job(
         &self,
         worker_id: &str,
@@ -1026,6 +1033,13 @@ mod tests {
                 command.amount_raw,
                 None,
             ))
+        }
+
+        async fn get_collection(
+            &self,
+            id: Uuid,
+        ) -> Result<Option<CollectionRecord>, RepositoryError> {
+            Ok(Some(collection_record(id, None, None)))
         }
 
         async fn claim_collection_job(

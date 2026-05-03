@@ -260,7 +260,9 @@ mod tests {
     use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
     use super::*;
-    use crate::auth::{COLLECTIONS_CREATE_SCOPE, ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE};
+    use crate::auth::{
+        COLLECTIONS_CREATE_SCOPE, COLLECTIONS_READ_SCOPE, ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE,
+    };
 
     const ISSUER: &str = "pay3-test-issuer";
     const AUDIENCE: &str = "pay3-api";
@@ -409,13 +411,16 @@ mod tests {
     }
 
     #[test]
-    fn collections_create_is_isolated_from_order_scopes() {
+    fn collection_scopes_are_isolated_from_order_scopes() {
         let verifier = verifier();
         let orders_token = token_with(|claims| {
             claims.scope = Some(ORDERS_CREATE_SCOPE.to_owned());
         });
         let collections_token = token_with(|claims| {
             claims.scope = Some(COLLECTIONS_CREATE_SCOPE.to_owned());
+        });
+        let collections_read_token = token_with(|claims| {
+            claims.scope = Some(COLLECTIONS_READ_SCOPE.to_owned());
         });
 
         let orders_principal = verifier
@@ -424,6 +429,9 @@ mod tests {
         let collections_principal = verifier
             .verify_token(&collections_token)
             .expect("collections token should verify");
+        let collections_read_principal = verifier
+            .verify_token(&collections_read_token)
+            .expect("collections read token should verify");
 
         assert_eq!(
             orders_principal.require_scope(COLLECTIONS_CREATE_SCOPE),
@@ -438,6 +446,17 @@ mod tests {
         assert!(
             collections_principal
                 .require_scope(COLLECTIONS_CREATE_SCOPE)
+                .is_ok()
+        );
+        assert_eq!(
+            collections_principal.require_scope(COLLECTIONS_READ_SCOPE),
+            Err(AuthError::InsufficientScope(
+                COLLECTIONS_READ_SCOPE.to_owned()
+            ))
+        );
+        assert!(
+            collections_read_principal
+                .require_scope(COLLECTIONS_READ_SCOPE)
                 .is_ok()
         );
     }

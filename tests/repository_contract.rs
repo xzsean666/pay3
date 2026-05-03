@@ -57,6 +57,7 @@ fn collection_repository_uses_job_lock_and_treasury_backed_insert() {
         "status = 'queued'",
         "idempotency_key",
         "request_hash",
+        "get_collection",
         "status != \"paid\"",
         "INSERT INTO collections",
         "attach_outbound_tx",

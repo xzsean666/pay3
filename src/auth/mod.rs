@@ -3,8 +3,8 @@ mod scope;
 
 pub use jwt::{Audience, Claims, JwtVerifier, Principal};
 pub use scope::{
-    COLLECTIONS_CREATE_SCOPE, ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE, ORDERS_VERIFY_SCOPE,
-    ScopeSet, require_scope,
+    COLLECTIONS_CREATE_SCOPE, COLLECTIONS_READ_SCOPE, ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE,
+    ORDERS_VERIFY_SCOPE, ScopeSet, require_scope,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

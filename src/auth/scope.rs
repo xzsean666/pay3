@@ -7,6 +7,7 @@ pub const ORDERS_CREATE_SCOPE: &str = "orders:create";
 pub const ORDERS_READ_SCOPE: &str = "orders:read";
 pub const ORDERS_VERIFY_SCOPE: &str = "orders:verify";
 pub const COLLECTIONS_CREATE_SCOPE: &str = "collections:create";
+pub const COLLECTIONS_READ_SCOPE: &str = "collections:read";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ScopeSet {

@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::{
     auth::{
-        AuthError, COLLECTIONS_CREATE_SCOPE, JwtVerifier, ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE,
-        Principal,
+        AuthError, COLLECTIONS_CREATE_SCOPE, COLLECTIONS_READ_SCOPE, JwtVerifier,
+        ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE, Principal,
     },
     config::AppConfig,
     db::repositories::{CollectionRecord, CollectionRecordStatus, OrderView, RepositoryError},
@@ -175,6 +175,11 @@ pub trait CollectionApiService: Send + Sync {
         &self,
         input: CreateCollectionInput,
     ) -> Result<CreateCollectionResult, CollectionServiceError>;
+
+    async fn get_collection(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<CollectionRecord>, CollectionServiceError>;
 }
 
 #[async_trait]
@@ -222,6 +227,13 @@ where
         input: CreateCollectionInput,
     ) -> Result<CreateCollectionResult, CollectionServiceError> {
         CollectionService::create_collection(self, input).await
+    }
+
+    async fn get_collection(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<CollectionRecord>, CollectionServiceError> {
+        CollectionService::get_collection(self, id).await
     }
 }
 
@@ -349,7 +361,9 @@ fn router_from_state(state: ApiState) -> Router {
     }
 
     if include_collection_routes {
-        router = router.route("/v1/collections", post(create_collection));
+        router = router
+            .route("/v1/collections", post(create_collection))
+            .route("/v1/collections/{id}", get(get_collection));
     }
 
     router
@@ -434,11 +448,15 @@ struct CreateCollectionRequest {
 struct CollectionResponse {
     id: Uuid,
     order_id: Uuid,
+    chain_id: u64,
+    token_address: String,
     status: CollectionRecordStatus,
     from_address: String,
     to_address: String,
     amount_raw: Option<String>,
     outbound_tx_id: Option<Uuid>,
+    attempt_count: u32,
+    error: Option<String>,
     created_at: time::OffsetDateTime,
     updated_at: time::OffsetDateTime,
 }
@@ -487,7 +505,7 @@ async fn get_order(
     Path(id): Path<String>,
 ) -> Result<Json<OrderResponse>, ApiError> {
     require_scope(&state, &headers, ORDERS_READ_SCOPE)?;
-    let id = parse_uuid(&id)?;
+    let id = parse_order_id(&id)?;
     let config = state.order_response_config()?;
     let Some(view) = state
         .orders()?
@@ -527,7 +545,7 @@ async fn create_collection(
 ) -> Result<(StatusCode, Json<CollectionResponse>), ApiError> {
     let principal = require_scope(&state, &headers, COLLECTIONS_CREATE_SCOPE)?;
     let Json(payload) = payload.map_err(json_rejection)?;
-    let order_id = parse_uuid(&payload.order_id)?;
+    let order_id = parse_order_id(&payload.order_id)?;
     let amount = parse_collection_amount(&payload.amount)?;
     let audit = AuditContext {
         request_id: None,
@@ -555,6 +573,25 @@ async fn create_collection(
     };
 
     Ok((status, Json(collection_response(result.collection))))
+}
+
+async fn get_collection(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<CollectionResponse>, ApiError> {
+    require_scope(&state, &headers, COLLECTIONS_READ_SCOPE)?;
+    let id = parse_collection_id(&id)?;
+    let Some(collection) = state
+        .collections()?
+        .get_collection(id)
+        .await
+        .map_err(collection_service_error_to_api)?
+    else {
+        return Err(ApiError::not_found("collection not found"));
+    };
+
+    Ok(Json(collection_response(collection)))
 }
 
 async fn not_found() -> ApiError {
@@ -588,11 +625,15 @@ fn collection_response(collection: CollectionRecord) -> CollectionResponse {
     CollectionResponse {
         id: collection.id,
         order_id: collection.order_id,
+        chain_id: collection.chain_id,
+        token_address: collection.token_address.to_lower_hex(),
         status: collection.status,
         from_address: collection.from_address.to_lower_hex(),
         to_address: collection.to_address.to_lower_hex(),
         amount_raw: collection.amount_raw.map(|amount| amount.to_string()),
         outbound_tx_id: collection.outbound_tx_id,
+        attempt_count: collection.attempt_count,
+        error: collection.error,
         created_at: collection.created_at,
         updated_at: collection.updated_at,
     }
@@ -681,9 +722,16 @@ fn json_rejection(rejection: JsonRejection) -> ApiError {
     ApiError::bad_request("invalid_json", rejection.to_string())
 }
 
-fn parse_uuid(value: &str) -> Result<Uuid, ApiError> {
-    Uuid::parse_str(value)
-        .map_err(|_| ApiError::bad_request("invalid_order_id", "invalid order id"))
+pub(super) fn parse_order_id(value: &str) -> Result<Uuid, ApiError> {
+    parse_uuid(value, "invalid_order_id", "invalid order id")
+}
+
+fn parse_collection_id(value: &str) -> Result<Uuid, ApiError> {
+    parse_uuid(value, "invalid_collection_id", "invalid collection id")
+}
+
+fn parse_uuid(value: &str, code: &'static str, message: &'static str) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(value).map_err(|_| ApiError::bad_request(code, message))
 }
 
 async fn record_request_latency(
@@ -722,8 +770,8 @@ mod tests {
     };
     use crate::{
         auth::{
-            Audience, COLLECTIONS_CREATE_SCOPE, Claims, JwtVerifier, ORDERS_CREATE_SCOPE,
-            ORDERS_READ_SCOPE,
+            Audience, COLLECTIONS_CREATE_SCOPE, COLLECTIONS_READ_SCOPE, Claims, JwtVerifier,
+            ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE,
         },
         db::repositories::{
             ChildAccountRecord, CollectionRecord, CollectionRecordStatus, OrderRecord, OrderView,
@@ -1188,6 +1236,92 @@ mod tests {
         assert_eq!(response.body["error"]["code"], "collection_not_allowed");
     }
 
+    #[tokio::test]
+    async fn get_collections_requires_collections_read_scope() {
+        let service = Arc::new(FakeCollectionApiService::with_collection(
+            collection_record(
+                Uuid::from_u128(13),
+                Uuid::from_u128(10),
+                CollectionRecordStatus::Queued,
+            ),
+        ));
+
+        let response = request_json_with_app(
+            collections_app(service.clone()),
+            Method::GET,
+            "/v1/collections/00000000-0000-0000-0000-000000000013",
+            Value::Null,
+            Some(token(COLLECTIONS_CREATE_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(response.body["error"]["code"], "forbidden");
+        assert_eq!(service.calls.lock().unwrap().get_ids.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn get_collections_returns_collection_with_read_scope() {
+        let mut record = collection_record(
+            Uuid::from_u128(14),
+            Uuid::from_u128(10),
+            CollectionRecordStatus::Confirming,
+        );
+        record.amount_raw = Some(RawAmount::from(1_000_000));
+        record.outbound_tx_id = Some(Uuid::from_u128(99));
+        record.attempt_count = 2;
+        record.error = Some("receipt pending".to_string());
+        let service = Arc::new(FakeCollectionApiService::with_collection(record));
+
+        let response = request_json_with_app(
+            collections_app(service.clone()),
+            Method::GET,
+            "/v1/collections/00000000-0000-0000-0000-00000000000e",
+            Value::Null,
+            Some(token(COLLECTIONS_READ_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body["id"], Uuid::from_u128(14).to_string());
+        assert_eq!(response.body["order_id"], Uuid::from_u128(10).to_string());
+        assert_eq!(response.body["chain_id"], 1);
+        assert_eq!(
+            response.body["token_address"],
+            evm_address(0x11).to_string()
+        );
+        assert_eq!(response.body["status"], "confirming");
+        assert_eq!(response.body["amount_raw"], "1000000");
+        assert_eq!(
+            response.body["outbound_tx_id"],
+            Uuid::from_u128(99).to_string()
+        );
+        assert_eq!(response.body["attempt_count"], 2);
+        assert_eq!(response.body["error"], "receipt pending");
+
+        assert_eq!(
+            service.calls.lock().unwrap().get_ids,
+            vec![Uuid::from_u128(14)]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_collections_returns_404_when_missing() {
+        let service = Arc::new(FakeCollectionApiService::default());
+
+        let response = request_json_with_app(
+            collections_app(service),
+            Method::GET,
+            "/v1/collections/00000000-0000-0000-0000-000000000015",
+            Value::Null,
+            Some(token(COLLECTIONS_READ_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        assert_eq!(response.body["error"]["message"], "collection not found");
+    }
+
     struct JsonResponse {
         status: StatusCode,
         body: Value,
@@ -1450,6 +1584,7 @@ mod tests {
     #[derive(Default)]
     struct FakeCollectionApiService {
         create_result: Mutex<Option<Result<CreateCollectionResult, CollectionServiceError>>>,
+        collections: Mutex<BTreeMap<Uuid, CollectionRecord>>,
         calls: Mutex<FakeCollectionApiCalls>,
     }
 
@@ -1467,11 +1602,21 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        fn with_collection(collection: CollectionRecord) -> Self {
+            let mut collections = BTreeMap::new();
+            collections.insert(collection.id, collection);
+            Self {
+                collections: Mutex::new(collections),
+                ..Self::default()
+            }
+        }
     }
 
     #[derive(Default)]
     struct FakeCollectionApiCalls {
         create_inputs: Vec<CreateCollectionInput>,
+        get_ids: Vec<Uuid>,
     }
 
     #[async_trait]
@@ -1489,6 +1634,14 @@ mod tests {
                     message: "missing fake create result".to_string(),
                 }),
             }
+        }
+
+        async fn get_collection(
+            &self,
+            id: Uuid,
+        ) -> Result<Option<CollectionRecord>, CollectionServiceError> {
+            self.calls.lock().unwrap().get_ids.push(id);
+            Ok(self.collections.lock().unwrap().get(&id).cloned())
         }
     }
 

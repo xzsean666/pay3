@@ -371,6 +371,7 @@ trait SignerProvider {
 - request schema 不接受 `to_address`
 - repository/DB 直接写非 treasury collection 失败
 - 无 `collections:create` scope 返回 403
+- `GET /v1/collections/{id}` 使用 `collections:read` scope，返回 collection 状态、outbound 引用和错误信息
 - signer contract test：health、timeout、key_ref 不存在、签名 tx_hash 校验、审计 request_id
 - production profile 拒绝 fake/local signer
 - dropped/stuck tx replacement 保留同 nonce 轨迹并写审计事件

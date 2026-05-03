@@ -10,7 +10,7 @@ use uuid::Uuid;
 
 use crate::{auth::ORDERS_VERIFY_SCOPE, domain::RawAmount, error::ApiError};
 
-use super::{ApiState, parse_uuid, require_scope};
+use super::{ApiState, parse_order_id, require_scope};
 
 #[async_trait]
 pub trait OrderVerifyApiService: Send + Sync {
@@ -55,7 +55,7 @@ pub(super) async fn verify_order(
     Path(id): Path<String>,
 ) -> Result<Json<OrderVerifyResult>, ApiError> {
     require_scope(&state, &headers, ORDERS_VERIFY_SCOPE)?;
-    let id = parse_uuid(&id)?;
+    let id = parse_order_id(&id)?;
     let result = state
         .order_verify()?
         .verify_order(id)

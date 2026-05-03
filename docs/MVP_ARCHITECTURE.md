@@ -434,6 +434,26 @@ JWT 必须校验 `exp`、`nbf`、`iat`、`iss`、`aud`、`sub`。MVP 是单默�
 
 查询归集状态、collect tx、错误信息。
 
+响应：
+
+```json
+{
+  "id": "018f8d8b-a91c-7d58-ae8e-0ed5fc753111",
+  "order_id": "018f8d8b-9e5a-7d36-a92f-37c3f8f21b11",
+  "chain_id": 1,
+  "token_address": "0xToken...",
+  "status": "confirming",
+  "from_address": "0xChild...",
+  "to_address": "0xTreasury...",
+  "amount_raw": "12340000",
+  "outbound_tx_id": "018f8d8b-b2ad-7f70-9cc7-7ef7d052a222",
+  "attempt_count": 2,
+  "error": null,
+  "created_at": "2026-05-03T00:00:00Z",
+  "updated_at": "2026-05-03T00:02:00Z"
+}
+```
+
 ### `GET /healthz`
 
 进程活性检查，不需要 JWT。
