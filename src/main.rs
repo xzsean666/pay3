@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use pay3::{api, config::AppConfig};
+use pay3::{config::AppConfig, runtime};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -11,7 +11,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
     config.validate_profile()?;
 
-    let app = api::router(config.clone()).layer(TraceLayer::new_for_http());
+    let app = runtime::build_api_router(config.clone())
+        .await?
+        .layer(TraceLayer::new_for_http());
     let listener = tokio::net::TcpListener::bind(config.http.bind_addr).await?;
 
     tracing::info!(addr = %config.http.bind_addr, "pay3 api listening");

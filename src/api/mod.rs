@@ -24,8 +24,8 @@ use crate::{
     domain::{OrderStatus, TokenAmount},
     error::ApiError,
     health::{
-        DependencyRegistry, HealthzResponse, MetricsRecorder, ReadinessReport,
-        SharedDependencyRegistry, StaticDependencyRegistry,
+        DependencyCheck, DependencyName, DependencyRegistry, HealthzResponse, MetricsRecorder,
+        ReadinessReport, SharedDependencyRegistry, StaticDependencyRegistry,
     },
     services::orders::{
         CreateOrderInput, CreateOrderResult, CreateOrderServiceOutcome, OrderService,
@@ -169,7 +169,29 @@ where
 
 pub fn router(config: AppConfig) -> Router {
     drop(config);
-    router_with_registry(StaticDependencyRegistry::all_healthy())
+    router_with_registry(StaticDependencyRegistry::from_checks(vec![
+        DependencyCheck::healthy(DependencyName::WorkerLease),
+        DependencyCheck::failed(
+            DependencyName::Db,
+            "runtime services were not bootstrapped; use runtime::build_api_router",
+        ),
+        DependencyCheck::failed(
+            DependencyName::Migration,
+            "runtime services were not bootstrapped; use runtime::build_api_router",
+        ),
+        DependencyCheck::failed(
+            DependencyName::RpcChainId,
+            "runtime services were not bootstrapped; use runtime::build_api_router",
+        ),
+        DependencyCheck::failed(
+            DependencyName::Kvdb,
+            "runtime services were not bootstrapped; use runtime::build_api_router",
+        ),
+        DependencyCheck::failed(
+            DependencyName::Signer,
+            "runtime services were not bootstrapped; use runtime::build_api_router",
+        ),
+    ]))
 }
 
 pub fn router_with_registry<R>(registry: R) -> Router
@@ -210,6 +232,23 @@ where
     R: DependencyRegistry,
 {
     let state = ApiState::new(Arc::new(registry)).with_order_verify(Arc::new(auth), order_verify);
+    router_from_state(state)
+}
+
+pub fn router_with_runtime_services<R>(
+    registry: R,
+    auth: JwtVerifier,
+    orders: Arc<dyn OrderApiService>,
+    order_verify: Arc<dyn verify::OrderVerifyApiService>,
+    order_response_config: OrderResponseConfig,
+) -> Router
+where
+    R: DependencyRegistry,
+{
+    let auth = Arc::new(auth);
+    let state = ApiState::new(Arc::new(registry))
+        .with_orders(auth.clone(), orders, order_response_config)
+        .with_order_verify(auth, order_verify);
     router_from_state(state)
 }
 

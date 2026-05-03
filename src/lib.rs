@@ -6,6 +6,7 @@ pub mod db;
 pub mod domain;
 pub mod error;
 pub mod health;
+pub mod runtime;
 pub mod services;
 pub mod signer;
 pub mod transfer_log_store;
