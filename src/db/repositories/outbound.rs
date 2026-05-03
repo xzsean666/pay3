@@ -12,7 +12,7 @@ use super::{
     error::RepositoryError,
     types::{
         BroadcastableOutboundTx, NewSignedOutboundTx, OutboundTxPurpose, OutboundTxRecord,
-        OutboundTxStatus, ReservedNonce,
+        OutboundTxStatus, ReceiptCheckableOutboundTx, ReservedNonce,
     },
 };
 
@@ -62,6 +62,11 @@ pub trait OutboundRepository: Send + Sync {
         &self,
         worker_id: &str,
     ) -> Result<Option<BroadcastableOutboundTx>, RepositoryError>;
+
+    async fn claim_broadcast_collect_tx_for_receipt(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<ReceiptCheckableOutboundTx>, RepositoryError>;
 
     async fn mark_broadcast(&self, tx_id: Uuid) -> Result<OutboundTxRecord, RepositoryError>;
 
@@ -291,6 +296,74 @@ impl OutboundRepository for PgOutboundRepository {
         .transpose()
     }
 
+    async fn claim_broadcast_collect_tx_for_receipt(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<ReceiptCheckableOutboundTx>, RepositoryError> {
+        let lease_seconds = u64_to_i64(self.claim_lease_seconds, "claim_lease_seconds")?;
+        let sql = r#"
+            WITH next_outbound AS (
+                SELECT c.id AS collection_id,
+                       c.outbound_tx_id
+                FROM collections c
+                JOIN outbound_transactions o
+                  ON o.id = c.outbound_tx_id
+                WHERE c.status = 'confirming'
+                  AND o.status = 'broadcast'
+                  AND (c.locked_until IS NULL OR c.locked_until <= now())
+                ORDER BY c.updated_at, c.id
+                FOR UPDATE OF c SKIP LOCKED
+                LIMIT 1
+            ),
+            claimed AS (
+                UPDATE collections AS c
+                SET locked_by = $1,
+                    locked_until = now() + ($2::bigint * interval '1 second'),
+                    updated_at = now()
+                FROM next_outbound
+                WHERE c.id = next_outbound.collection_id
+                RETURNING c.id AS collection_id,
+                          c.outbound_tx_id
+            )
+            SELECT claimed.collection_id,
+                   o.id,
+                   o.chain_id,
+                   o.purpose,
+                   o.from_address,
+                   o.to_address,
+                   o.nonce,
+                   o.tx_hash,
+                   o.signed_tx,
+                   o.status,
+                   o.replacement_of,
+                   o.replacement_reason,
+                   o.broadcast_count,
+                   o.last_broadcast_at,
+                   o.receipt_block_number,
+                   o.receipt_block_hash,
+                   o.error,
+                   o.created_at,
+                   o.updated_at
+            FROM claimed
+            JOIN outbound_transactions o
+              ON o.id = claimed.outbound_tx_id
+            "#;
+
+        let row = sqlx::query(sql)
+            .bind(worker_id)
+            .bind(lease_seconds)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|row| {
+            Ok(ReceiptCheckableOutboundTx {
+                collection_id: row.try_get("collection_id")?,
+                outbound: outbound_record_from_row(&row)?,
+            })
+        })
+        .transpose()
+    }
+
     async fn mark_broadcast(&self, tx_id: Uuid) -> Result<OutboundTxRecord, RepositoryError> {
         let mut tx = self.pool.begin().await?;
         let sql = format!(
@@ -320,6 +393,8 @@ impl OutboundRepository for PgOutboundRepository {
             r#"
             UPDATE collections
             SET status = 'confirming',
+                locked_by = NULL,
+                locked_until = NULL,
                 updated_at = now()
             WHERE outbound_tx_id = $1
               AND status IN ('transferring', 'confirming')

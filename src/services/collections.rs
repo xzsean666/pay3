@@ -1130,6 +1130,14 @@ mod tests {
             unimplemented!("collection service does not claim signed txs for broadcast")
         }
 
+        async fn claim_broadcast_collect_tx_for_receipt(
+            &self,
+            _worker_id: &str,
+        ) -> Result<Option<crate::db::repositories::ReceiptCheckableOutboundTx>, RepositoryError>
+        {
+            unimplemented!("collection service does not claim broadcast txs for receipt")
+        }
+
         async fn mark_broadcast(&self, _tx_id: Uuid) -> Result<OutboundTxRecord, RepositoryError> {
             unimplemented!("collector worker owns broadcast state")
         }

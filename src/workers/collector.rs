@@ -5,9 +5,10 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    chain::ChainError,
+    chain::{ChainError, TransactionStatus, TxReceipt},
     db::repositories::{
-        BroadcastableOutboundTx, OutboundRepository, OutboundTxRecord, RepositoryError,
+        BroadcastableOutboundTx, OutboundRepository, OutboundTxRecord, ReceiptCheckableOutboundTx,
+        RepositoryError,
     },
     domain::TxHash,
     services::{
@@ -46,6 +47,18 @@ pub enum CollectionCollectorTickOutcome {
         collection_id: Uuid,
         outbound: OutboundTxRecord,
     },
+    ReceiptPending {
+        collection_id: Uuid,
+        outbound: OutboundTxRecord,
+    },
+    Confirmed {
+        collection_id: Uuid,
+        outbound: OutboundTxRecord,
+    },
+    Failed {
+        collection_id: Uuid,
+        outbound: OutboundTxRecord,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -60,6 +73,15 @@ pub enum CollectionCollectorError {
         "broadcast tx hash mismatch for outbound {outbound_tx_id}: signed {expected_tx_hash}, broadcast returned {actual_tx_hash}"
     )]
     BroadcastHashMismatch {
+        outbound_tx_id: Uuid,
+        expected_tx_hash: TxHash,
+        actual_tx_hash: TxHash,
+    },
+
+    #[error(
+        "receipt tx hash mismatch for outbound {outbound_tx_id}: expected {expected_tx_hash}, receipt returned {actual_tx_hash}"
+    )]
+    ReceiptHashMismatch {
         outbound_tx_id: Uuid,
         expected_tx_hash: TxHash,
         actual_tx_hash: TxHash,
@@ -118,6 +140,21 @@ where
     }
 }
 
+#[async_trait]
+pub trait TxReceiptReader: Send + Sync {
+    async fn transaction_receipt(&self, tx_hash: TxHash) -> Result<Option<TxReceipt>, ChainError>;
+}
+
+#[async_trait]
+impl<T> TxReceiptReader for T
+where
+    T: crate::chain::Erc20ChainClient,
+{
+    async fn transaction_receipt(&self, tx_hash: TxHash) -> Result<Option<TxReceipt>, ChainError> {
+        crate::chain::Erc20ChainClient::transaction_receipt(self, tx_hash).await
+    }
+}
+
 pub struct CollectionCollectorWorker<P, O, B> {
     preparer: P,
     outbound: O,
@@ -145,7 +182,7 @@ impl<P, O, B> CollectionCollectorWorker<P, O, B>
 where
     P: CollectionJobPreparer,
     O: OutboundRepository,
-    B: SignedTxBroadcaster,
+    B: SignedTxBroadcaster + TxReceiptReader,
 {
     pub async fn tick(&self) -> Result<CollectionCollectorTickOutcome, CollectionCollectorError> {
         self.config.validate()?;
@@ -157,6 +194,14 @@ where
             .await?
         {
             return self.broadcast_outbound(recoverable).await;
+        }
+
+        if let Some(receipt_checkable) = self
+            .outbound
+            .claim_broadcast_collect_tx_for_receipt(worker_id)
+            .await?
+        {
+            return self.check_outbound_receipt(receipt_checkable).await;
         }
 
         let outcome = self.preparer.prepare_next_collection_job(worker_id).await?;
@@ -200,6 +245,53 @@ where
             collection_id: recoverable.collection_id,
             outbound,
         })
+    }
+
+    async fn check_outbound_receipt(
+        &self,
+        checkable: ReceiptCheckableOutboundTx,
+    ) -> Result<CollectionCollectorTickOutcome, CollectionCollectorError> {
+        let Some(receipt) = self
+            .broadcaster
+            .transaction_receipt(checkable.outbound.tx_hash)
+            .await?
+        else {
+            return Ok(CollectionCollectorTickOutcome::ReceiptPending {
+                collection_id: checkable.collection_id,
+                outbound: checkable.outbound,
+            });
+        };
+
+        if receipt.tx_hash != checkable.outbound.tx_hash {
+            return Err(CollectionCollectorError::ReceiptHashMismatch {
+                outbound_tx_id: checkable.outbound.id,
+                expected_tx_hash: checkable.outbound.tx_hash,
+                actual_tx_hash: receipt.tx_hash,
+            });
+        }
+
+        match receipt.status {
+            TransactionStatus::Success => {
+                let outbound = self
+                    .outbound
+                    .mark_confirmed(checkable.outbound.id, receipt.block)
+                    .await?;
+                Ok(CollectionCollectorTickOutcome::Confirmed {
+                    collection_id: checkable.collection_id,
+                    outbound,
+                })
+            }
+            TransactionStatus::Reverted => {
+                let outbound = self
+                    .outbound
+                    .mark_failed(checkable.outbound.id, "collect transaction reverted")
+                    .await?;
+                Ok(CollectionCollectorTickOutcome::Failed {
+                    collection_id: checkable.collection_id,
+                    outbound,
+                })
+            }
+        }
     }
 }
 
@@ -286,6 +378,101 @@ mod tests {
         assert_eq!(outcome, CollectionCollectorTickOutcome::NoJob);
         assert!(worker.broadcaster.broadcasts().is_empty());
         assert!(worker.outbound.marked().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tick_marks_broadcast_outbound_confirmed_when_success_receipt_exists() {
+        let outbound = outbound_record(13, OutboundTxStatus::Broadcast);
+        let receipt = receipt(outbound.tx_hash, TransactionStatus::Success, block_ref(90));
+        let worker = worker(
+            FakePreparer::with_outcomes(vec![Ok(PrepareCollectionJobOutcome::NoJob)]),
+            FakeOutboundRepository::with_receipt_checkable(ReceiptCheckableOutboundTx {
+                collection_id: collection_id(),
+                outbound: outbound.clone(),
+            }),
+            FakeBroadcaster::returning(tx_hash(0xaa)).with_receipt(Some(receipt)),
+        );
+
+        let outcome = worker.tick().await.unwrap();
+
+        assert_eq!(
+            outcome,
+            CollectionCollectorTickOutcome::Confirmed {
+                collection_id: collection_id(),
+                outbound: outbound_record_with_receipt(
+                    13,
+                    OutboundTxStatus::Confirmed,
+                    Some(block_ref(90)),
+                    None,
+                ),
+            }
+        );
+        assert!(worker.preparer.calls().is_empty());
+        assert_eq!(worker.broadcaster.receipt_queries(), vec![outbound.tx_hash]);
+        assert_eq!(
+            worker.outbound.confirmed(),
+            vec![(outbound.id, block_ref(90))]
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_marks_broadcast_outbound_failed_when_receipt_reverted() {
+        let outbound = outbound_record(14, OutboundTxStatus::Broadcast);
+        let receipt = receipt(outbound.tx_hash, TransactionStatus::Reverted, block_ref(91));
+        let worker = worker(
+            FakePreparer::with_outcomes(vec![Ok(PrepareCollectionJobOutcome::NoJob)]),
+            FakeOutboundRepository::with_receipt_checkable(ReceiptCheckableOutboundTx {
+                collection_id: collection_id(),
+                outbound: outbound.clone(),
+            }),
+            FakeBroadcaster::returning(tx_hash(0xaa)).with_receipt(Some(receipt)),
+        );
+
+        let outcome = worker.tick().await.unwrap();
+
+        assert_eq!(
+            outcome,
+            CollectionCollectorTickOutcome::Failed {
+                collection_id: collection_id(),
+                outbound: outbound_record_with_receipt(
+                    14,
+                    OutboundTxStatus::Failed,
+                    None,
+                    Some("collect transaction reverted".to_string()),
+                ),
+            }
+        );
+        assert!(worker.preparer.calls().is_empty());
+        assert_eq!(
+            worker.outbound.failed(),
+            vec![(outbound.id, "collect transaction reverted".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_keeps_broadcast_outbound_pending_when_receipt_is_missing() {
+        let outbound = outbound_record(15, OutboundTxStatus::Broadcast);
+        let worker = worker(
+            FakePreparer::with_outcomes(vec![Ok(PrepareCollectionJobOutcome::NoJob)]),
+            FakeOutboundRepository::with_receipt_checkable(ReceiptCheckableOutboundTx {
+                collection_id: collection_id(),
+                outbound: outbound.clone(),
+            }),
+            FakeBroadcaster::returning(tx_hash(0xaa)).with_receipt(None),
+        );
+
+        let outcome = worker.tick().await.unwrap();
+
+        assert_eq!(
+            outcome,
+            CollectionCollectorTickOutcome::ReceiptPending {
+                collection_id: collection_id(),
+                outbound,
+            }
+        );
+        assert!(worker.preparer.calls().is_empty());
+        assert!(worker.outbound.confirmed().is_empty());
+        assert!(worker.outbound.failed().is_empty());
     }
 
     #[tokio::test]
@@ -400,8 +587,12 @@ mod tests {
     #[derive(Debug, Default)]
     struct FakeOutboundState {
         recoverable: Option<BroadcastableOutboundTx>,
+        receipt_checkable: Option<ReceiptCheckableOutboundTx>,
         claim_calls: Vec<String>,
+        receipt_claim_calls: Vec<String>,
         marked: Vec<Uuid>,
+        confirmed: Vec<(Uuid, ChainBlockRef)>,
+        failed: Vec<(Uuid, String)>,
     }
 
     impl FakeOutboundRepository {
@@ -409,6 +600,15 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(FakeOutboundState {
                     recoverable: Some(recoverable),
+                    ..FakeOutboundState::default()
+                })),
+            }
+        }
+
+        fn with_receipt_checkable(receipt_checkable: ReceiptCheckableOutboundTx) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeOutboundState {
+                    receipt_checkable: Some(receipt_checkable),
                     ..FakeOutboundState::default()
                 })),
             }
@@ -422,11 +622,35 @@ mod tests {
                 .clone()
         }
 
+        fn _receipt_claim_calls(&self) -> Vec<String> {
+            self.state
+                .lock()
+                .expect("fake outbound mutex poisoned")
+                .receipt_claim_calls
+                .clone()
+        }
+
         fn marked(&self) -> Vec<Uuid> {
             self.state
                 .lock()
                 .expect("fake outbound mutex poisoned")
                 .marked
+                .clone()
+        }
+
+        fn confirmed(&self) -> Vec<(Uuid, ChainBlockRef)> {
+            self.state
+                .lock()
+                .expect("fake outbound mutex poisoned")
+                .confirmed
+                .clone()
+        }
+
+        fn failed(&self) -> Vec<(Uuid, String)> {
+            self.state
+                .lock()
+                .expect("fake outbound mutex poisoned")
+                .failed
                 .clone()
         }
     }
@@ -465,6 +689,15 @@ mod tests {
             Ok(state.recoverable.take())
         }
 
+        async fn claim_broadcast_collect_tx_for_receipt(
+            &self,
+            worker_id: &str,
+        ) -> Result<Option<ReceiptCheckableOutboundTx>, RepositoryError> {
+            let mut state = self.state.lock().expect("fake outbound mutex poisoned");
+            state.receipt_claim_calls.push(worker_id.to_string());
+            Ok(state.receipt_checkable.take())
+        }
+
         async fn mark_broadcast(&self, tx_id: Uuid) -> Result<OutboundTxRecord, RepositoryError> {
             self.state
                 .lock()
@@ -479,37 +712,73 @@ mod tests {
 
         async fn mark_confirmed(
             &self,
-            _tx_id: Uuid,
-            _receipt_block: ChainBlockRef,
+            tx_id: Uuid,
+            receipt_block: ChainBlockRef,
         ) -> Result<OutboundTxRecord, RepositoryError> {
-            unimplemented!("confirmation sweep is not part of this worker tick yet")
+            self.state
+                .lock()
+                .expect("fake outbound mutex poisoned")
+                .confirmed
+                .push((tx_id, receipt_block));
+            Ok(outbound_record_with_receipt(
+                tx_id.as_u128(),
+                OutboundTxStatus::Confirmed,
+                Some(receipt_block),
+                None,
+            ))
         }
 
         async fn mark_failed(
             &self,
-            _tx_id: Uuid,
-            _error: &str,
+            tx_id: Uuid,
+            error: &str,
         ) -> Result<OutboundTxRecord, RepositoryError> {
-            unimplemented!("failure handling is not part of this worker tick yet")
+            self.state
+                .lock()
+                .expect("fake outbound mutex poisoned")
+                .failed
+                .push((tx_id, error.to_string()));
+            Ok(outbound_record_with_receipt(
+                tx_id.as_u128(),
+                OutboundTxStatus::Failed,
+                None,
+                Some(error.to_string()),
+            ))
         }
     }
 
     #[derive(Clone, Debug)]
     struct FakeBroadcaster {
         returned_hash: TxHash,
+        receipt: Option<TxReceipt>,
         broadcasts: Arc<Mutex<Vec<Vec<u8>>>>,
+        receipt_queries: Arc<Mutex<Vec<TxHash>>>,
     }
 
     impl FakeBroadcaster {
         fn returning(returned_hash: TxHash) -> Self {
             Self {
                 returned_hash,
+                receipt: None,
                 broadcasts: Arc::new(Mutex::new(Vec::new())),
+                receipt_queries: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn with_receipt(mut self, receipt: Option<TxReceipt>) -> Self {
+            self.receipt = receipt;
+            self
         }
 
         fn broadcasts(&self) -> Vec<Vec<u8>> {
             self.broadcasts
+                .lock()
+                .expect("fake broadcaster mutex poisoned")
+                .clone()
+        }
+
+        fn receipt_queries(&self) -> Vec<TxHash> {
+            self.receipt_queries
                 .lock()
                 .expect("fake broadcaster mutex poisoned")
                 .clone()
@@ -524,6 +793,20 @@ mod tests {
                 .expect("fake broadcaster mutex poisoned")
                 .push(signed_tx);
             Ok(self.returned_hash)
+        }
+    }
+
+    #[async_trait]
+    impl TxReceiptReader for FakeBroadcaster {
+        async fn transaction_receipt(
+            &self,
+            tx_hash: TxHash,
+        ) -> Result<Option<TxReceipt>, ChainError> {
+            self.receipt_queries
+                .lock()
+                .expect("fake broadcaster mutex poisoned")
+                .push(tx_hash);
+            Ok(self.receipt.clone())
         }
     }
 
@@ -573,6 +856,15 @@ mod tests {
     }
 
     fn outbound_record(seed: u128, status: OutboundTxStatus) -> OutboundTxRecord {
+        outbound_record_with_receipt(seed, status, None, None)
+    }
+
+    fn outbound_record_with_receipt(
+        seed: u128,
+        status: OutboundTxStatus,
+        receipt_block: Option<ChainBlockRef>,
+        error: Option<String>,
+    ) -> OutboundTxRecord {
         OutboundTxRecord {
             id: Uuid::from_u128(seed),
             chain_id: 1,
@@ -587,8 +879,8 @@ mod tests {
             replacement_reason: None,
             broadcast_count: u32::from(matches!(status, OutboundTxStatus::Broadcast)),
             last_broadcast_at: matches!(status, OutboundTxStatus::Broadcast).then_some(now()),
-            receipt_block: None,
-            error: None,
+            receipt_block,
+            error,
             created_at: now(),
             updated_at: now(),
         }
@@ -608,6 +900,19 @@ mod tests {
 
     fn tx_hash(byte: u8) -> TxHash {
         TxHash::from_bytes([byte; 32])
+    }
+
+    fn receipt(tx_hash: TxHash, status: TransactionStatus, block: ChainBlockRef) -> TxReceipt {
+        TxReceipt {
+            tx_hash,
+            block,
+            status,
+            gas_used: Some(51_000),
+        }
+    }
+
+    fn block_ref(number: u64) -> ChainBlockRef {
+        ChainBlockRef::new(number, _block_hash(number as u8))
     }
 
     fn _block_hash(byte: u8) -> BlockHash {

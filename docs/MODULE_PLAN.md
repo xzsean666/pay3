@@ -136,6 +136,7 @@ Repository 是业务一致性的边界。service 不拼 SQL。
     - `insert_signed_tx(tx)`
     - `replace_signed_tx(old_tx_id, replacement_tx)`
     - `claim_signed_collect_tx_for_broadcast(worker_id)`，只 claim 已持久化且尚未 broadcast 的 collect signed tx，用于 broadcast 前崩溃恢复
+    - `claim_broadcast_collect_tx_for_receipt(worker_id)`，只 claim 已 broadcast 且尚未确认的 collect tx，用于 broadcast 后崩溃恢复和 receipt sweep
     - `mark_broadcast/confirmed/failed`
   - `AuditRepository`
     - `append_audit_event(event)`

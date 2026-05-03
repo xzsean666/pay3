@@ -90,6 +90,9 @@ fn outbound_repository_serializes_nonce_and_preserves_replacement_invariants() {
         "claim_signed_collect_tx_for_broadcast",
         "c.status = 'transferring'",
         "o.status = 'signed'",
+        "claim_broadcast_collect_tx_for_receipt",
+        "c.status = 'confirming'",
+        "o.status = 'broadcast'",
         "FOR UPDATE OF c SKIP LOCKED",
         "locked_until",
     ] {

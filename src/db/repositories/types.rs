@@ -405,6 +405,12 @@ pub struct BroadcastableOutboundTx {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReceiptCheckableOutboundTx {
+    pub collection_id: Uuid,
+    pub outbound: OutboundTxRecord,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEventInput {
     pub id: Uuid,
     pub event_type: String,

@@ -765,7 +765,7 @@ CREATE TABLE account_nonces (
 
 ### `outbound_transactions`
 
-所有链上发送交易必须先落库再广播，collector 重试时只能重播同一 `signed_tx`。广播前崩溃恢复由 `OutboundRepository::claim_signed_collect_tx_for_broadcast(worker_id)` 从 `collections.status='transferring'` + `outbound_transactions.status='signed'` 的记录中带锁 claim 一个待广播交易。
+所有链上发送交易必须先落库再广播，collector 重试时只能重播同一 `signed_tx`。广播前崩溃恢复由 `OutboundRepository::claim_signed_collect_tx_for_broadcast(worker_id)` 从 `collections.status='transferring'` + `outbound_transactions.status='signed'` 的记录中带锁 claim 一个待广播交易；广播后崩溃恢复由 `OutboundRepository::claim_broadcast_collect_tx_for_receipt(worker_id)` 从 `collections.status='confirming'` + `outbound_transactions.status='broadcast'` 的记录中带锁 claim 一个待查 receipt 交易。
 
 ```sql
 CREATE TABLE outbound_transactions (
@@ -991,6 +991,8 @@ COMMIT
 outside transaction: broadcast signed_tx
 on retry before broadcast is recorded: claim transferring+signed outbound and rebroadcast same signed_tx
 on retry after broadcast is recorded: check tx_hash receipt first
+if receipt success: mark outbound and collection confirmed
+if receipt reverted: mark outbound and collection failed
 ```
 
 replacement/gas bump 流程：
