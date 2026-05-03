@@ -18,18 +18,27 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::{
-    auth::{AuthError, JwtVerifier, ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE, Principal},
+    auth::{
+        AuthError, COLLECTIONS_CREATE_SCOPE, JwtVerifier, ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE,
+        Principal,
+    },
     config::AppConfig,
-    db::repositories::{OrderView, RepositoryError},
+    db::repositories::{CollectionRecord, CollectionRecordStatus, OrderView, RepositoryError},
     domain::{OrderStatus, TokenAmount},
     error::ApiError,
     health::{
         DependencyCheck, DependencyName, DependencyRegistry, HealthzResponse, MetricsRecorder,
         ReadinessReport, SharedDependencyRegistry, StaticDependencyRegistry,
     },
-    services::orders::{
-        CreateOrderInput, CreateOrderResult, CreateOrderServiceOutcome, OrderService,
-        OrderServiceError,
+    services::{
+        collections::{
+            AuditContext, CollectionAmount, CollectionService, CollectionServiceError,
+            CreateCollectionInput, CreateCollectionOutcome, CreateCollectionResult,
+        },
+        orders::{
+            CreateOrderInput, CreateOrderResult, CreateOrderServiceOutcome, OrderService,
+            OrderServiceError,
+        },
     },
 };
 
@@ -40,6 +49,7 @@ struct ApiState {
     auth: Option<Arc<JwtVerifier>>,
     orders: Option<Arc<dyn OrderApiService>>,
     order_verify: Option<Arc<dyn verify::OrderVerifyApiService>>,
+    collections: Option<Arc<dyn CollectionApiService>>,
     order_response_config: Option<OrderResponseConfig>,
 }
 
@@ -51,6 +61,7 @@ impl ApiState {
             auth: None,
             orders: None,
             order_verify: None,
+            collections: None,
             order_response_config: None,
         }
     }
@@ -81,6 +92,16 @@ impl ApiState {
         self
     }
 
+    fn with_collections(
+        mut self,
+        auth: Arc<JwtVerifier>,
+        collections: Arc<dyn CollectionApiService>,
+    ) -> Self {
+        self.auth = Some(auth);
+        self.collections = Some(collections);
+        self
+    }
+
     fn auth(&self) -> Result<&JwtVerifier, ApiError> {
         self.auth
             .as_deref()
@@ -104,6 +125,15 @@ impl ApiState {
             ApiError::service_unavailable(
                 "order_verify_unavailable",
                 "order verify service is not configured",
+            )
+        })
+    }
+
+    fn collections(&self) -> Result<&dyn CollectionApiService, ApiError> {
+        self.collections.as_deref().ok_or_else(|| {
+            ApiError::service_unavailable(
+                "collections_unavailable",
+                "collections service is not configured",
             )
         })
     }
@@ -140,6 +170,14 @@ pub trait OrderApiService: Send + Sync {
 }
 
 #[async_trait]
+pub trait CollectionApiService: Send + Sync {
+    async fn create_collection(
+        &self,
+        input: CreateCollectionInput,
+    ) -> Result<CreateCollectionResult, CollectionServiceError>;
+}
+
+#[async_trait]
 impl<R, D, H, C, I> OrderApiService for OrderService<R, D, H, C, I>
 where
     R: crate::db::repositories::OrderRepository,
@@ -164,6 +202,26 @@ where
         external_id: &str,
     ) -> Result<Option<OrderView>, OrderServiceError> {
         OrderService::get_order_by_external_id(self, external_id).await
+    }
+}
+
+#[async_trait]
+impl<O, C, B, A, S, H, G, I> CollectionApiService for CollectionService<O, C, B, A, S, H, G, I>
+where
+    O: crate::db::repositories::OrderRepository,
+    C: crate::db::repositories::CollectionRepository,
+    B: crate::db::repositories::OutboundRepository,
+    A: crate::db::repositories::AuditRepository,
+    S: crate::signer::SignerProvider,
+    H: crate::chain::Erc20ChainClient,
+    G: crate::services::collections::PrefundedGasChecker,
+    I: crate::services::orders::IdGenerator,
+{
+    async fn create_collection(
+        &self,
+        input: CreateCollectionInput,
+    ) -> Result<CreateCollectionResult, CollectionServiceError> {
+        CollectionService::create_collection(self, input).await
     }
 }
 
@@ -235,11 +293,24 @@ where
     router_from_state(state)
 }
 
+pub fn router_with_collection_service<R>(
+    registry: R,
+    auth: JwtVerifier,
+    collections: Arc<dyn CollectionApiService>,
+) -> Router
+where
+    R: DependencyRegistry,
+{
+    let state = ApiState::new(Arc::new(registry)).with_collections(Arc::new(auth), collections);
+    router_from_state(state)
+}
+
 pub fn router_with_runtime_services<R>(
     registry: R,
     auth: JwtVerifier,
     orders: Arc<dyn OrderApiService>,
     order_verify: Arc<dyn verify::OrderVerifyApiService>,
+    collections: Arc<dyn CollectionApiService>,
     order_response_config: OrderResponseConfig,
 ) -> Router
 where
@@ -248,13 +319,15 @@ where
     let auth = Arc::new(auth);
     let state = ApiState::new(Arc::new(registry))
         .with_orders(auth.clone(), orders, order_response_config)
-        .with_order_verify(auth, order_verify);
+        .with_order_verify(auth.clone(), order_verify)
+        .with_collections(auth, collections);
     router_from_state(state)
 }
 
 fn router_from_state(state: ApiState) -> Router {
     let include_order_routes = state.orders.is_some();
     let include_order_verify_route = state.order_verify.is_some();
+    let include_collection_routes = state.collections.is_some();
     let mut router = Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -273,6 +346,10 @@ fn router_from_state(state: ApiState) -> Router {
 
     if include_order_verify_route {
         router = router.route("/v1/orders/{id}/verify", post(verify::verify_order));
+    }
+
+    if include_collection_routes {
+        router = router.route("/v1/collections", post(create_collection));
     }
 
     router
@@ -343,6 +420,27 @@ struct OrderPaymentResponse {
     derivation_path: String,
     expires_at: time::OffsetDateTime,
     monitor_until: time::OffsetDateTime,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateCollectionRequest {
+    order_id: String,
+    amount: String,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CollectionResponse {
+    id: Uuid,
+    order_id: Uuid,
+    status: CollectionRecordStatus,
+    from_address: String,
+    to_address: String,
+    amount_raw: Option<String>,
+    outbound_tx_id: Option<Uuid>,
+    created_at: time::OffsetDateTime,
+    updated_at: time::OffsetDateTime,
 }
 
 async fn create_order(
@@ -422,6 +520,43 @@ async fn get_order_by_external_id(
     Ok(Json(order_response(view, config)))
 }
 
+async fn create_collection(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    payload: Result<Json<CreateCollectionRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<CollectionResponse>), ApiError> {
+    let principal = require_scope(&state, &headers, COLLECTIONS_CREATE_SCOPE)?;
+    let Json(payload) = payload.map_err(json_rejection)?;
+    let order_id = parse_uuid(&payload.order_id)?;
+    let amount = parse_collection_amount(&payload.amount)?;
+    let audit = AuditContext {
+        request_id: None,
+        principal_sub: Some(principal.subject),
+        scopes: principal
+            .scopes
+            .iter()
+            .map(ToOwned::to_owned)
+            .collect::<Vec<_>>(),
+    };
+
+    let result = state
+        .collections()?
+        .create_collection(CreateCollectionInput {
+            order_id,
+            amount,
+            idempotency_key: payload.idempotency_key,
+            audit,
+        })
+        .await
+        .map_err(collection_service_error_to_api)?;
+    let status = match result.outcome {
+        CreateCollectionOutcome::Created => StatusCode::CREATED,
+        CreateCollectionOutcome::Existing => StatusCode::OK,
+    };
+
+    Ok((status, Json(collection_response(result.collection))))
+}
+
 async fn not_found() -> ApiError {
     ApiError::not_found("route not found")
 }
@@ -446,6 +581,31 @@ fn order_response(view: OrderView, config: &OrderResponseConfig) -> OrderRespons
             expires_at: view.order.expires_at,
             monitor_until: view.order.monitor_until,
         },
+    }
+}
+
+fn collection_response(collection: CollectionRecord) -> CollectionResponse {
+    CollectionResponse {
+        id: collection.id,
+        order_id: collection.order_id,
+        status: collection.status,
+        from_address: collection.from_address.to_lower_hex(),
+        to_address: collection.to_address.to_lower_hex(),
+        amount_raw: collection.amount_raw.map(|amount| amount.to_string()),
+        outbound_tx_id: collection.outbound_tx_id,
+        created_at: collection.created_at,
+        updated_at: collection.updated_at,
+    }
+}
+
+fn parse_collection_amount(value: &str) -> Result<CollectionAmount, ApiError> {
+    if value.trim().eq_ignore_ascii_case("max") {
+        Ok(CollectionAmount::Max)
+    } else {
+        Err(ApiError::bad_request(
+            "invalid_collection_amount",
+            "collection amount must be \"max\" for MVP",
+        ))
     }
 }
 
@@ -489,6 +649,34 @@ fn order_service_error_to_api(error: OrderServiceError) -> ApiError {
     }
 }
 
+fn collection_service_error_to_api(error: CollectionServiceError) -> ApiError {
+    let message = error.to_string();
+    match &error {
+        CollectionServiceError::InvalidArgument { field, message } => {
+            ApiError::bad_request("invalid_collection", format!("{field}: {message}"))
+        }
+        CollectionServiceError::OrderNotFound { .. }
+        | CollectionServiceError::Repository(RepositoryError::NotFound { .. }) => {
+            ApiError::not_found("order not found")
+        }
+        CollectionServiceError::Repository(RepositoryError::IdempotencyConflict { .. }) => {
+            ApiError::conflict("idempotency_conflict", message)
+        }
+        CollectionServiceError::OrderNotCollectable { .. }
+        | CollectionServiceError::OrderStreamMismatch { .. }
+        | CollectionServiceError::ZeroCollectionAmount { .. }
+        | CollectionServiceError::InsufficientTokenBalance { .. } => {
+            ApiError::conflict("collection_not_allowed", message)
+        }
+        CollectionServiceError::Chain(_)
+        | CollectionServiceError::Signer(_)
+        | CollectionServiceError::GasFunding(_) => {
+            ApiError::service_unavailable("collection_dependency_unavailable", message)
+        }
+        _ => ApiError::internal(message),
+    }
+}
+
 fn json_rejection(rejection: JsonRejection) -> ApiError {
     ApiError::bad_request("invalid_json", rejection.to_string())
 }
@@ -529,15 +717,24 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        OrderApiService, OrderResponseConfig, router_with_order_service, router_with_registry,
+        CollectionApiService, OrderApiService, OrderResponseConfig, router_with_collection_service,
+        router_with_order_service, router_with_registry,
     };
     use crate::{
-        auth::{Audience, Claims, JwtVerifier, ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE},
+        auth::{
+            Audience, COLLECTIONS_CREATE_SCOPE, Claims, JwtVerifier, ORDERS_CREATE_SCOPE,
+            ORDERS_READ_SCOPE,
+        },
         db::repositories::{
-            ChildAccountRecord, OrderRecord, OrderView, PaymentWindowRecord, RepositoryError,
+            ChildAccountRecord, CollectionRecord, CollectionRecordStatus, OrderRecord, OrderView,
+            PaymentWindowRecord, RepositoryError,
         },
         domain::{BlockHash, ChainBlockRef, DerivationSegment, EvmAddress, OrderStatus, RawAmount},
         health::{DependencyCheck, DependencyName, StaticDependencyRegistry},
+        services::collections::{
+            CollectionAmount, CollectionServiceError, CreateCollectionInput,
+            CreateCollectionOutcome, CreateCollectionResult,
+        },
         services::orders::{
             CreateOrderInput, CreateOrderResult, CreateOrderServiceOutcome, OrderServiceError,
         },
@@ -820,6 +1017,177 @@ mod tests {
         assert_eq!(response.body["payment"]["amount"], "2.5");
     }
 
+    #[tokio::test]
+    async fn post_collections_requires_collections_create_scope() {
+        let service = Arc::new(FakeCollectionApiService::default());
+        let response = request_json_with_app(
+            collections_app(service.clone()),
+            Method::POST,
+            "/v1/collections",
+            json!({
+                "order_id": Uuid::from_u128(10).to_string(),
+                "amount": "max",
+                "idempotency_key": "collect-1"
+            }),
+            Some(token(ORDERS_READ_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(response.body["error"]["code"], "forbidden");
+        assert_eq!(service.calls.lock().unwrap().create_inputs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn post_collections_creates_max_collection() {
+        let record = collection_record(
+            Uuid::from_u128(11),
+            Uuid::from_u128(10),
+            CollectionRecordStatus::Queued,
+        );
+        let service = Arc::new(FakeCollectionApiService::with_create(
+            CreateCollectionResult {
+                outcome: CreateCollectionOutcome::Created,
+                collection: record,
+            },
+        ));
+
+        let response = request_json_with_app(
+            collections_app(service.clone()),
+            Method::POST,
+            "/v1/collections",
+            json!({
+                "order_id": Uuid::from_u128(10).to_string(),
+                "amount": "max",
+                "idempotency_key": "collect-1"
+            }),
+            Some(token(COLLECTIONS_CREATE_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::CREATED);
+        assert_eq!(response.body["id"], Uuid::from_u128(11).to_string());
+        assert_eq!(response.body["order_id"], Uuid::from_u128(10).to_string());
+        assert_eq!(response.body["status"], "queued");
+        assert_eq!(response.body["amount_raw"], Value::Null);
+        assert_eq!(response.body["from_address"], evm_address(0x77).to_string());
+        assert_eq!(response.body["to_address"], evm_address(0x99).to_string());
+
+        let calls = service.calls.lock().unwrap();
+        assert_eq!(calls.create_inputs.len(), 1);
+        assert_eq!(calls.create_inputs[0].order_id, Uuid::from_u128(10));
+        assert_eq!(calls.create_inputs[0].amount, CollectionAmount::Max);
+        assert_eq!(calls.create_inputs[0].idempotency_key, "collect-1");
+        assert_eq!(
+            calls.create_inputs[0].audit.principal_sub.as_deref(),
+            Some("merchant-1")
+        );
+        assert_eq!(
+            calls.create_inputs[0].audit.scopes,
+            vec![COLLECTIONS_CREATE_SCOPE]
+        );
+    }
+
+    #[tokio::test]
+    async fn post_collections_existing_idempotent_result_uses_ok_status() {
+        let record = collection_record(
+            Uuid::from_u128(12),
+            Uuid::from_u128(10),
+            CollectionRecordStatus::Queued,
+        );
+        let service = Arc::new(FakeCollectionApiService::with_create(
+            CreateCollectionResult {
+                outcome: CreateCollectionOutcome::Existing,
+                collection: record,
+            },
+        ));
+
+        let response = request_json_with_app(
+            collections_app(service),
+            Method::POST,
+            "/v1/collections",
+            json!({
+                "order_id": Uuid::from_u128(10).to_string(),
+                "amount": "MAX",
+                "idempotency_key": "collect-1"
+            }),
+            Some(token(COLLECTIONS_CREATE_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body["id"], Uuid::from_u128(12).to_string());
+    }
+
+    #[tokio::test]
+    async fn post_collections_rejects_unknown_to_address_field() {
+        let service = Arc::new(FakeCollectionApiService::default());
+        let response = request_json_with_app(
+            collections_app(service.clone()),
+            Method::POST,
+            "/v1/collections",
+            json!({
+                "order_id": Uuid::from_u128(10).to_string(),
+                "amount": "max",
+                "idempotency_key": "collect-1",
+                "to_address": evm_address(0x55).to_string()
+            }),
+            Some(token(COLLECTIONS_CREATE_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(response.body["error"]["code"], "invalid_json");
+        assert_eq!(service.calls.lock().unwrap().create_inputs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn post_collections_rejects_exact_amount_in_mvp_api() {
+        let service = Arc::new(FakeCollectionApiService::default());
+        let response = request_json_with_app(
+            collections_app(service.clone()),
+            Method::POST,
+            "/v1/collections",
+            json!({
+                "order_id": Uuid::from_u128(10).to_string(),
+                "amount": "1000",
+                "idempotency_key": "collect-1"
+            }),
+            Some(token(COLLECTIONS_CREATE_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::BAD_REQUEST);
+        assert_eq!(response.body["error"]["code"], "invalid_collection_amount");
+        assert_eq!(service.calls.lock().unwrap().create_inputs.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn post_collections_maps_uncollectable_order_to_409() {
+        let service = Arc::new(FakeCollectionApiService::with_create_error(
+            CollectionServiceError::OrderNotCollectable {
+                order_id: Uuid::from_u128(10),
+                status: OrderStatus::Confirming,
+            },
+        ));
+
+        let response = request_json_with_app(
+            collections_app(service),
+            Method::POST,
+            "/v1/collections",
+            json!({
+                "order_id": Uuid::from_u128(10).to_string(),
+                "amount": "max",
+                "idempotency_key": "collect-1"
+            }),
+            Some(token(COLLECTIONS_CREATE_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::CONFLICT);
+        assert_eq!(response.body["error"]["code"], "collection_not_allowed");
+    }
+
     struct JsonResponse {
         status: StatusCode,
         body: Value,
@@ -874,6 +1242,10 @@ mod tests {
                 token_symbol: "USDT".to_string(),
             },
         )
+    }
+
+    fn collections_app(service: Arc<FakeCollectionApiService>) -> axum::Router {
+        router_with_collection_service(StaticDependencyRegistry::all_healthy(), verifier(), service)
     }
 
     fn verifier() -> JwtVerifier {
@@ -953,6 +1325,34 @@ mod tests {
                 monitor_until,
                 created_at: now,
             },
+        }
+    }
+
+    fn collection_record(
+        id: Uuid,
+        order_id: Uuid,
+        status: CollectionRecordStatus,
+    ) -> CollectionRecord {
+        let now = OffsetDateTime::from_unix_timestamp(1_777_777_777).unwrap();
+        CollectionRecord {
+            id,
+            order_id,
+            idempotency_key: "collect-1".to_string(),
+            request_hash: "0xcollection-request".to_string(),
+            child_account_id: Uuid::from_u128(order_id.as_u128() + 100),
+            chain_id: 1,
+            token_address: evm_address(0x11),
+            from_address: evm_address(0x77),
+            to_address: evm_address(0x99),
+            amount_raw: None,
+            status,
+            outbound_tx_id: None,
+            attempt_count: 0,
+            locked_by: None,
+            locked_until: None,
+            error: None,
+            created_at: now,
+            updated_at: now,
         }
     }
 
@@ -1044,6 +1444,51 @@ mod tests {
                 return Ok(None);
             };
             Ok(self.orders.lock().unwrap().get(&id).cloned())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeCollectionApiService {
+        create_result: Mutex<Option<Result<CreateCollectionResult, CollectionServiceError>>>,
+        calls: Mutex<FakeCollectionApiCalls>,
+    }
+
+    impl FakeCollectionApiService {
+        fn with_create(result: CreateCollectionResult) -> Self {
+            Self {
+                create_result: Mutex::new(Some(Ok(result))),
+                ..Self::default()
+            }
+        }
+
+        fn with_create_error(error: CollectionServiceError) -> Self {
+            Self {
+                create_result: Mutex::new(Some(Err(error))),
+                ..Self::default()
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeCollectionApiCalls {
+        create_inputs: Vec<CreateCollectionInput>,
+    }
+
+    #[async_trait]
+    impl CollectionApiService for FakeCollectionApiService {
+        async fn create_collection(
+            &self,
+            input: CreateCollectionInput,
+        ) -> Result<CreateCollectionResult, CollectionServiceError> {
+            self.calls.lock().unwrap().create_inputs.push(input);
+            match self.create_result.lock().unwrap().take() {
+                Some(Ok(result)) => Ok(result),
+                Some(Err(error)) => Err(error),
+                None => Err(CollectionServiceError::InvalidArgument {
+                    field: "fake_error",
+                    message: "missing fake create result".to_string(),
+                }),
+            }
         }
     }
 

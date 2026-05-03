@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，已完成 Phase 5 `workers/scanner` tick contract 初版、`services/collections` prefunded 初版和 collector broadcast tick 初版，并新增真实 API 启动路径的 runtime composition 初版。
+仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，已完成 Phase 5 `workers/scanner` tick contract 初版、`services/collections` prefunded 初版、collector broadcast tick 初版和 collection API route contract 初版，并新增真实 API 启动路径的 runtime composition 初版。
 
 已完成：
 
@@ -63,14 +63,21 @@
   - runtime 会创建 `RpcRangeSource`，启动时校验 RPC `eth_chainId`。
   - runtime 会创建 JWT verifier，并把 `PgOrderRepository + HdWallet<DeterministicFakeDeriver> + RpcRangeSource` 组装进真实 `OrderService`。
   - runtime 会把 `ManualOrderVerifyService` 接到 API verify route，依赖 `PgOrderRepository`、`PgVerifiedPaymentRecorder`、redb log reader 和 `RpcRangeSource`。
-  - `api::router_with_runtime_services` 可同时挂订单 create/read 和 manual verify；旧同步 `api::router(config)` 不再伪装 ready，会返回未 bootstrap 的 dependency failure。
+  - runtime 会把 `CollectionService` 接到 API collection route，依赖 `PgOrderRepository`、`PgCollectionRepository`、`PgOutboundRepository`、`PgAuditRepository`、`DeterministicFakeSigner`、`RpcRangeSource` 和 `AssumePrefundedGas`；当前 runtime collect gas fee 为代码常量，后续需要配置化。
+  - `api::router_with_runtime_services` 可同时挂订单 create/read、manual verify 和 collection create；旧同步 `api::router(config)` 不再伪装 ready，会返回未 bootstrap 的 dependency failure。
   - 注意：当前 runtime 只允许 non-production `SIGNER_MODE=fake` 跑通开发/联调路径；external/KMS/HSM signer adapter 仍未实现，production 仍不可用。
 - 订单 API 初版：
   - `POST /v1/orders`: `orders:create` scope，解析 decimal `amount` -> raw amount，返回 `201 created` 或幂等 `200 ok`。
   - `GET /v1/orders/{id}`: `orders:read` scope。
   - `GET /v1/orders/by-external-id/{external_id}`: `orders:read` scope。
   - `POST /v1/orders/{id}/verify`: `orders:verify` scope，通过 `OrderVerifyApiService` trait 注入；已有 manual verify service adapter，并已接入 API runtime composition 初版。
-  - API 通过 `OrderApiService` trait 注入 service；真实启动路径已接 Pg/RPC/redb/JWT，仍缺 collection API、scanner/collector loop 和 e2e。
+  - API 通过 `OrderApiService` trait 注入 service；真实启动路径已接 Pg/RPC/redb/JWT。
+- 归集 API 初版：
+  - `POST /v1/collections`: `collections:create` scope。
+  - request 只接受 `order_id`、`amount`、`idempotency_key`，显式拒绝未知字段，避免客户端传 `to_address`。
+  - MVP API 只接受 `amount=max`，不会暴露任意 exact amount 或 treasury override；具体归集金额仍由 service 根据子地址 token balance 解析。
+  - 返回 collection id/order/status/from/to/amount/outbound 时间字段，`Created` -> `201`、`Existing` -> `200`。
+  - 已接入真实 runtime composition 初版；仍缺 collection read API、collector recovery loop、receipt/retry/replacement 和 e2e。
 - `src/transfer_log_store/types.rs`: transfer log stream/cursor/log/header/page token canonical primitives。
 - `src/transfer_log_store/mod.rs`: in-memory `TransferLogIngestor`/`TransferLogReader`，以及 redb-backed `RedbTransferLogIngestor` runtime 初版；覆盖连续扫描、空块 header、exclusive page token、reorg rewind、capacity gate 和持久化读路径。
 - `src/transfer_log_store/redb_store.rs`: redb persistence layer，支持 config/cursor/header/log/range manifest 持久化、stream config + cursor 原子初始化、atomic batch write、bounded `logs_in_range`、exclusive `logs_page`、rewind delete。
@@ -98,16 +105,16 @@
 
 - `cargo fmt -- --check`: 通过。
 - `cargo check`: 通过。
-- `cargo test`: 通过，115 个库测试 + 56 个 integration/contract 测试：
+- `cargo test`: 通过，121 个库测试 + 56 个 integration/contract 测试：
   - chain 2、manual verify service 5、migration 6、order verify API 8、payment matching 9、payment window lookup 4、repository 5、signer 5、transfer log redb 7、transfer log store types 5。
 
 ## 多 Agent 审计结论
 
-当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store redb-backed runtime 初版、M12 付款匹配纯 service、手动 verify service/API route contract、API runtime composition 初版、scanner worker tick contract 初版、`services/collections` prefunded 初版和 collector broadcast tick 初版已经完成并通过编译/静态 contract 测试，但还没有真实 DB 集成测试、Anvil ERC20 集成测试、scanner runtime loop/confirmation sweep/readiness、collection API、collector worker recovery loop、collect receipt/retry/replacement 崩溃恢复、部署工件和演练记录。
+当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store redb-backed runtime 初版、M12 付款匹配纯 service、手动 verify service/API route contract、collection API route contract 初版、API runtime composition 初版、scanner worker tick contract 初版、`services/collections` prefunded 初版和 collector broadcast tick 初版已经完成并通过编译/静态 contract 测试，但还没有真实 DB 集成测试、Anvil ERC20 集成测试、scanner runtime loop/confirmation sweep/readiness、collector worker recovery loop、collect receipt/retry/replacement 崩溃恢复、部署工件和演练记录。
 
 原因：
 
-- 仓库已有订单 API 和 manual verify 的真实启动组装初版，但仍没有 scanner runtime loop/confirmation sweep/metrics/readiness、collection API、collector worker recovery loop、collect receipt/retry/replacement 崩溃恢复、真实 DB 集成测试、Anvil ERC20 集成测试、部署和 runbook 演练记录。
+- 仓库已有订单 API、manual verify 和 collection create 的真实启动组装初版，但仍没有 scanner runtime loop/confirmation sweep/metrics/readiness、collector worker recovery loop、collect receipt/retry/replacement 崩溃恢复、真实 DB 集成测试、Anvil ERC20 集成测试、部署和 runbook 演练记录。
 - runtime 目前只支持 non-production fake signer 作为开发/联调桥接；外部 signer/KMS/HSM adapter 未实现前不能 production。
 - 地址复用在 ERC20 场景无法绝对消除迟到付款歧义，已从 MVP 砍掉。
 - collect 不能允许任意 `to_address`，必须固定 treasury。
@@ -250,12 +257,14 @@
    - 单测覆盖 treasury-only 创建、unpaid 拒绝、余额不足、gas gate 在 nonce/sign 前 fail closed、签名和 outbound 持久化、ERC20 calldata。
    - `workers/collector.rs` 已有 broadcast tick 初版：准备 job 后广播 signed raw tx、校验 tx hash、调用 `mark_broadcast`。
    - collector 单测覆盖 no job、broadcast success、hash mismatch fail closed、不合法 worker id。
-   - 仍需 collector recovery loop、扫描 signed/broadcast outbound、broadcast 前/后崩溃恢复、receipt confirmation、same nonce replacement、真实 DB 原子化/并发测试和 API route。
+   - `POST /v1/collections` API route contract 初版已完成并接入 runtime：只允许 `amount=max`，拒绝未知字段/`to_address`，使用 `collections:create` scope，映射 created/existing/conflict/dependency 错误。
+   - 仍需 collection read API、collector recovery loop、扫描 signed/broadcast outbound、broadcast 前/后崩溃恢复、receipt confirmation、same nonce replacement、真实 DB 原子化/并发测试。
 21. 实现 API runtime composition。已完成初版：
    - `src/runtime.rs` 组装 PgPool、migration/seed、JWT、RPC chain id probe、redb stream、订单 service 和 manual verify service。
+   - runtime 已组装 collection create API 所需的 Pg collection/outbound/audit repositories、fake signer、RPC chain client 和 prefunded gas checker。
    - `src/main.rs` 已切到真实 runtime builder。
    - non-production 仅支持 `SIGNER_MODE=fake`，production signer adapter 仍未实现。
-   - 仍需 collection API、scanner/collector 常驻 loop、动态 readiness/metrics、真实 DB/RPC/Anvil e2e。
+   - 仍需 collection read API、scanner/collector 常驻 loop、动态 readiness/metrics、真实 DB/RPC/Anvil e2e。
 22. 用 Anvil + mock ERC20 做全流程 e2e，并补并发、reorg、KVDB rebuild、RPC 切换、崩溃恢复、metrics/alert/runbook drill。
 
 ## 全局进度板
@@ -267,7 +276,7 @@
 | MVP 生产验收审计 | 完成 | 结论：当前未完整闭环不可生产；验收项已纳入 MVP，见 `docs/PRODUCTION_READINESS.md` |
 | Rust 项目骨架 | 完成 | `cargo check` 通过 |
 | 配置、health、readyz、metrics | 完成 | typed config、production guard、`/healthz`、`/readyz`、`/metrics`、统一错误模型 |
-| JWT 鉴权 | 完成基础 | verifier/scope 已完成；订单 API 已接 scope 校验，后续新 `/v1/*` 端点仍需逐个接入 |
+| JWT 鉴权 | 完成基础 | verifier/scope 已完成；订单、verify、collection create API 已接 scope 校验，后续新 `/v1/*` 端点仍需逐个接入 |
 | PostgreSQL migrations | 完成 | sqlx migrator、初始 schema、运行时 seed helper、migration contract 测试；真实 DB apply 需设置 `PAY3_TEST_DATABASE_URL` |
 | db repositories | 完成初版 | traits + Pg repositories 已接入编译；repository contract 测试通过；还需有测试 DB 后补真实并发/负例集成测试 |
 | domain 状态机 | 完成 | amount/address/hash、order/payment/collection、KV reorg epoch、derivation rollover |
@@ -280,11 +289,11 @@
 | transfer_log_store | 完成 M9 runtime 初版 | canonical types + in-memory ingestor/reader + redb-backed ingestor/reader + redb persistence contract；retention cleanup、readiness/metrics wiring、Anvil 测试未做 |
 | services/payments | 完成纯 service contract | `TransferLogReader::logs_page` -> candidate lookup -> `MatchedPaymentInput`；`match_stored_transfer_logs` 已供 verify/scanner 复用 |
 | RPC provider manager / LogSource | 完成初版 | `HttpJsonRpcProvider` + `RpcProviderManager` + `RpcRangeSource`，含 chain_id 校验、hash mismatch fail-closed、capacity gate、failover；已接 API runtime 初版，metrics/Anvil 测试未做 |
-| API runtime composition | 完成初版 | `runtime::build_api_router` 连接 Pg、跑 migration/seed、打开 redb、校验 RPC chain id、挂订单和 verify；仅支持 non-production fake signer；scanner/collector loop、collection API、动态 readiness 未做 |
+| API runtime composition | 完成初版 | `runtime::build_api_router` 连接 Pg、跑 migration/seed、打开 redb、校验 RPC chain id、挂订单、verify 和 collection create；仅支持 non-production fake signer；scanner/collector loop、动态 readiness 未做 |
 | 付款 verify | 完成 service + route + runtime 初版 | `POST /v1/orders/{id}/verify` + `orders:verify` scope；manual service 已复用 matcher；Pg recorder 已完成并接入 runtime；真实 DB/Anvil e2e 未做 |
 | scanner worker | 部分完成 | tick contract 初版已完成：lease/CAS、KV reorg epoch、paged matcher、commit batch；runtime loop、confirmation sweep、rolling lookback/coverage gate、metrics/readiness 未完成 |
 | redb/KVDB | 完成 transfer log KV 初版 | `transfer_log_store/redb_store.rs` + `RedbTransferLogIngestor` 通过 contract；通用 cache 后置 |
-| services/collections | 完成初版 | treasury-only create + prefunded job prepare + signer/outbound/audit contract；collector runtime、broadcast/retry/receipt/replacement/API/真实 DB 原子化测试未做 |
+| services/collections | 完成初版 | treasury-only create + prefunded job prepare + signer/outbound/audit contract；collection create API route/runtime 已完成初版；collector runtime、broadcast/retry/receipt/replacement/真实 DB 原子化测试未做 |
 | collect worker | 部分完成 | broadcast tick 初版已完成：prepared outbound 后广播并 mark_broadcast；仍需 recovery loop、receipt confirmation、same nonce replacement 和 audit 补强 |
 | 外部 signer adapter | 未开始 | 已有 signer trait/fake；production 需要 KMS/HSM/external signer adapter |
 | 可观测性/告警 | 未开始 | `/metrics`、结构化日志、alert dry-run |

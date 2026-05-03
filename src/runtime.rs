@@ -13,10 +13,15 @@ use crate::{
         migrations::{
             MigrationBootstrapError, RuntimeSeedConfig, run_schema_migrations, seed_runtime_config,
         },
-        repositories::{PgOrderRepository, PgVerifiedPaymentRecorder},
+        repositories::{
+            PgAuditRepository, PgCollectionRepository, PgOrderRepository, PgOutboundRepository,
+            PgVerifiedPaymentRecorder,
+        },
     },
+    domain::{CollectionFees, RawAmount},
     health::StaticDependencyRegistry,
     services::{
+        collections::{AssumePrefundedGas, CollectionService, CollectionServiceConfig},
         orders::{OrderService, OrderServiceConfig, SystemClock},
         verify::{ManualOrderVerifyService, ManualVerifyConfig},
     },
@@ -37,6 +42,9 @@ const TRANSFER_LOG_MAX_UNIQUE_TO_ADDRESSES_PER_BATCH: usize = 1_000;
 const TRANSFER_LOG_MAX_DB_FALLBACK_ADDRESSES: usize = 1_000;
 const TRANSFER_LOG_CAPACITY_PROBE_BLOCKS: u64 = 100;
 const TRANSFER_LOG_RPC_MAX_RETRIES: u32 = 3;
+const COLLECTION_GAS_LIMIT: u64 = 80_000;
+const COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 50_000_000_000;
+const COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 2_000_000_000;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -63,6 +71,9 @@ pub enum RuntimeError {
 
     #[error(transparent)]
     OrderService(#[from] crate::services::orders::OrderServiceError),
+
+    #[error(transparent)]
+    CollectionService(#[from] crate::services::collections::CollectionServiceError),
 
     #[error(transparent)]
     Wallet(#[from] WalletError),
@@ -100,6 +111,11 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
 
     let auth = jwt_verifier(&config)?;
     let orders = Arc::new(order_service(&config, pool.clone(), rpc_source.clone())?);
+    let collections = Arc::new(collection_service(
+        &config,
+        pool.clone(),
+        rpc_source.clone(),
+    )?);
     let order_verify = Arc::new(ManualOrderVerifyService::new(
         PgOrderRepository::new(pool.clone()),
         PgVerifiedPaymentRecorder::new(pool),
@@ -117,6 +133,7 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
         auth,
         orders,
         order_verify,
+        collections,
         OrderResponseConfig::from_config(&config),
     ))
 }
@@ -169,6 +186,53 @@ fn order_service(
         PgOrderRepository::new(pool),
         HdWallet::new(deriver),
         rpc_source,
+    )?)
+}
+
+fn collection_service(
+    config: &AppConfig,
+    pool: PgPool,
+    rpc_source: RpcRangeSource,
+) -> Result<
+    CollectionService<
+        PgOrderRepository,
+        PgCollectionRepository,
+        PgOutboundRepository,
+        PgAuditRepository,
+        DeterministicFakeSigner,
+        RpcRangeSource,
+        AssumePrefundedGas,
+    >,
+    RuntimeError,
+> {
+    let signer = match &config.signer.mode {
+        SignerMode::Fake => DeterministicFakeSigner::with_allowed_key_refs(
+            "pay3-runtime-fake",
+            [config.signer.key_ref.clone()],
+        )?,
+        mode => {
+            return Err(RuntimeError::UnsupportedSignerMode { mode: mode.clone() });
+        }
+    };
+
+    Ok(CollectionService::new(
+        CollectionServiceConfig::new(
+            config.chain.chain_id,
+            config.chain.token_address,
+            config.chain.treasury_address,
+            CollectionFees::new(
+                COLLECTION_GAS_LIMIT,
+                RawAmount::from(COLLECTION_MAX_FEE_PER_GAS_WEI),
+                RawAmount::from(COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI),
+            ),
+        ),
+        PgOrderRepository::new(pool.clone()),
+        PgCollectionRepository::new(pool.clone()),
+        PgOutboundRepository::new(pool.clone()),
+        PgAuditRepository::new(pool),
+        signer,
+        rpc_source,
+        AssumePrefundedGas,
     )?)
 }
 
