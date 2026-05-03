@@ -50,8 +50,8 @@
   - `POST /v1/orders/{id}/verify`: `orders:verify` scope，通过 `OrderVerifyApiService` trait 注入；已有 manual verify service adapter，真实 runtime wiring 未完成。
   - API 通过 `OrderApiService` trait 注入 service；真实 `router(config)` 的 DB/RPC/ChainHeadReader 组装仍未接入。
 - `src/transfer_log_store/types.rs`: transfer log stream/cursor/log/header/page token canonical primitives。
-- `src/transfer_log_store/mod.rs`: in-memory `TransferLogIngestor`/`TransferLogReader`，覆盖连续扫描、空块 header、exclusive page token、reorg rewind。
-- `src/transfer_log_store/redb_store.rs`: redb persistence layer 原型，支持 config/cursor/header/log/range manifest 持久化、atomic batch write、exclusive `logs_page`、rewind delete；还不是完整 redb-backed ingestor runtime。
+- `src/transfer_log_store/mod.rs`: in-memory `TransferLogIngestor`/`TransferLogReader`，以及 redb-backed `RedbTransferLogIngestor` runtime 初版；覆盖连续扫描、空块 header、exclusive page token、reorg rewind、capacity gate 和持久化读路径。
+- `src/transfer_log_store/redb_store.rs`: redb persistence layer，支持 config/cursor/header/log/range manifest 持久化、stream config + cursor 原子初始化、atomic batch write、bounded `logs_in_range`、exclusive `logs_page`、rewind delete。
 - `tests/migration_contract.rs`: migration contract 测试；有 `PAY3_TEST_DATABASE_URL`/`TEST_DATABASE_URL` 时会实际 apply 到临时 schema，否则跳过 DB apply 分支。
 - `tests/repository_contract.rs`: repository SQL/contract 静态测试，覆盖幂等、lease/CAS、matched-only payments、collection job lock、nonce/replacement、audit insert。
 - `tests/chain_contract.rs`: chain 模块静态 contract 测试，确保暴露必要 trait/fake/RPC 控制点，且不依赖 axum API DTO、DB 或订单业务状态。
@@ -76,12 +76,12 @@
 
 - `cargo fmt -- --check`: 通过。
 - `cargo check`: 通过。
-- `cargo test`: 通过，101 个库测试 + 53 个 integration/contract 测试：
-  - chain 2、manual verify service 5、migration 6、order verify API 8、payment matching 9、payment window lookup 4、repository 5、signer 5、transfer log redb 4、transfer log store types 5。
+- `cargo test`: 通过，101 个库测试 + 56 个 integration/contract 测试：
+  - chain 2、manual verify service 5、migration 6、order verify API 8、payment matching 9、payment window lookup 4、repository 5、signer 5、transfer log redb 7、transfer log store types 5。
 
 ## 多 Agent 审计结论
 
-当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store 原型、M12 付款匹配纯 service、手动 verify service/API route contract 和 scanner worker tick contract 初版已经完成并通过编译/静态 contract 测试，但还没有真实 DB/RPC API wiring、真实 DB 集成测试、Anvil ERC20 集成测试、完整 redb-backed ingestor runtime、scanner runtime loop/confirmation sweep/readiness、collect worker、部署工件和演练记录。
+当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store redb-backed runtime 初版、M12 付款匹配纯 service、手动 verify service/API route contract 和 scanner worker tick contract 初版已经完成并通过编译/静态 contract 测试，但还没有真实 DB/RPC API wiring、真实 DB 集成测试、Anvil ERC20 集成测试、scanner runtime loop/confirmation sweep/readiness、collect worker、部署工件和演练记录。
 
 原因：
 
@@ -174,15 +174,18 @@
    - `TransferLogRange`、`TransferLogCapacityLimits`、`TransferLogCapacityReport`。
    - fake 覆盖 block range 批量 logs、token/range filtering、canonical block hash filtering、RPC failure、chain_id mismatch、reorg replacement、capacity probe、balance/receipt/broadcast。
    - 真实 `RpcRangeSource` / provider manager 已完成初版；注意还没有 Anvil ERC20 集成测试、runtime wiring 和生产 readiness 接入，不能用于生产 RPC。
-12. 实现独立 `transfer_log_store`。已完成原型/contract：
+12. 实现独立 `transfer_log_store`。已完成 redb-backed runtime 初版/contract：
    - 输入 `chain_id/token_address/start_block`。
    - in-memory ingestor 第一次从 `start_block` 扫，之后从 cursor `next_block` 继续轮询。
+   - redb-backed `RedbTransferLogIngestor` 第一次从 `start_block` 初始化 config/cursor，之后从 redb cursor `next_block` 继续轮询。
    - raw Transfer logs、block header cache、range manifest 保持在 memory/redb 层，不写 PostgreSQL。
    - 空 logs 区块也保存 header 并推进 cursor。
    - reader 主路径使用 `logs_page(limit)`，禁止无界读。
    - cursor 保存 `reorg_epoch/last_reorg_from/last_reorg_at/writer_epoch`。
-   - redb layer 已有 config/cursor/header/log/range manifest 持久化、atomic batch write、rewind delete。
-   - 仍需把 redb layer 接成完整 `TransferLogIngestor` runtime，并补 capacity probe、retention floor、KVDB coverage check。
+   - redb layer 已有 config/cursor/header/log/range manifest 持久化、stream config + cursor 原子初始化、atomic batch write、bounded `logs_in_range`、exclusive `logs_page`、rewind delete。
+   - redb runtime poll 前运行 `TransferLogSource::capacity_probe`；可缩小 batch，单块超阈值时返回 not ready 且不推进 cursor。
+   - redb runtime reorg 检测会 rewind KV cursor 并删除分叉块及之后的 headers/logs/range manifest，不触碰 PostgreSQL。
+   - 仍需 retention floor cleanup、runtime loop/readiness/metrics wiring、KVDB coverage/retention 对外状态和 Anvil ERC20 集成测试。
 13. 实现 `PaymentWindowLookup`。已完成：
    - memory watch set + 批量 fallback trait。
    - fallback miss 去重并一次批量查询；不做 per-address fallback。
@@ -212,7 +215,11 @@
    - provider count gate、`eth_chainId` 校验、latest/safe/finalized head、同高度 hash mismatch fail-closed。
    - `eth_getLogs` ERC20 Transfer range source、capacity probe、`ensure_capacity` gate、429/timeout/error failover。
    - 仍需 runtime wiring、metrics/readyz 接入和 Anvil ERC20 集成测试。
-19. 实现完整 redb-backed `TransferLogIngestor` runtime（或把现有 in-memory ingestor 抽到可替换 storage），替换当前原型路径。
+19. 实现完整 redb-backed `TransferLogIngestor` runtime（或把现有 in-memory ingestor 抽到可替换 storage），替换当前原型路径。已完成初版：
+   - `RedbTransferLogIngestor<S>` 实现 `TransferLogIngestor` 和 `TransferLogReader`。
+   - 支持 `ensure_stream`、`poll_once`、`rewind_to`、`cursor`、`block_header`、bounded `logs_in_range`、exclusive `logs_page`。
+   - poll batch 通过 capacity probe gate，超限 batch 自动缩小；单块超限 fail closed，不写入 headers/logs/cursor。
+   - redb contract 测试覆盖 reopen 后读状态、空块 header 持久化、reorg rewind+rescan、capacity gate 不推进 cursor。
 20. 实现 collect job，先只做 `prefunded`，但必须持久化 nonce/signed transaction，支持同 nonce replacement 和审计事件。
 21. 用 Anvil + mock ERC20 做全流程 e2e，并补并发、reorg、KVDB rebuild、RPC 切换、崩溃恢复、metrics/alert/runbook drill。
 
@@ -235,12 +242,12 @@
 | 创建订单 API | 完成 route contract | `POST /v1/orders` / `GET /v1/orders/{id}` / by-external-id，scope 和错误映射测试通过；真实 runtime wiring 等 chain/RPC/DB 组装 |
 | chain 纯契约/fake | 完成初版 | traits + normalized logs/headers/receipt + fake range/reorg/failure/capacity 测试；真实 RPC provider manager 初版已完成，Anvil ERC20 测试未做 |
 | PaymentWindowLookup | 完成 | watch set + 批量 fallback contract；禁止逐地址 fallback |
-| transfer_log_store | 部分完成 | canonical types + in-memory ingestor/reader + redb persistence layer contract；完整 redb-backed ingestor runtime/capacity gate/retention floor 未完成 |
+| transfer_log_store | 完成 M9 runtime 初版 | canonical types + in-memory ingestor/reader + redb-backed ingestor/reader + redb persistence contract；retention cleanup、readiness/metrics wiring、Anvil 测试未做 |
 | services/payments | 完成纯 service contract | `TransferLogReader::logs_page` -> candidate lookup -> `MatchedPaymentInput`；`match_stored_transfer_logs` 已供 verify/scanner 复用 |
 | RPC provider manager / LogSource | 完成初版 | `HttpJsonRpcProvider` + `RpcProviderManager` + `RpcRangeSource`，含 chain_id 校验、hash mismatch fail-closed、capacity gate、failover；runtime wiring/metrics/Anvil 测试未做 |
 | 付款 verify | 完成 service + route contract | `POST /v1/orders/{id}/verify` + `orders:verify` scope；manual service 已复用 matcher；Pg recorder 已完成；真实 runtime wiring 未完成 |
 | scanner worker | 部分完成 | tick contract 初版已完成：lease/CAS、KV reorg epoch、paged matcher、commit batch；runtime loop、confirmation sweep、rolling lookback/coverage gate、metrics/readiness 未完成 |
-| redb/KVDB | 部分完成 | `transfer_log_store/redb_store.rs` 原型通过 contract；通用 cache 后置 |
+| redb/KVDB | 完成 transfer log KV 初版 | `transfer_log_store/redb_store.rs` + `RedbTransferLogIngestor` 通过 contract；通用 cache 后置 |
 | collect | 未开始 | MVP 只做 prefunded；目标只能 treasury；必须有 outbound tx/replacement/audit |
 | 外部 signer adapter | 未开始 | 已有 signer trait/fake；production 需要 KMS/HSM/external signer adapter |
 | 可观测性/告警 | 未开始 | `/metrics`、结构化日志、alert dry-run |

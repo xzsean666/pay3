@@ -1,8 +1,13 @@
+use std::path::Path;
+
+use pay3::transfer_log_store::redb_store::RedbTransferLogStore as RuntimeRedbTransferLogStore;
 use pay3::{
-    domain::{BlockHash, EvmAddress, RawAmount, TxHash},
+    chain::{ChainBlock, FakeErc20ChainClient, TransferLog},
+    domain::{BlockHash, ChainBlockRef, EvmAddress, RawAmount, TxHash},
     transfer_log_store::{
-        LogPageToken, LogSourceKind, ScanTargetMode, StoredBlockHeader, StoredTransferLog,
-        StreamId, TransferLogCursor, TransferLogStreamConfig,
+        LogPageToken, LogSourceKind, PollOutcome, RedbTransferLogIngestor, ScanTargetMode,
+        StoredBlockHeader, StoredTransferLog, StreamId, TransferLogCursor, TransferLogIngestor,
+        TransferLogReader, TransferLogStoreError, TransferLogStreamConfig,
     },
 };
 use tempfile::NamedTempFile;
@@ -13,6 +18,7 @@ mod transfer_log_store {
 }
 
 #[path = "../src/transfer_log_store/redb_store.rs"]
+#[allow(dead_code)]
 mod redb_store;
 
 use redb_store::{RangeManifestDto, RedbTransferLogBatch, RedbTransferLogStore};
@@ -161,6 +167,103 @@ fn transfer_log_redb_rewind_deletes_block_and_after_and_records_reorg_cursor() {
     assert!(store.range_manifests(stream, 10).unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn redb_ingestor_polls_persists_and_reopens_reader_state() {
+    let file = NamedTempFile::new().unwrap();
+    let stream = stream();
+    let chain = runtime_chain(10).push_transfer_log(chain_log(stream, 9, 0, 0x42));
+    let ingestor = runtime_ingestor(chain.clone(), file.path());
+
+    ingestor.ensure_stream(config(stream)).await.unwrap();
+    let outcome = ingestor.poll_once(stream).await.unwrap();
+
+    assert!(matches!(
+        outcome,
+        PollOutcome::Advanced {
+            from_block: 9,
+            to_block: 10,
+            log_count: 1,
+            ..
+        }
+    ));
+    drop(ingestor);
+
+    let reopened = runtime_ingestor(chain, file.path());
+    let cursor = reopened.cursor(stream).await.unwrap();
+    assert_eq!(cursor.next_block, 11);
+    assert_eq!(cursor.last_completed_block, Some(10));
+    assert!(
+        reopened.block_header(stream, 10).await.unwrap().is_some(),
+        "empty log blocks must still persist headers"
+    );
+    assert_eq!(
+        reopened.logs_page(stream, None, 10).await.unwrap().logs,
+        vec![stored_from_chain_log(chain_log(stream, 9, 0, 0x42))]
+    );
+}
+
+#[tokio::test]
+async fn redb_ingestor_rewinds_persisted_state_on_reorg_and_rescans() {
+    let file = NamedTempFile::new().unwrap();
+    let stream = stream();
+    let chain = runtime_chain(9).push_transfer_log(chain_log(stream, 9, 0, 0x42));
+    let ingestor = runtime_ingestor(chain.clone(), file.path());
+    ingestor.ensure_stream(config(stream)).await.unwrap();
+    ingestor.poll_once(stream).await.unwrap();
+    drop(ingestor);
+
+    let new_block = chain_block(9, 0xaa);
+    let new_log = TransferLog {
+        block: new_block,
+        ..chain_log(stream, 9, 0, 0x99)
+    };
+    chain
+        .replace_block_for_reorg(new_block)
+        .push_transfer_log(new_log.clone());
+
+    let reorg_ingestor = runtime_ingestor(chain.clone(), file.path());
+    let rewound = reorg_ingestor.poll_once(stream).await.unwrap();
+    assert!(matches!(
+        rewound,
+        PollOutcome::Rewound {
+            from_block: 9,
+            cursor: TransferLogCursor {
+                reorg_epoch: 1,
+                next_block: 9,
+                ..
+            },
+            ..
+        }
+    ));
+    drop(reorg_ingestor);
+
+    let ingestor = runtime_ingestor(chain, file.path());
+    ingestor.poll_once(stream).await.unwrap();
+    let logs = ingestor.logs_in_range(stream, 9, 9, 10).await.unwrap();
+    assert_eq!(logs, vec![stored_from_chain_log(new_log)]);
+    assert_eq!(ingestor.cursor(stream).await.unwrap().reorg_epoch, 1);
+}
+
+#[tokio::test]
+async fn redb_ingestor_capacity_gate_fails_single_hot_block_without_advancing() {
+    let file = NamedTempFile::new().unwrap();
+    let stream = stream();
+    let mut stream_config = config(stream);
+    stream_config.batch_size_blocks = 1;
+    stream_config.max_logs_per_page = 1;
+    let chain = runtime_chain(9)
+        .push_transfer_log(chain_log(stream, 9, 0, 0x42))
+        .push_transfer_log(chain_log(stream, 9, 1, 0x43));
+    let ingestor = runtime_ingestor(chain, file.path());
+
+    ingestor.ensure_stream(stream_config).await.unwrap();
+    let error = ingestor.poll_once(stream).await.unwrap_err();
+
+    assert!(matches!(error, TransferLogStoreError::NotReady { .. }));
+    assert_eq!(ingestor.cursor(stream).await.unwrap().next_block, 9);
+    assert!(ingestor.block_header(stream, 9).await.unwrap().is_none());
+}
+
 fn stream() -> StreamId {
     StreamId::new(1, address(0x11))
 }
@@ -178,9 +281,68 @@ fn config(stream: StreamId) -> TransferLogStreamConfig {
         max_db_fallback_addresses: 100,
         capacity_probe_blocks: 10,
         reorg_lookback_blocks: 12,
-        target_mode: ScanTargetMode::LatestMinusConfirmations(6),
+        target_mode: ScanTargetMode::SafeTag,
         rpc_max_retries: 3,
         log_source: LogSourceKind::RpcRange,
+    }
+}
+
+fn runtime_ingestor(
+    chain: FakeErc20ChainClient,
+    path: &Path,
+) -> RedbTransferLogIngestor<FakeErc20ChainClient> {
+    RedbTransferLogIngestor::with_clock(
+        chain,
+        RuntimeRedbTransferLogStore::open(path).unwrap(),
+        now,
+    )
+}
+
+fn runtime_chain(safe_head: u64) -> FakeErc20ChainClient {
+    let chain = FakeErc20ChainClient::new(1);
+    for number in 9..=safe_head {
+        chain.insert_block(chain_block(number, number));
+    }
+    chain.set_safe_head(ChainBlockRef::new(safe_head, hash(safe_head)))
+}
+
+fn chain_log(stream: StreamId, block_number: u64, log_index: u64, to_byte: u8) -> TransferLog {
+    TransferLog {
+        chain_id: stream.chain_id,
+        token_address: stream.token_address,
+        block: chain_block(block_number, block_number),
+        tx_hash: tx(block_number, log_index),
+        log_index,
+        from_address: address(0x01),
+        to_address: address(to_byte),
+        amount_raw: RawAmount::from(block_number + log_index),
+    }
+}
+
+fn chain_block(number: u64, hash_byte: u64) -> ChainBlock {
+    ChainBlock::new(
+        number,
+        hash(hash_byte),
+        hash(hash_byte.saturating_sub(1)),
+        now() + time::Duration::seconds(number as i64),
+    )
+}
+
+fn stored_from_chain_log(log: TransferLog) -> StoredTransferLog {
+    StoredTransferLog {
+        chain_id: log.chain_id,
+        token_address: log.token_address,
+        block_number: log.block.number,
+        block_hash: log.block.hash,
+        block_timestamp: log.block.timestamp,
+        tx_hash: log.tx_hash,
+        tx_index: None,
+        log_index: log.log_index,
+        from_address: log.from_address,
+        to_address: log.to_address,
+        amount_raw: log.amount_raw,
+        removed: false,
+        observed_at: now(),
     }
 }
 

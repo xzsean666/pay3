@@ -3,6 +3,7 @@ pub mod types;
 
 use std::{
     collections::{BTreeMap, HashMap},
+    path::Path,
     sync::{Arc, Mutex},
 };
 
@@ -13,9 +14,14 @@ use time::OffsetDateTime;
 pub use types::*;
 
 use crate::{
-    chain::{ChainBlock, ChainError, ChainHeaderReader, TransferLogRange, TransferLogSource},
+    chain::{
+        ChainBlock, ChainError, ChainHeaderReader, TransferLogCapacityLimits, TransferLogRange,
+        TransferLogSource,
+    },
     domain::BlockHash,
 };
+
+use redb_store::{RangeManifestDto, RedbTransferLogBatch, RedbTransferLogStore};
 
 #[derive(Debug, Error)]
 pub enum TransferLogStoreError {
@@ -40,6 +46,9 @@ pub enum TransferLogStoreError {
     #[error("deep reorg detected for {stream:?} from block {from_block}")]
     DeepReorgDetected { stream: StreamId, from_block: u64 },
 
+    #[error("transfer log storage error: {message}")]
+    Storage { message: String },
+
     #[error(transparent)]
     Chain(#[from] ChainError),
 
@@ -50,6 +59,19 @@ pub enum TransferLogStoreError {
 impl TransferLogStoreError {
     fn invalid_limit(field: &'static str) -> Self {
         Self::InvalidLimit { field }
+    }
+}
+
+impl From<redb_store::RedbTransferLogStoreError> for TransferLogStoreError {
+    fn from(error: redb_store::RedbTransferLogStoreError) -> Self {
+        match error {
+            redb_store::RedbTransferLogStoreError::InvalidLimit { field } => {
+                Self::InvalidLimit { field }
+            }
+            error => Self::Storage {
+                message: error.to_string(),
+            },
+        }
     }
 }
 
@@ -139,6 +161,342 @@ impl<S> InMemoryTransferLogStore<S> {
 
     fn now(&self) -> OffsetDateTime {
         (self.now)()
+    }
+}
+
+#[derive(Clone)]
+pub struct RedbTransferLogIngestor<S> {
+    source: S,
+    store: Arc<RedbTransferLogStore>,
+    now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
+}
+
+impl<S> RedbTransferLogIngestor<S> {
+    pub fn new(source: S, store: RedbTransferLogStore) -> Self {
+        Self::with_clock(source, store, OffsetDateTime::now_utc)
+    }
+
+    pub fn with_clock(
+        source: S,
+        store: RedbTransferLogStore,
+        now: impl Fn() -> OffsetDateTime + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            source,
+            store: Arc::new(store),
+            now: Arc::new(now),
+        }
+    }
+
+    pub fn open(source: S, path: impl AsRef<Path>) -> TransferLogStoreResult<Self> {
+        Ok(Self::new(source, RedbTransferLogStore::open(path)?))
+    }
+
+    fn now(&self) -> OffsetDateTime {
+        (self.now)()
+    }
+
+    fn load_stream(
+        &self,
+        stream: StreamId,
+    ) -> TransferLogStoreResult<(TransferLogStreamConfig, TransferLogCursor)> {
+        let config = self
+            .store
+            .load_stream_config(stream)?
+            .ok_or(TransferLogStoreError::StreamNotFound { stream })?;
+        let cursor = self
+            .store
+            .load_cursor(stream)?
+            .ok_or(TransferLogStoreError::StreamNotFound { stream })?;
+        Ok((config, cursor))
+    }
+}
+
+#[async_trait]
+impl<S> TransferLogIngestor for RedbTransferLogIngestor<S>
+where
+    S: ChainHeaderReader + TransferLogSource + Send + Sync,
+{
+    async fn ensure_stream(
+        &self,
+        config: TransferLogStreamConfig,
+    ) -> TransferLogStoreResult<StreamState> {
+        config.validate_page_limits()?;
+        let stream = config.stream_id();
+        let now = self.now();
+
+        if let Some(existing) = self.store.load_stream_config(stream)? {
+            if let Some(conflict) = config.identity_conflict(&existing) {
+                return Err(TransferLogStoreError::StreamConfigConflict {
+                    stream: conflict.stream,
+                    existing_start_block: conflict.existing_start_block,
+                    requested_start_block: conflict.requested_start_block,
+                });
+            }
+
+            let cursor = match self.store.load_cursor(stream)? {
+                Some(cursor) => {
+                    self.store.save_stream_config(&config)?;
+                    cursor
+                }
+                None => {
+                    let cursor = TransferLogCursor::initial(&config, 1, now);
+                    self.store.save_stream_config_and_cursor(&config, &cursor)?;
+                    cursor
+                }
+            };
+
+            return Ok(StreamState {
+                stream,
+                config,
+                created_at: cursor.updated_at,
+                updated_at: now,
+                cursor,
+            });
+        }
+
+        let cursor = TransferLogCursor::initial(&config, 1, now);
+        self.store.save_stream_config_and_cursor(&config, &cursor)?;
+
+        Ok(StreamState {
+            stream,
+            config,
+            cursor: cursor.clone(),
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    async fn poll_once(&self, stream: StreamId) -> TransferLogStoreResult<PollOutcome> {
+        let (config, cursor) = self.load_stream(stream)?;
+
+        if let Some(outcome) = self.detect_reorg(stream, &config, &cursor).await? {
+            return Ok(outcome);
+        }
+
+        let target = resolve_target(&self.source, &config).await?;
+        if target < cursor.next_block {
+            return Ok(PollOutcome::Idle { cursor });
+        }
+
+        let from_block = cursor.next_block;
+        let to_block = self
+            .capacity_checked_to_block(&config, from_block, target)
+            .await?;
+        let mut headers = Vec::new();
+        for number in from_block..=to_block {
+            headers.push(self.source.block_by_number(number).await?);
+        }
+
+        let logs = self
+            .source
+            .transfer_logs(TransferLogRange::new(
+                config.chain_id,
+                config.token_address,
+                from_block,
+                to_block,
+            ))
+            .await?;
+
+        let now = self.now();
+        let headers_by_number = headers
+            .iter()
+            .map(|header| (header.number, *header))
+            .collect::<BTreeMap<_, _>>();
+        let stored_headers = headers
+            .into_iter()
+            .map(|header| stored_header(config.chain_id, config.token_address, header, now))
+            .collect::<Vec<_>>();
+        let stored_logs = logs
+            .into_iter()
+            .filter_map(|log| {
+                let header = headers_by_number.get(&log.block.number)?;
+                if header.hash != log.block.hash {
+                    return None;
+                }
+                Some(stored_log(log, header.timestamp, now))
+            })
+            .collect::<Vec<_>>();
+
+        let completed_hash = headers_by_number
+            .get(&to_block)
+            .map(|header| header.hash)
+            .unwrap_or(BlockHash::ZERO);
+        let mut next_cursor = cursor;
+        next_cursor.next_block = to_block.saturating_add(1);
+        next_cursor.last_completed_block = Some(to_block);
+        next_cursor.last_completed_hash = Some(completed_hash);
+        next_cursor.updated_at = now;
+        let log_count = stored_logs.len();
+
+        self.store.write_batch(RedbTransferLogBatch {
+            stream,
+            headers: stored_headers,
+            logs: stored_logs,
+            range_manifest: Some(RangeManifestDto {
+                stream,
+                from_block,
+                to_block,
+                block_count: to_block.saturating_sub(from_block).saturating_add(1),
+                log_count,
+                writer_epoch: next_cursor.writer_epoch,
+                completed_at: now,
+            }),
+            cursor: next_cursor.clone(),
+        })?;
+
+        Ok(PollOutcome::Advanced {
+            stream,
+            from_block,
+            to_block,
+            log_count,
+            cursor: next_cursor,
+        })
+    }
+
+    async fn rewind_to(
+        &self,
+        stream: StreamId,
+        block: u64,
+        _reason: RewindReason,
+    ) -> TransferLogStoreResult<()> {
+        let (config, _) = self.load_stream(stream)?;
+        let rewind_to = block.max(config.start_block);
+        self.store
+            .rewind_delete_from_block(stream, rewind_to, self.now())?
+            .ok_or(TransferLogStoreError::StreamNotFound { stream })?;
+        Ok(())
+    }
+}
+
+impl<S> RedbTransferLogIngestor<S>
+where
+    S: ChainHeaderReader + TransferLogSource + Send + Sync,
+{
+    async fn detect_reorg(
+        &self,
+        stream: StreamId,
+        config: &TransferLogStreamConfig,
+        cursor: &TransferLogCursor,
+    ) -> TransferLogStoreResult<Option<PollOutcome>> {
+        let Some(last_completed_block) = cursor.last_completed_block else {
+            return Ok(None);
+        };
+        let Some(last_completed_hash) = cursor.last_completed_hash else {
+            return Ok(None);
+        };
+
+        let current = self.source.block_by_number(last_completed_block).await?;
+        if current.hash == last_completed_hash {
+            return Ok(None);
+        }
+
+        let reorg_floor = last_completed_block
+            .saturating_sub(config.reorg_lookback_blocks.saturating_sub(1))
+            .max(config.start_block);
+        let mut first_diverged = last_completed_block;
+        for number in reorg_floor..=last_completed_block {
+            let current = self.source.block_by_number(number).await?;
+            let stored_hash = self
+                .store
+                .load_block_header(stream, number)?
+                .map(|header| header.block_hash);
+            if stored_hash != Some(current.hash) {
+                first_diverged = number;
+                break;
+            }
+        }
+
+        let cursor = self
+            .store
+            .rewind_delete_from_block(stream, first_diverged, self.now())?
+            .ok_or(TransferLogStoreError::StreamNotFound { stream })?;
+        Ok(Some(PollOutcome::Rewound {
+            stream,
+            from_block: first_diverged,
+            cursor,
+        }))
+    }
+
+    async fn capacity_checked_to_block(
+        &self,
+        config: &TransferLogStreamConfig,
+        from_block: u64,
+        target: u64,
+    ) -> TransferLogStoreResult<u64> {
+        let batch_size = effective_batch_size(config);
+        let mut to_block = from_block
+            .saturating_add(batch_size.saturating_sub(1))
+            .min(target);
+        let limits = transfer_log_capacity_limits(config);
+
+        loop {
+            let range =
+                TransferLogRange::new(config.chain_id, config.token_address, from_block, to_block);
+            let report = self.source.capacity_probe(range, limits).await?;
+            if report.is_within_limits() {
+                return Ok(to_block);
+            }
+
+            let block_count = to_block.saturating_sub(from_block).saturating_add(1);
+            if block_count <= 1 {
+                return Err(TransferLogStoreError::NotReady {
+                    reason: format!(
+                        "transfer log capacity exceeded for block {from_block}: {} logs, max {}",
+                        report.log_count, report.limits.max_logs
+                    ),
+                });
+            }
+
+            let next_block_count = (block_count / 2).max(1);
+            to_block = from_block.saturating_add(next_block_count.saturating_sub(1));
+        }
+    }
+}
+
+#[async_trait]
+impl<S> TransferLogReader for RedbTransferLogIngestor<S>
+where
+    S: Send + Sync,
+{
+    async fn cursor(&self, stream: StreamId) -> TransferLogStoreResult<TransferLogCursor> {
+        Ok(self.load_stream(stream)?.1)
+    }
+
+    async fn block_header(
+        &self,
+        stream: StreamId,
+        block: u64,
+    ) -> TransferLogStoreResult<Option<StoredBlockHeader>> {
+        self.load_stream(stream)?;
+        Ok(self.store.load_block_header(stream, block)?)
+    }
+
+    async fn logs_in_range(
+        &self,
+        stream: StreamId,
+        from: u64,
+        to: u64,
+        max_logs: usize,
+    ) -> TransferLogStoreResult<Vec<StoredTransferLog>> {
+        if max_logs == 0 {
+            return Err(TransferLogStoreError::invalid_limit("max_logs"));
+        }
+        self.load_stream(stream)?;
+        Ok(self.store.logs_in_range(stream, from, to, max_logs)?)
+    }
+
+    async fn logs_page(
+        &self,
+        stream: StreamId,
+        after: Option<LogPageToken>,
+        limit: usize,
+    ) -> TransferLogStoreResult<LogsPage> {
+        if limit == 0 {
+            return Err(TransferLogStoreError::invalid_limit("limit"));
+        }
+        self.load_stream(stream)?;
+        Ok(self.store.logs_page(stream, after, limit)?)
     }
 }
 
@@ -534,6 +892,22 @@ where
         }
     };
     Ok(head.number)
+}
+
+fn effective_batch_size(config: &TransferLogStreamConfig) -> u64 {
+    let requested = config.batch_size_blocks.max(1);
+    if config.max_batch_size_blocks == 0 {
+        requested
+    } else {
+        requested.min(config.max_batch_size_blocks)
+    }
+}
+
+fn transfer_log_capacity_limits(config: &TransferLogStreamConfig) -> TransferLogCapacityLimits {
+    TransferLogCapacityLimits {
+        max_logs: config.max_logs_per_page,
+        max_logs_per_block: config.max_logs_per_page,
+    }
 }
 
 fn stored_header(

@@ -60,7 +60,20 @@ pub struct RedbTransferLogStore {
 impl RedbTransferLogStore {
     pub fn open(path: impl AsRef<Path>) -> RedbTransferLogStoreResult<Self> {
         let db = Database::create(path).map_err(redb_error)?;
-        Ok(Self { db })
+        let store = Self { db };
+        store.initialize_tables()?;
+        Ok(store)
+    }
+
+    fn initialize_tables(&self) -> RedbTransferLogStoreResult<()> {
+        let write = self.db.begin_write().map_err(redb_error)?;
+        {
+            write.open_table(META).map_err(redb_error)?;
+            write.open_table(HEADERS).map_err(redb_error)?;
+            write.open_table(LOGS).map_err(redb_error)?;
+            write.open_table(RANGES).map_err(redb_error)?;
+        }
+        write.commit().map_err(redb_error)
     }
 
     pub fn save_stream_config(
@@ -94,6 +107,29 @@ impl RedbTransferLogStore {
             let value = serialize(cursor)?;
             table
                 .insert(key.as_slice(), value.as_slice())
+                .map_err(redb_error)?;
+        }
+        write.commit().map_err(redb_error)
+    }
+
+    pub fn save_stream_config_and_cursor(
+        &self,
+        config: &TransferLogStreamConfig,
+        cursor: &TransferLogCursor,
+    ) -> RedbTransferLogStoreResult<()> {
+        let write = self.db.begin_write().map_err(redb_error)?;
+        {
+            let mut table = write.open_table(META).map_err(redb_error)?;
+            let config_key = meta_key(config.stream_id(), META_CONFIG);
+            let config_value = serialize(config)?;
+            table
+                .insert(config_key.as_slice(), config_value.as_slice())
+                .map_err(redb_error)?;
+
+            let cursor_key = meta_key(cursor.stream, META_CURSOR);
+            let cursor_value = serialize(cursor)?;
+            table
+                .insert(cursor_key.as_slice(), cursor_value.as_slice())
                 .map_err(redb_error)?;
         }
         write.commit().map_err(redb_error)
@@ -145,6 +181,43 @@ impl RedbTransferLogStore {
                 .map_err(redb_error)?;
         }
         write.commit().map_err(redb_error)
+    }
+
+    pub fn logs_in_range(
+        &self,
+        stream: StreamId,
+        from: u64,
+        to: u64,
+        max_logs: usize,
+    ) -> RedbTransferLogStoreResult<Vec<StoredTransferLog>> {
+        if max_logs == 0 {
+            return Err(RedbTransferLogStoreError::InvalidLimit { field: "max_logs" });
+        }
+        if from > to {
+            return Ok(Vec::new());
+        }
+
+        let read = self.db.begin_read().map_err(redb_error)?;
+        let table = read.open_table(LOGS).map_err(redb_error)?;
+        let start = log_key(stream, from, 0);
+        let end = match to.checked_add(1) {
+            Some(next_block) => log_key(stream, next_block, 0),
+            None => prefix_end(&log_prefix(stream)),
+        };
+
+        let mut logs = Vec::with_capacity(max_logs);
+        for item in table
+            .range::<&[u8]>((
+                Bound::Included(start.as_slice()),
+                Bound::Excluded(end.as_slice()),
+            ))
+            .map_err(redb_error)?
+            .take(max_logs)
+        {
+            let (_, value) = item.map_err(redb_error)?;
+            logs.push(deserialize(value.value())?);
+        }
+        Ok(logs)
     }
 
     pub fn logs_page(
