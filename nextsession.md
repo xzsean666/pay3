@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、transfer log store、付款匹配 service 和手动 verify API route contract，并完成 Phase 5 `workers/scanner` tick contract 初版。
+仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，并完成 Phase 5 `workers/scanner` tick contract 初版。
 
 已完成：
 
@@ -18,6 +18,13 @@
   - `ChainBlock`、`TransferLog`、`TxReceipt`、capacity probe DTO。
   - `FakeErc20ChainClient` 可控制 range logs、RPC failure、reorg block replacement、balances、receipts、broadcast tx hash。
   - 已桥接 `OrderChainHeadReader`，后续订单 service 可用真实 chain head reader。
+- `src/chain/rpc.rs`: RPC provider manager / `RpcRangeSource` 初版：
+  - `JsonRpcProvider` trait、`HttpJsonRpcProvider`、`RpcProviderManager`、`RpcRangeSource`。
+  - provider count gate、`eth_chainId` 校验、latest/safe/finalized head 读取、同高度 block hash mismatch fail-closed。
+  - HTTP JSON-RPC 429/timeout/error 会 failover 到下一个 provider；readiness probe 可校验 chain id 和 heads。
+  - `RpcRangeSource` 实现 `ChainHeaderReader`、`TransferLogSource`、`Erc20ChainClient`。
+  - 支持 ERC20 `Transfer` `eth_getLogs` range filter、topic/data 解析、block header 校验、capacity probe 和 `ensure_capacity` gate。
+  - 支持 `balanceOf`、receipt 查询、signed tx broadcast 的 RPC adapter 初版；尚未做 Anvil ERC20 集成测试和真实 runtime wiring。
 - `src/db/migrations/20260502000100_initial_schema.sql`: PostgreSQL 初始 schema。
 - `src/db/migrations.rs`: sqlx migrator 和运行时 seed helper，用于初始化 `wallet_cursors`、`chain_cursors`、`treasury_addresses`。
 - `src/db/repositories/**`: Order/Payment/Collection/Outbound/Audit repository trait 和 PostgreSQL 实现初版。
@@ -41,13 +48,13 @@
   - `GET /v1/orders/{id}`: `orders:read` scope。
   - `GET /v1/orders/by-external-id/{external_id}`: `orders:read` scope。
   - `POST /v1/orders/{id}/verify`: `orders:verify` scope，通过 `OrderVerifyApiService` trait 注入；已有 manual verify service adapter，真实 runtime wiring 未完成。
-  - API 通过 `OrderApiService` trait 注入 service；真实 `router(config)` 的 DB/RPC/ChainHeadReader 组装仍需后续 chain/RPC 模块完成后接入。
+  - API 通过 `OrderApiService` trait 注入 service；真实 `router(config)` 的 DB/RPC/ChainHeadReader 组装仍未接入。
 - `src/transfer_log_store/types.rs`: transfer log stream/cursor/log/header/page token canonical primitives。
 - `src/transfer_log_store/mod.rs`: in-memory `TransferLogIngestor`/`TransferLogReader`，覆盖连续扫描、空块 header、exclusive page token、reorg rewind。
 - `src/transfer_log_store/redb_store.rs`: redb persistence layer 原型，支持 config/cursor/header/log/range manifest 持久化、atomic batch write、exclusive `logs_page`、rewind delete；还不是完整 redb-backed ingestor runtime。
 - `tests/migration_contract.rs`: migration contract 测试；有 `PAY3_TEST_DATABASE_URL`/`TEST_DATABASE_URL` 时会实际 apply 到临时 schema，否则跳过 DB apply 分支。
 - `tests/repository_contract.rs`: repository SQL/contract 静态测试，覆盖幂等、lease/CAS、matched-only payments、collection job lock、nonce/replacement、audit insert。
-- `tests/chain_contract.rs`: chain 模块静态 contract 测试，确保暴露必要 trait/fake 控制点，且不依赖 HTTP、DB 或订单业务状态。
+- `tests/chain_contract.rs`: chain 模块静态 contract 测试，确保暴露必要 trait/fake/RPC 控制点，且不依赖 axum API DTO、DB 或订单业务状态。
 - `tests/signer_contract.rs`: signer fake/contract 测试。
 - `tests/payment_window_lookup_contract.rs`: watch-set hit/miss 和批量 fallback contract 测试。
 - `tests/payment_matching_contract.rs`: 付款匹配分页、候选过滤、窗口判断、确认数和歧义拒绝 contract 测试。
@@ -69,16 +76,16 @@
 
 - `cargo fmt -- --check`: 通过。
 - `cargo check`: 通过。
-- `cargo test`: 通过，97 个库测试 + 53 个 integration/contract 测试：
+- `cargo test`: 通过，101 个库测试 + 53 个 integration/contract 测试：
   - chain 2、manual verify service 5、migration 6、order verify API 8、payment matching 9、payment window lookup 4、repository 5、signer 5、transfer log redb 4、transfer log store types 5。
 
 ## 多 Agent 审计结论
 
-当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、M9 transfer log store 原型、M12 付款匹配纯 service、手动 verify service/API route contract 和 scanner worker tick contract 初版已经完成并通过编译/静态 contract 测试，但还没有真实 RPC provider manager、真实 DB/RPC API wiring、真实 DB 集成测试、完整 redb-backed ingestor runtime、scanner runtime loop/confirmation sweep/readiness、collect worker、部署工件和演练记录。
+当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store 原型、M12 付款匹配纯 service、手动 verify service/API route contract 和 scanner worker tick contract 初版已经完成并通过编译/静态 contract 测试，但还没有真实 DB/RPC API wiring、真实 DB 集成测试、Anvil ERC20 集成测试、完整 redb-backed ingestor runtime、scanner runtime loop/confirmation sweep/readiness、collect worker、部署工件和演练记录。
 
 原因：
 
-- 仓库还没有订单 API 的真实 DB/RPC runtime wiring、manual verify 的真实 runtime wiring、scanner runtime loop/confirmation sweep/metrics/readiness、collect worker、真实 DB 集成测试、部署和 runbook 演练记录。
+- 仓库还没有订单 API 的真实 DB/RPC runtime wiring、manual verify 的真实 runtime wiring、scanner runtime loop/confirmation sweep/metrics/readiness、collect worker、真实 DB 集成测试、Anvil ERC20 集成测试、部署和 runbook 演练记录。
 - 地址复用在 ERC20 场景无法绝对消除迟到付款歧义，已从 MVP 砍掉。
 - collect 不能允许任意 `to_address`，必须固定 treasury。
 - 需要 reorg/finality 处理，否则可能把孤块付款标为 `paid`。
@@ -166,7 +173,7 @@
    - `ChainHeaderReader` / `TransferLogSource` / `Erc20ChainClient`。
    - `TransferLogRange`、`TransferLogCapacityLimits`、`TransferLogCapacityReport`。
    - fake 覆盖 block range 批量 logs、token/range filtering、canonical block hash filtering、RPC failure、chain_id mismatch、reorg replacement、capacity probe、balance/receipt/broadcast。
-   - 注意：还没有真实 `RpcRangeSource` / provider manager / Anvil ERC20 测试；不能用于生产 RPC。
+   - 真实 `RpcRangeSource` / provider manager 已完成初版；注意还没有 Anvil ERC20 集成测试、runtime wiring 和生产 readiness 接入，不能用于生产 RPC。
 12. 实现独立 `transfer_log_store`。已完成原型/contract：
    - 输入 `chain_id/token_address/start_block`。
    - in-memory ingestor 第一次从 `start_block` 扫，之后从 cursor `next_block` 继续轮询。
@@ -200,7 +207,11 @@
    - raw scan batches 仍由 `transfer_log_store` 管理，scanner 不直接 `eth_getLogs`。
    - 已覆盖 lease held、claim+commit、KV reorg、空 page 推进、page incomplete 不提交、CAS mismatch。
    - 仍需 runtime loop、confirmation sweep、rolling lookback/coverage gate、metrics/readiness、真实 DB 集成测试。
-18. 实现 RPC provider manager、`ChainHeaderReader`、`TransferLogSource` capacity gate。
+18. 实现 RPC provider manager、`ChainHeaderReader`、`TransferLogSource` capacity gate。已完成初版：
+   - `JsonRpcProvider` / `HttpJsonRpcProvider` / `RpcProviderManager` / `RpcRangeSource`。
+   - provider count gate、`eth_chainId` 校验、latest/safe/finalized head、同高度 hash mismatch fail-closed。
+   - `eth_getLogs` ERC20 Transfer range source、capacity probe、`ensure_capacity` gate、429/timeout/error failover。
+   - 仍需 runtime wiring、metrics/readyz 接入和 Anvil ERC20 集成测试。
 19. 实现完整 redb-backed `TransferLogIngestor` runtime（或把现有 in-memory ingestor 抽到可替换 storage），替换当前原型路径。
 20. 实现 collect job，先只做 `prefunded`，但必须持久化 nonce/signed transaction，支持同 nonce replacement 和审计事件。
 21. 用 Anvil + mock ERC20 做全流程 e2e，并补并发、reorg、KVDB rebuild、RPC 切换、崩溃恢复、metrics/alert/runbook drill。
@@ -222,11 +233,11 @@
 | signer contract/fake | 完成 | `SignerProvider` + deterministic fake signer；production profile 仍禁止 fake/local signer |
 | 创建订单 service | 完成初版 | canonical request_hash、链头窗口、wallet 派生、fake repo/head 测试通过；真实 DB 并发测试后补 |
 | 创建订单 API | 完成 route contract | `POST /v1/orders` / `GET /v1/orders/{id}` / by-external-id，scope 和错误映射测试通过；真实 runtime wiring 等 chain/RPC/DB 组装 |
-| chain 纯契约/fake | 完成初版 | traits + normalized logs/headers/receipt + fake range/reorg/failure/capacity 测试；真实 RPC provider manager 未开始 |
+| chain 纯契约/fake | 完成初版 | traits + normalized logs/headers/receipt + fake range/reorg/failure/capacity 测试；真实 RPC provider manager 初版已完成，Anvil ERC20 测试未做 |
 | PaymentWindowLookup | 完成 | watch set + 批量 fallback contract；禁止逐地址 fallback |
 | transfer_log_store | 部分完成 | canonical types + in-memory ingestor/reader + redb persistence layer contract；完整 redb-backed ingestor runtime/capacity gate/retention floor 未完成 |
 | services/payments | 完成纯 service contract | `TransferLogReader::logs_page` -> candidate lookup -> `MatchedPaymentInput`；`match_stored_transfer_logs` 已供 verify/scanner 复用 |
-| RPC provider manager / LogSource | 未开始 | capacity gate、hash mismatch 暂停 |
+| RPC provider manager / LogSource | 完成初版 | `HttpJsonRpcProvider` + `RpcProviderManager` + `RpcRangeSource`，含 chain_id 校验、hash mismatch fail-closed、capacity gate、failover；runtime wiring/metrics/Anvil 测试未做 |
 | 付款 verify | 完成 service + route contract | `POST /v1/orders/{id}/verify` + `orders:verify` scope；manual service 已复用 matcher；Pg recorder 已完成；真实 runtime wiring 未完成 |
 | scanner worker | 部分完成 | tick contract 初版已完成：lease/CAS、KV reorg epoch、paged matcher、commit batch；runtime loop、confirmation sweep、rolling lookback/coverage gate、metrics/readiness 未完成 |
 | redb/KVDB | 部分完成 | `transfer_log_store/redb_store.rs` 原型通过 contract；通用 cache 后置 |

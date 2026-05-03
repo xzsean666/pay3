@@ -1,3 +1,5 @@
+pub mod rpc;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex},
@@ -13,10 +15,29 @@ use crate::{
     services::orders::{OrderChainHeadReader, OrderServiceError},
 };
 
+pub use rpc::{
+    ERC20_TRANSFER_TOPIC, HttpJsonRpcProvider, JsonRpcProvider, RpcProviderChainStatus,
+    RpcProviderManager, RpcProviderReadiness, RpcRangeSource, SharedJsonRpcProvider,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ChainError {
     #[error("chain RPC unavailable: {message}")]
     RpcUnavailable { message: String },
+
+    #[error("malformed chain RPC response: {message}")]
+    MalformedRpcResponse { message: String },
+
+    #[error(
+        "RPC provider hash mismatch for {context}: {left_provider} returned {left_hash}, {right_provider} returned {right_hash}"
+    )]
+    ProviderHashMismatch {
+        context: String,
+        left_provider: String,
+        left_hash: BlockHash,
+        right_provider: String,
+        right_hash: BlockHash,
+    },
 
     #[error("invalid block range {from_block}..={to_block}")]
     InvalidBlockRange { from_block: u64, to_block: u64 },
@@ -37,6 +58,12 @@ pub enum ChainError {
 impl ChainError {
     pub fn rpc_unavailable(message: impl Into<String>) -> Self {
         Self::RpcUnavailable {
+            message: message.into(),
+        }
+    }
+
+    pub fn malformed_rpc_response(message: impl Into<String>) -> Self {
+        Self::MalformedRpcResponse {
             message: message.into(),
         }
     }
