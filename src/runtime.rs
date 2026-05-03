@@ -31,6 +31,10 @@ use crate::{
         TransferLogStoreError, TransferLogStreamConfig,
     },
     wallet::{DeterministicFakeDeriver, HdWallet, WalletError},
+    workers::transfer_log_ingestor::{
+        TransferLogIngestorLoopConfig, TransferLogIngestorLoopError,
+        spawn_transfer_log_ingestor_loop,
+    },
 };
 
 const LATE_PAYMENT_MONITOR_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -70,6 +74,9 @@ pub enum RuntimeError {
     TransferLogStore(#[from] TransferLogStoreError),
 
     #[error(transparent)]
+    TransferLogIngestorLoop(#[from] TransferLogIngestorLoopError),
+
+    #[error(transparent)]
     OrderService(#[from] crate::services::orders::OrderServiceError),
 
     #[error(transparent)]
@@ -105,9 +112,16 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
     ensure_runtime_signer_health(&config).await?;
 
     let log_store = RedbTransferLogIngestor::open(rpc_source.clone(), &config.kvdb.path)?;
-    log_store
-        .ensure_stream(transfer_log_stream_config(&config))
-        .await?;
+    let stream_config = transfer_log_stream_config(&config);
+    let stream = stream_config.stream_id();
+    log_store.ensure_stream(stream_config.clone()).await?;
+    let _log_ingestor_loop = spawn_transfer_log_ingestor_loop(
+        log_store.clone(),
+        TransferLogIngestorLoopConfig::new(
+            stream,
+            std::time::Duration::from_millis(stream_config.poll_interval_ms),
+        ),
+    )?;
 
     let auth = jwt_verifier(&config)?;
     let orders = Arc::new(order_service(&config, pool.clone(), rpc_source.clone())?);

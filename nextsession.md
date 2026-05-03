@@ -59,10 +59,15 @@
   - tick 开始时会优先通过 `OutboundRepository::claim_signed_collect_tx_for_broadcast` claim 已持久化但未广播的 `transferring + signed` collect outbound，重播同一 `signed_tx`，覆盖 broadcast 前崩溃恢复。
   - 无待重播 signed outbound 时，会通过 `OutboundRepository::claim_broadcast_collect_tx_for_receipt` claim `confirming + broadcast` collect outbound，查询 receipt；success 标记 outbound/collection confirmed，reverted 标记 failed，receipt missing 保持 pending。
   - 仍缺 same nonce replacement、确认数/finality 策略、confirmation audit event 和常驻 runtime loop。
+- `src/workers/transfer_log_ingestor.rs`: transfer log ingestor 常驻 poll loop 初版：
+  - `TransferLogIngestorLoop` 包装 `TransferLogIngestor::poll_once`，校验非零 poll interval。
+  - `spawn_transfer_log_ingestor_loop` 使用 `tokio::time::interval` 周期 poll，`Advanced/Rewound/Idle` 写结构化 tracing，单次错误记录后继续循环。
+  - 单测覆盖配置校验、按 stream tick、poll error 传播。
 - `src/runtime.rs`、`src/main.rs`、`src/api/mod.rs`: API runtime composition 初版：
   - `main.rs` 现在通过 `runtime::build_api_router(config)` 异步启动，不再直接使用健康检查壳子。
   - runtime 会校验 profile、连接 `PgPool`、运行 schema migration、seed `wallet_cursors/chain_cursors/treasury_addresses`。
   - runtime 会创建 KVDB 父目录、打开 redb-backed `RedbTransferLogIngestor`，并为配置链/token 初始化 stream。
+  - runtime 会 spawn redb-backed transfer log ingestor poll loop，持续把 ERC20 `Transfer` raw logs 写入 KVDB，供 manual verify 和后续 scanner 读取。
   - runtime 会创建 `RpcRangeSource`，启动时校验 RPC `eth_chainId`。
   - runtime 会创建 JWT verifier，并把 `PgOrderRepository + HdWallet<DeterministicFakeDeriver> + RpcRangeSource` 组装进真实 `OrderService`。
   - runtime 会把 `ManualOrderVerifyService` 接到 API verify route，依赖 `PgOrderRepository`、`PgVerifiedPaymentRecorder`、redb log reader 和 `RpcRangeSource`。
@@ -109,16 +114,16 @@
 
 - `cargo fmt -- --check`: 通过。
 - `cargo check`: 通过。
-- `cargo test`: 通过，128 个库测试 + 56 个 integration/contract 测试：
+- `cargo test`: 通过，131 个库测试 + 56 个 integration/contract 测试：
   - chain 2、manual verify service 5、migration 6、order verify API 8、payment matching 9、payment window lookup 4、repository 5、signer 5、transfer log redb 7、transfer log store types 5。
 
 ## 多 Agent 审计结论
 
-当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store redb-backed runtime 初版、M12 付款匹配纯 service、手动 verify service/API route contract、collection create/read API route contract 初版、API runtime composition 初版、scanner worker tick contract 初版、`services/collections` prefunded 初版、collector broadcast tick 初版和 broadcast 前/后崩溃恢复与 receipt sweep tick 初版已经完成并通过编译/静态 contract 测试，但还没有真实 DB 集成测试、Anvil ERC20 集成测试、scanner runtime loop/confirmation sweep/readiness、collect retry/replacement 崩溃恢复、部署工件和演练记录。
+当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store redb-backed runtime 初版和常驻 poll loop、M12 付款匹配纯 service、手动 verify service/API route contract、collection create/read API route contract、API runtime composition 初版、scanner worker tick contract 初版、`services/collections` prefunded 初版、collector broadcast tick 初版和 broadcast 前/后崩溃恢复与 receipt sweep tick 初版已经完成并通过编译/静态 contract 测试，但还没有真实 DB 集成测试、Anvil ERC20 集成测试、scanner runtime loop/confirmation sweep/readiness、collect retry/replacement 崩溃恢复、部署工件和演练记录。
 
 原因：
 
-- 仓库已有订单 API、manual verify 和 collection create/read 的真实启动组装初版，也已有 collector broadcast 前/后崩溃恢复和 receipt sweep tick 初版；但仍没有 scanner runtime loop/confirmation sweep/metrics/readiness、collect retry/replacement 崩溃恢复、真实 DB 集成测试、Anvil ERC20 集成测试、部署和 runbook 演练记录。
+- 仓库已有订单 API、manual verify、collection create/read 和 transfer log ingestor poll loop 的真实启动组装初版，也已有 collector broadcast 前/后崩溃恢复和 receipt sweep tick 初版；但仍没有 scanner runtime loop/confirmation sweep/metrics/readiness、collector 常驻 loop、collect retry/replacement 崩溃恢复、真实 DB 集成测试、Anvil ERC20 集成测试、部署和 runbook 演练记录。
 - runtime 目前只支持 non-production fake signer 作为开发/联调桥接；外部 signer/KMS/HSM adapter 未实现前不能 production。
 - 地址复用在 ERC20 场景无法绝对消除迟到付款歧义，已从 MVP 砍掉。
 - collect 不能允许任意 `to_address`，必须固定 treasury。
@@ -219,7 +224,8 @@
    - redb layer 已有 config/cursor/header/log/range manifest 持久化、stream config + cursor 原子初始化、atomic batch write、bounded `logs_in_range`、exclusive `logs_page`、rewind delete。
    - redb runtime poll 前运行 `TransferLogSource::capacity_probe`；可缩小 batch，单块超阈值时返回 not ready 且不推进 cursor。
    - redb runtime reorg 检测会 rewind KV cursor 并删除分叉块及之后的 headers/logs/range manifest，不触碰 PostgreSQL。
-   - 仍需 retention floor cleanup、runtime loop/readiness/metrics wiring、KVDB coverage/retention 对外状态和 Anvil ERC20 集成测试。
+   - redb-backed ingestor poll loop 已接入 API runtime 启动路径，启动后周期执行 `poll_once`。
+   - 仍需 retention floor cleanup、readiness/metrics wiring、KVDB coverage/retention 对外状态和 Anvil ERC20 集成测试。
 13. 实现 `PaymentWindowLookup`。已完成：
    - memory watch set + 批量 fallback trait。
    - fallback miss 去重并一次批量查询；不做 per-address fallback。
@@ -254,6 +260,7 @@
    - 支持 `ensure_stream`、`poll_once`、`rewind_to`、`cursor`、`block_header`、bounded `logs_in_range`、exclusive `logs_page`。
    - poll batch 通过 capacity probe gate，超限 batch 自动缩小；单块超限 fail closed，不写入 headers/logs/cursor。
    - redb contract 测试覆盖 reopen 后读状态、空块 header 持久化、reorg rewind+rescan、capacity gate 不推进 cursor。
+   - `workers/transfer_log_ingestor` 已提供常驻 poll loop 并接入 `runtime::build_api_router`，启动后持续写 KV raw logs。
 20. 实现 collect job，先只做 `prefunded`，但必须持久化 nonce/signed transaction，支持同 nonce replacement 和审计事件。已完成 service 初版：
    - `services/collections.rs` 提供 `CollectionService`、`CreateCollectionInput`、`CollectionAmount::{Max, Exact}`、`PrefundedGasChecker`。
    - 创建 collection 固定写配置 treasury，要求订单 `paid` 且 chain/token 匹配，生成 canonical request_hash，调用 `CollectionRepository::create_collection_idempotent`。
@@ -293,10 +300,10 @@
 | 创建订单 API | 完成 route + runtime 初版 | `POST /v1/orders` / `GET /v1/orders/{id}` / by-external-id，scope 和错误映射测试通过；真实启动路径已接 Pg/RPC/JWT/redb，真实 DB/Anvil e2e 未做 |
 | chain 纯契约/fake | 完成初版 | traits + normalized logs/headers/receipt + fake range/reorg/failure/capacity 测试；真实 RPC provider manager 初版已完成，Anvil ERC20 测试未做 |
 | PaymentWindowLookup | 完成 | watch set + 批量 fallback contract；禁止逐地址 fallback |
-| transfer_log_store | 完成 M9 runtime 初版 | canonical types + in-memory ingestor/reader + redb-backed ingestor/reader + redb persistence contract；retention cleanup、readiness/metrics wiring、Anvil 测试未做 |
+| transfer_log_store | 完成 M9 runtime 初版 | canonical types + in-memory ingestor/reader + redb-backed ingestor/reader + runtime poll loop + redb persistence contract；retention cleanup、readiness/metrics wiring、Anvil 测试未做 |
 | services/payments | 完成纯 service contract | `TransferLogReader::logs_page` -> candidate lookup -> `MatchedPaymentInput`；`match_stored_transfer_logs` 已供 verify/scanner 复用 |
 | RPC provider manager / LogSource | 完成初版 | `HttpJsonRpcProvider` + `RpcProviderManager` + `RpcRangeSource`，含 chain_id 校验、hash mismatch fail-closed、capacity gate、failover；已接 API runtime 初版，metrics/Anvil 测试未做 |
-| API runtime composition | 完成初版 | `runtime::build_api_router` 连接 Pg、跑 migration/seed、打开 redb、校验 RPC chain id、挂订单、verify 和 collection create/read；仅支持 non-production fake signer；scanner/collector loop、动态 readiness 未做 |
+| API runtime composition | 完成初版 | `runtime::build_api_router` 连接 Pg、跑 migration/seed、打开 redb、启动 transfer log poll loop、校验 RPC chain id、挂订单、verify 和 collection create/read；仅支持 non-production fake signer；scanner/collector loop、动态 readiness 未做 |
 | 付款 verify | 完成 service + route + runtime 初版 | `POST /v1/orders/{id}/verify` + `orders:verify` scope；manual service 已复用 matcher；Pg recorder 已完成并接入 runtime；真实 DB/Anvil e2e 未做 |
 | scanner worker | 部分完成 | tick contract 初版已完成：lease/CAS、KV reorg epoch、paged matcher、commit batch；runtime loop、confirmation sweep、rolling lookback/coverage gate、metrics/readiness 未完成 |
 | redb/KVDB | 完成 transfer log KV 初版 | `transfer_log_store/redb_store.rs` + `RedbTransferLogIngestor` 通过 contract；通用 cache 后置 |
