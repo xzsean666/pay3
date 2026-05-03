@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{str::FromStr, time::Duration};
 
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
@@ -11,9 +11,12 @@ use crate::domain::{BlockHash, ChainBlockRef, EvmAddress, RawAmount, TxHash};
 use super::{
     error::RepositoryError,
     types::{
-        NewSignedOutboundTx, OutboundTxPurpose, OutboundTxRecord, OutboundTxStatus, ReservedNonce,
+        BroadcastableOutboundTx, NewSignedOutboundTx, OutboundTxPurpose, OutboundTxRecord,
+        OutboundTxStatus, ReservedNonce,
     },
 };
+
+const DEFAULT_CLAIM_LEASE_SECONDS: u64 = 60;
 
 const OUTBOUND_COLUMNS: &str = r#"
     id,
@@ -55,6 +58,11 @@ pub trait OutboundRepository: Send + Sync {
         replacement_tx: NewSignedOutboundTx,
     ) -> Result<OutboundTxRecord, RepositoryError>;
 
+    async fn claim_signed_collect_tx_for_broadcast(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<BroadcastableOutboundTx>, RepositoryError>;
+
     async fn mark_broadcast(&self, tx_id: Uuid) -> Result<OutboundTxRecord, RepositoryError>;
 
     async fn mark_confirmed(
@@ -73,11 +81,22 @@ pub trait OutboundRepository: Send + Sync {
 #[derive(Clone)]
 pub struct PgOutboundRepository {
     pool: PgPool,
+    claim_lease_seconds: u64,
 }
 
 impl PgOutboundRepository {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            claim_lease_seconds: DEFAULT_CLAIM_LEASE_SECONDS,
+        }
+    }
+
+    pub fn with_claim_lease(pool: PgPool, claim_lease: Duration) -> Self {
+        Self {
+            pool,
+            claim_lease_seconds: claim_lease.as_secs().max(1),
+        }
     }
 }
 
@@ -202,6 +221,74 @@ impl OutboundRepository for PgOutboundRepository {
 
         tx.commit().await?;
         Ok(replacement)
+    }
+
+    async fn claim_signed_collect_tx_for_broadcast(
+        &self,
+        worker_id: &str,
+    ) -> Result<Option<BroadcastableOutboundTx>, RepositoryError> {
+        let lease_seconds = u64_to_i64(self.claim_lease_seconds, "claim_lease_seconds")?;
+        let sql = r#"
+            WITH next_outbound AS (
+                SELECT c.id AS collection_id,
+                       c.outbound_tx_id
+                FROM collections c
+                JOIN outbound_transactions o
+                  ON o.id = c.outbound_tx_id
+                WHERE c.status = 'transferring'
+                  AND o.status = 'signed'
+                  AND (c.locked_until IS NULL OR c.locked_until <= now())
+                ORDER BY c.updated_at, c.id
+                FOR UPDATE OF c SKIP LOCKED
+                LIMIT 1
+            ),
+            claimed AS (
+                UPDATE collections AS c
+                SET locked_by = $1,
+                    locked_until = now() + ($2::bigint * interval '1 second'),
+                    updated_at = now()
+                FROM next_outbound
+                WHERE c.id = next_outbound.collection_id
+                RETURNING c.id AS collection_id,
+                          c.outbound_tx_id
+            )
+            SELECT claimed.collection_id,
+                   o.id,
+                   o.chain_id,
+                   o.purpose,
+                   o.from_address,
+                   o.to_address,
+                   o.nonce,
+                   o.tx_hash,
+                   o.signed_tx,
+                   o.status,
+                   o.replacement_of,
+                   o.replacement_reason,
+                   o.broadcast_count,
+                   o.last_broadcast_at,
+                   o.receipt_block_number,
+                   o.receipt_block_hash,
+                   o.error,
+                   o.created_at,
+                   o.updated_at
+            FROM claimed
+            JOIN outbound_transactions o
+              ON o.id = claimed.outbound_tx_id
+            "#;
+
+        let row = sqlx::query(sql)
+            .bind(worker_id)
+            .bind(lease_seconds)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        row.map(|row| {
+            Ok(BroadcastableOutboundTx {
+                collection_id: row.try_get("collection_id")?,
+                outbound: outbound_record_from_row(&row)?,
+            })
+        })
+        .transpose()
     }
 
     async fn mark_broadcast(&self, tx_id: Uuid) -> Result<OutboundTxRecord, RepositoryError> {

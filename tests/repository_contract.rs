@@ -87,6 +87,11 @@ fn outbound_repository_serializes_nonce_and_preserves_replacement_invariants() {
         "old.from_address != replacement.from_address",
         "old.to_address != replacement.to_address",
         "old.nonce != replacement.nonce",
+        "claim_signed_collect_tx_for_broadcast",
+        "c.status = 'transferring'",
+        "o.status = 'signed'",
+        "FOR UPDATE OF c SKIP LOCKED",
+        "locked_until",
     ] {
         assert!(OUTBOUND_REPOSITORY.contains(fragment), "missing {fragment}");
     }

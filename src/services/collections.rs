@@ -1122,6 +1122,14 @@ mod tests {
             unimplemented!("collection service does not replace txs yet")
         }
 
+        async fn claim_signed_collect_tx_for_broadcast(
+            &self,
+            _worker_id: &str,
+        ) -> Result<Option<crate::db::repositories::BroadcastableOutboundTx>, RepositoryError>
+        {
+            unimplemented!("collection service does not claim signed txs for broadcast")
+        }
+
         async fn mark_broadcast(&self, _tx_id: Uuid) -> Result<OutboundTxRecord, RepositoryError> {
             unimplemented!("collector worker owns broadcast state")
         }

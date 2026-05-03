@@ -6,7 +6,9 @@ use uuid::Uuid;
 
 use crate::{
     chain::ChainError,
-    db::repositories::{OutboundRepository, OutboundTxRecord, RepositoryError},
+    db::repositories::{
+        BroadcastableOutboundTx, OutboundRepository, OutboundTxRecord, RepositoryError,
+    },
     domain::TxHash,
     services::{
         collections::{CollectionService, CollectionServiceError, PrepareCollectionJobOutcome},
@@ -147,35 +149,55 @@ where
 {
     pub async fn tick(&self) -> Result<CollectionCollectorTickOutcome, CollectionCollectorError> {
         self.config.validate()?;
+        let worker_id = self.config.worker_id.trim();
 
-        let outcome = self
-            .preparer
-            .prepare_next_collection_job(self.config.worker_id.trim())
-            .await?;
+        if let Some(recoverable) = self
+            .outbound
+            .claim_signed_collect_tx_for_broadcast(worker_id)
+            .await?
+        {
+            return self.broadcast_outbound(recoverable).await;
+        }
+
+        let outcome = self.preparer.prepare_next_collection_job(worker_id).await?;
         let PrepareCollectionJobOutcome::Prepared {
             collection,
             outbound,
-            signed_tx,
+            signed_tx: _,
         } = outcome
         else {
             return Ok(CollectionCollectorTickOutcome::NoJob);
         };
 
+        self.broadcast_outbound(BroadcastableOutboundTx {
+            collection_id: collection.id,
+            outbound,
+        })
+        .await
+    }
+
+    async fn broadcast_outbound(
+        &self,
+        recoverable: BroadcastableOutboundTx,
+    ) -> Result<CollectionCollectorTickOutcome, CollectionCollectorError> {
         let broadcast_tx_hash = self
             .broadcaster
-            .broadcast_signed_tx(signed_tx.raw_tx.clone())
+            .broadcast_signed_tx(recoverable.outbound.signed_tx.clone())
             .await?;
-        if broadcast_tx_hash != outbound.tx_hash {
+        if broadcast_tx_hash != recoverable.outbound.tx_hash {
             return Err(CollectionCollectorError::BroadcastHashMismatch {
-                outbound_tx_id: outbound.id,
-                expected_tx_hash: outbound.tx_hash,
+                outbound_tx_id: recoverable.outbound.id,
+                expected_tx_hash: recoverable.outbound.tx_hash,
                 actual_tx_hash: broadcast_tx_hash,
             });
         }
 
-        let outbound = self.outbound.mark_broadcast(outbound.id).await?;
+        let outbound = self
+            .outbound
+            .mark_broadcast(recoverable.outbound.id)
+            .await?;
         Ok(CollectionCollectorTickOutcome::Broadcast {
-            collection_id: collection.id,
+            collection_id: recoverable.collection_id,
             outbound,
         })
     }
@@ -218,6 +240,36 @@ mod tests {
         );
         assert_eq!(worker.preparer.calls(), vec!["collector-1".to_string()]);
         assert_eq!(worker.broadcaster.broadcasts(), vec![signed_tx().raw_tx]);
+        assert_eq!(worker.outbound.marked(), vec![outbound.id]);
+    }
+
+    #[tokio::test]
+    async fn tick_recovers_signed_outbound_before_preparing_new_job() {
+        let outbound = outbound_record(12, OutboundTxStatus::Signed);
+        let worker = worker(
+            FakePreparer::with_outcomes(vec![Ok(PrepareCollectionJobOutcome::NoJob)]),
+            FakeOutboundRepository::with_recoverable(BroadcastableOutboundTx {
+                collection_id: collection_id(),
+                outbound: outbound.clone(),
+            }),
+            FakeBroadcaster::returning(outbound.tx_hash),
+        );
+
+        let outcome = worker.tick().await.unwrap();
+
+        assert_eq!(
+            outcome,
+            CollectionCollectorTickOutcome::Broadcast {
+                collection_id: collection_id(),
+                outbound: outbound_record(12, OutboundTxStatus::Broadcast),
+            }
+        );
+        assert!(worker.preparer.calls().is_empty());
+        assert_eq!(
+            worker.outbound.claim_calls(),
+            vec!["collector-1".to_string()]
+        );
+        assert_eq!(worker.broadcaster.broadcasts(), vec![outbound.signed_tx]);
         assert_eq!(worker.outbound.marked(), vec![outbound.id]);
     }
 
@@ -342,14 +394,39 @@ mod tests {
 
     #[derive(Clone, Debug, Default)]
     struct FakeOutboundRepository {
-        marked: Arc<Mutex<Vec<Uuid>>>,
+        state: Arc<Mutex<FakeOutboundState>>,
+    }
+
+    #[derive(Debug, Default)]
+    struct FakeOutboundState {
+        recoverable: Option<BroadcastableOutboundTx>,
+        claim_calls: Vec<String>,
+        marked: Vec<Uuid>,
     }
 
     impl FakeOutboundRepository {
-        fn marked(&self) -> Vec<Uuid> {
-            self.marked
+        fn with_recoverable(recoverable: BroadcastableOutboundTx) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeOutboundState {
+                    recoverable: Some(recoverable),
+                    ..FakeOutboundState::default()
+                })),
+            }
+        }
+
+        fn claim_calls(&self) -> Vec<String> {
+            self.state
                 .lock()
                 .expect("fake outbound mutex poisoned")
+                .claim_calls
+                .clone()
+        }
+
+        fn marked(&self) -> Vec<Uuid> {
+            self.state
+                .lock()
+                .expect("fake outbound mutex poisoned")
+                .marked
                 .clone()
         }
     }
@@ -379,12 +456,25 @@ mod tests {
             unimplemented!("collector worker does not replace signed txs yet")
         }
 
+        async fn claim_signed_collect_tx_for_broadcast(
+            &self,
+            worker_id: &str,
+        ) -> Result<Option<BroadcastableOutboundTx>, RepositoryError> {
+            let mut state = self.state.lock().expect("fake outbound mutex poisoned");
+            state.claim_calls.push(worker_id.to_string());
+            Ok(state.recoverable.take())
+        }
+
         async fn mark_broadcast(&self, tx_id: Uuid) -> Result<OutboundTxRecord, RepositoryError> {
-            self.marked
+            self.state
                 .lock()
                 .expect("fake outbound mutex poisoned")
+                .marked
                 .push(tx_id);
-            Ok(outbound_record(11, OutboundTxStatus::Broadcast))
+            Ok(outbound_record(
+                tx_id.as_u128(),
+                OutboundTxStatus::Broadcast,
+            ))
         }
 
         async fn mark_confirmed(
