@@ -212,6 +212,7 @@ impl OutboundRepository for PgOutboundRepository {
             UPDATE collections
             SET outbound_tx_id = $2,
                 status = 'transferring',
+                attempt_count = attempt_count + 1,
                 locked_by = NULL,
                 locked_until = NULL,
                 error = NULL,

@@ -2,21 +2,25 @@
 
 use std::num::{ParseIntError, TryFromIntError};
 
-use alloy_primitives::keccak256;
+use alloy_primitives::{U256, keccak256};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
     chain::{ChainError, Erc20ChainClient},
     db::repositories::{
-        AuditEventInput, AuditRepository, CollectionJob, CollectionRecord, CollectionRepository,
-        CreateCollectionCommand, NewSignedOutboundTx, OrderRepository, OrderView,
-        OutboundRepository, OutboundTxPurpose, OutboundTxRecord, RepositoryError,
+        AuditEventInput, AuditRepository, CollectionJob, CollectionRecord, CollectionRecordStatus,
+        CollectionRepository, CreateCollectionCommand, NewSignedOutboundTx, OrderRepository,
+        OrderView, OutboundRepository, OutboundTxPurpose, OutboundTxRecord,
+        ReceiptCheckableOutboundTx, RepositoryError,
     },
-    domain::{CollectionFees, EvmAddress, OrderStatus, RawAmount},
+    domain::{
+        CollectionFees, CollectionPurpose, CollectionTxPlan, EvmAddress, OrderStatus, RawAmount,
+    },
     services::orders::{IdGenerator, RandomIdGenerator},
     signer::{SignedTx, SignerError, SignerProvider, UnsignedTx},
 };
@@ -228,6 +232,9 @@ pub enum CollectionServiceError {
     #[error("order {order_id} is for a different chain/token")]
     OrderStreamMismatch { order_id: Uuid },
 
+    #[error("collection not found: {collection_id}")]
+    CollectionNotFound { collection_id: Uuid },
+
     #[error("collection amount resolved to zero for collection {collection_id}")]
     ZeroCollectionAmount { collection_id: Uuid },
 
@@ -254,6 +261,15 @@ pub enum CollectionServiceError {
 
     #[error("signed transaction invariant violation: {message}")]
     SignedTxInvariant { message: String },
+
+    #[error("collection {collection_id} is not replaceable while in {status:?}")]
+    ReplacementNotEligible {
+        collection_id: Uuid,
+        status: CollectionRecordStatus,
+    },
+
+    #[error("collection {collection_id} does not have a resolved amount for replacement")]
+    ReplacementAmountUnavailable { collection_id: Uuid },
 
     #[error(transparent)]
     Repository(#[from] RepositoryError),
@@ -487,7 +503,7 @@ where
             .await?;
         let collection = self
             .collections
-            .attach_outbound_tx(job.collection.id, outbound.id)
+            .attach_outbound_tx(job.collection.id, outbound.id, amount)
             .await?;
         self.append_collection_audit(
             "collection.signed",
@@ -497,6 +513,182 @@ where
             Some(outbound.tx_hash),
             json!({
                 "worker_id": worker_id,
+                "outbound_tx_id": outbound.id,
+                "from_address": outbound.from_address,
+                "to_address": outbound.to_address,
+                "amount_raw": amount.to_string(),
+                "nonce": outbound.nonce.to_string(),
+                "tx_hash": outbound.tx_hash,
+            }),
+        )
+        .await?;
+
+        Ok(PrepareCollectionJobOutcome::Prepared {
+            collection,
+            outbound,
+            signed_tx: signed,
+        })
+    }
+
+    pub async fn replace_collection_job(
+        &self,
+        worker_id: &str,
+        job: ReceiptCheckableOutboundTx,
+        replacement_reason: &str,
+    ) -> Result<PrepareCollectionJobOutcome, CollectionServiceError> {
+        let worker_id = worker_id.trim();
+        if worker_id.is_empty() {
+            return Err(CollectionServiceError::invalid_argument(
+                "worker_id",
+                "must not be empty",
+            ));
+        }
+        let replacement_reason = replacement_reason.trim();
+        if replacement_reason.is_empty() {
+            return Err(CollectionServiceError::invalid_argument(
+                "replacement_reason",
+                "must not be empty",
+            ));
+        }
+
+        let collection_job = self
+            .collections
+            .get_collection_job(job.collection_id)
+            .await?
+            .ok_or(CollectionServiceError::CollectionNotFound {
+                collection_id: job.collection_id,
+            })?;
+        let collection = collection_job.collection.clone();
+        if !matches!(
+            collection.status,
+            CollectionRecordStatus::Transferring | CollectionRecordStatus::Confirming
+        ) {
+            return Err(CollectionServiceError::ReplacementNotEligible {
+                collection_id: collection.id,
+                status: collection.status,
+            });
+        }
+        if collection.outbound_tx_id != Some(job.outbound.id) {
+            return Err(CollectionServiceError::SignedTxInvariant {
+                message: format!(
+                    "collection {} outbound {} did not match claimed replacement candidate {}",
+                    collection.id,
+                    collection
+                        .outbound_tx_id
+                        .map_or_else(|| "none".to_string(), |id| id.to_string()),
+                    job.outbound.id
+                ),
+            });
+        }
+        if !matches!(
+            job.outbound.status,
+            crate::db::repositories::OutboundTxStatus::Broadcast
+        ) {
+            return Err(CollectionServiceError::SignedTxInvariant {
+                message: format!(
+                    "outbound {} must be broadcast before replacement, got {:?}",
+                    job.outbound.id, job.outbound.status
+                ),
+            });
+        }
+
+        let amount =
+            collection
+                .amount_raw
+                .ok_or(CollectionServiceError::ReplacementAmountUnavailable {
+                    collection_id: collection.id,
+                })?;
+        let nonce = raw_amount_to_u64(job.outbound.nonce)?;
+        let bumped_fees = bump_collection_fees(self.config.fees)?;
+        let original_plan = CollectionTxPlan::new(
+            collection.chain_id,
+            nonce,
+            collection.from_address,
+            collection.to_address,
+            amount,
+            CollectionPurpose::TreasurySweep,
+            self.config.fees,
+        );
+        let replacement_plan = CollectionTxPlan {
+            fees: bumped_fees,
+            ..original_plan
+        };
+        original_plan
+            .assert_replacement_allowed(replacement_plan)
+            .map_err(|error| CollectionServiceError::SignedTxInvariant {
+                message: error.to_string(),
+            })?;
+        self.gas_checker
+            .ensure_prefunded_gas(PrefundedGasCheck {
+                chain_id: collection.chain_id,
+                from_address: collection.from_address,
+                gas_limit: bumped_fees.gas_limit,
+                max_fee_per_gas: bumped_fees.max_fee_per_gas,
+                max_priority_fee_per_gas: bumped_fees.max_priority_fee_per_gas,
+            })
+            .await?;
+        self.signer.health_check().await?;
+
+        let unsigned = UnsignedTx::new(
+            format!(
+                "collection-{}-nonce-{nonce}-replacement-{}",
+                collection.id, job.outbound.id
+            ),
+            collection.chain_id,
+            nonce,
+            collection.token_address,
+            RawAmount::ZERO,
+            bumped_fees.gas_limit,
+            bumped_fees.max_fee_per_gas,
+            bumped_fees.max_priority_fee_per_gas,
+            erc20_transfer_data(collection.to_address, amount),
+        )?;
+        let signed = self
+            .signer
+            .sign_transaction(
+                &collection_job.signer_key_ref,
+                &collection_job.derivation_path,
+                unsigned,
+            )
+            .await?;
+        ensure_signed_tx_matches_job(&collection_job, &signed, nonce)?;
+
+        let outbound = self
+            .outbound
+            .replace_signed_tx(
+                job.outbound.id,
+                NewSignedOutboundTx {
+                    id: self.ids.new_id(),
+                    chain_id: collection.chain_id,
+                    purpose: OutboundTxPurpose::Collect,
+                    from_address: collection.from_address,
+                    to_address: collection.to_address,
+                    nonce: job.outbound.nonce,
+                    tx_hash: signed.tx_hash,
+                    signed_tx: signed.raw_tx.clone(),
+                    replacement_of: Some(job.outbound.id),
+                    replacement_reason: Some(replacement_reason.to_string()),
+                },
+            )
+            .await?;
+        let mut collection = collection;
+        collection.outbound_tx_id = Some(outbound.id);
+        collection.status = CollectionRecordStatus::Transferring;
+        collection.attempt_count = collection.attempt_count.saturating_add(1);
+        collection.locked_by = None;
+        collection.locked_until = None;
+        collection.error = None;
+        collection.updated_at = OffsetDateTime::now_utc();
+        self.append_collection_audit(
+            "collection.replaced",
+            &AuditContext::default(),
+            Some(collection.order_id),
+            Some(collection.id),
+            Some(outbound.tx_hash),
+            json!({
+                "worker_id": worker_id,
+                "replacement_of": job.outbound.id,
+                "replacement_reason": replacement_reason,
                 "outbound_tx_id": outbound.id,
                 "from_address": outbound.from_address,
                 "to_address": outbound.to_address,
@@ -686,6 +878,28 @@ fn ensure_signed_tx_matches_job(
     Ok(())
 }
 
+fn bump_collection_fees(fees: CollectionFees) -> Result<CollectionFees, CollectionServiceError> {
+    Ok(CollectionFees::new(
+        fees.gas_limit,
+        bump_raw_amount(fees.max_fee_per_gas)?,
+        bump_raw_amount(fees.max_priority_fee_per_gas)?,
+    ))
+}
+
+fn bump_raw_amount(amount: RawAmount) -> Result<RawAmount, CollectionServiceError> {
+    let mut bump = amount.value() / U256::from(10u8);
+    if bump.is_zero() {
+        bump = U256::from(1u8);
+    }
+
+    let bumped = amount.value().checked_add(bump).ok_or_else(|| {
+        CollectionServiceError::SignedTxInvariant {
+            message: format!("replacement fee bump overflowed for amount {amount}"),
+        }
+    })?;
+    Ok(RawAmount::new(bumped))
+}
+
 fn signed_invariant(message: impl Into<String>) -> CollectionServiceError {
     CollectionServiceError::SignedTxInvariant {
         message: message.into(),
@@ -695,6 +909,7 @@ fn signed_invariant(message: impl Into<String>) -> CollectionServiceError {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         collections::VecDeque,
         sync::{Arc, Mutex},
     };
@@ -793,11 +1008,99 @@ mod tests {
         assert_eq!(service.outbound.inserted().len(), 1);
         assert_eq!(
             service.collections.attached(),
-            vec![(collection_id(), outbound.id)]
+            vec![(collection_id(), outbound.id, RawAmount::from(1_000))]
         );
         assert_eq!(
             service.audit.event_types(),
             vec!["collection.signed".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_collection_job_bumps_fees_and_preserves_amount() {
+        let service = service(Fixture::default());
+        let old_tx = NewSignedOutboundTx {
+            id: Uuid::from_u128(200),
+            chain_id: 1,
+            purpose: OutboundTxPurpose::Collect,
+            from_address: child_address(),
+            to_address: treasury(),
+            nonce: RawAmount::from(7),
+            tx_hash: tx_hash(0xab),
+            signed_tx: b"old-signed".to_vec(),
+            replacement_of: None,
+            replacement_reason: None,
+        };
+        let mut collection_job = collection_job(Some(RawAmount::from(1_000)));
+        collection_job.collection.status = CollectionRecordStatus::Confirming;
+        collection_job.collection.outbound_tx_id = Some(old_tx.id);
+        collection_job.collection.attempt_count = 2;
+        collection_job.collection.amount_raw = Some(RawAmount::from(1_000));
+        {
+            let mut state = service
+                .collections
+                .state
+                .lock()
+                .expect("fake collection repo mutex poisoned");
+            state
+                .jobs_by_collection_id
+                .insert(collection_job.collection.id, collection_job.clone());
+        }
+        let mut old_outbound = outbound_record(old_tx);
+        old_outbound.status = OutboundTxStatus::Broadcast;
+        old_outbound.last_broadcast_at = Some(now() - time::Duration::hours(2));
+
+        let outcome = service
+            .replace_collection_job(
+                "collector-1",
+                ReceiptCheckableOutboundTx {
+                    collection_id: collection_job.collection.id,
+                    outbound: old_outbound.clone(),
+                },
+                "receipt missing beyond replacement threshold",
+            )
+            .await
+            .unwrap();
+
+        let PrepareCollectionJobOutcome::Prepared {
+            collection,
+            outbound,
+            signed_tx,
+        } = outcome
+        else {
+            panic!("expected replacement to produce a prepared job");
+        };
+
+        assert_eq!(collection.status, CollectionRecordStatus::Transferring);
+        assert_eq!(collection.outbound_tx_id, Some(outbound.id));
+        assert_eq!(collection.amount_raw, Some(RawAmount::from(1_000)));
+        assert_eq!(outbound.replacement_of, Some(old_outbound.id));
+        let replacements = service.outbound.replacements();
+        assert_eq!(replacements.len(), 1);
+        assert_eq!(replacements[0].0, old_outbound.id);
+        assert_eq!(replacements[0].1.replacement_of, Some(old_outbound.id));
+        assert_eq!(replacements[0].1.tx_hash, outbound.tx_hash);
+        let signed_requests = service.signer.signed_requests();
+        assert_eq!(signed_requests.len(), 1);
+        assert_eq!(signed_tx.nonce, 7);
+        assert_eq!(signed_tx.to, token());
+        assert_eq!(signed_tx.tx_hash, outbound.tx_hash);
+        assert_eq!(
+            signed_requests[0].data,
+            erc20_transfer_data(treasury(), RawAmount::from(1_000))
+        );
+        assert_eq!(signed_requests[0].value, RawAmount::ZERO);
+        assert_eq!(
+            signed_requests[0].max_fee_per_gas,
+            RawAmount::from(33_000_000_000)
+        );
+        assert_eq!(
+            signed_requests[0].max_priority_fee_per_gas,
+            RawAmount::from(1_650_000_000)
+        );
+        assert_eq!(
+            service.audit.event_types(),
+            vec!["collection.replaced".to_string()]
         );
     }
 
@@ -985,15 +1288,18 @@ mod tests {
     #[derive(Clone, Debug)]
     struct FakeCollectionState {
         job: Option<CollectionJob>,
+        jobs_by_collection_id: BTreeMap<Uuid, CollectionJob>,
         commands: Vec<CreateCollectionCommand>,
-        attached: Vec<(Uuid, Uuid)>,
+        attached: Vec<(Uuid, Uuid, RawAmount)>,
     }
 
     impl FakeCollectionRepository {
         fn new(job: CollectionJob) -> Self {
+            let jobs_by_collection_id = BTreeMap::from([(job.collection.id, job.clone())]);
             Self {
                 state: Arc::new(Mutex::new(FakeCollectionState {
                     job: Some(job),
+                    jobs_by_collection_id,
                     commands: Vec::new(),
                     attached: Vec::new(),
                 })),
@@ -1008,7 +1314,7 @@ mod tests {
                 .clone()
         }
 
-        fn attached(&self) -> Vec<(Uuid, Uuid)> {
+        fn attached(&self) -> Vec<(Uuid, Uuid, RawAmount)> {
             self.state
                 .lock()
                 .expect("fake collection repo mutex poisoned")
@@ -1039,7 +1345,27 @@ mod tests {
             &self,
             id: Uuid,
         ) -> Result<Option<CollectionRecord>, RepositoryError> {
-            Ok(Some(collection_record(id, None, None)))
+            Ok(self
+                .state
+                .lock()
+                .expect("fake collection repo mutex poisoned")
+                .jobs_by_collection_id
+                .get(&id)
+                .map(|job| job.collection.clone())
+                .or(Some(collection_record(id, None, None))))
+        }
+
+        async fn get_collection_job(
+            &self,
+            id: Uuid,
+        ) -> Result<Option<CollectionJob>, RepositoryError> {
+            Ok(self
+                .state
+                .lock()
+                .expect("fake collection repo mutex poisoned")
+                .jobs_by_collection_id
+                .get(&id)
+                .cloned())
         }
 
         async fn claim_collection_job(
@@ -1058,13 +1384,27 @@ mod tests {
             &self,
             collection_id: Uuid,
             outbound_tx_id: Uuid,
+            resolved_amount_raw: RawAmount,
         ) -> Result<CollectionRecord, RepositoryError> {
-            self.state
+            let mut state = self
+                .state
                 .lock()
-                .expect("fake collection repo mutex poisoned")
+                .expect("fake collection repo mutex poisoned");
+            state
                 .attached
-                .push((collection_id, outbound_tx_id));
-            Ok(collection_record(collection_id, None, Some(outbound_tx_id)))
+                .push((collection_id, outbound_tx_id, resolved_amount_raw));
+            if let Some(job) = state.jobs_by_collection_id.get_mut(&collection_id) {
+                job.collection.amount_raw = Some(resolved_amount_raw);
+                job.collection.outbound_tx_id = Some(outbound_tx_id);
+                job.collection.status =
+                    crate::db::repositories::CollectionRecordStatus::Transferring;
+                return Ok(job.collection.clone());
+            }
+            Ok(collection_record(
+                collection_id,
+                Some(resolved_amount_raw),
+                Some(outbound_tx_id),
+            ))
         }
     }
 
@@ -1077,6 +1417,7 @@ mod tests {
     struct FakeOutboundState {
         reserved: Vec<(u64, EvmAddress)>,
         inserted: Vec<NewSignedOutboundTx>,
+        replacements: Vec<(Uuid, NewSignedOutboundTx)>,
     }
 
     impl FakeOutboundRepository {
@@ -1093,6 +1434,14 @@ mod tests {
                 .lock()
                 .expect("fake outbound repo mutex poisoned")
                 .inserted
+                .clone()
+        }
+
+        fn replacements(&self) -> Vec<(Uuid, NewSignedOutboundTx)> {
+            self.state
+                .lock()
+                .expect("fake outbound repo mutex poisoned")
+                .replacements
                 .clone()
         }
     }
@@ -1130,10 +1479,15 @@ mod tests {
 
         async fn replace_signed_tx(
             &self,
-            _old_tx_id: Uuid,
-            _replacement_tx: NewSignedOutboundTx,
+            old_tx_id: Uuid,
+            replacement_tx: NewSignedOutboundTx,
         ) -> Result<OutboundTxRecord, RepositoryError> {
-            unimplemented!("collection service does not replace txs yet")
+            self.state
+                .lock()
+                .expect("fake outbound repo mutex poisoned")
+                .replacements
+                .push((old_tx_id, replacement_tx.clone()));
+            Ok(outbound_record(replacement_tx))
         }
 
         async fn claim_signed_collect_tx_for_broadcast(

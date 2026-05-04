@@ -1,7 +1,7 @@
 //! Payment scanner worker tick over persisted KV transfer logs.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Duration as StdDuration;
+use std::time::{Duration as StdDuration, Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -16,6 +16,7 @@ use crate::{
         PaymentRecord, PaymentRepository, RepositoryError, ScanCursorLease,
     },
     domain::{BlockHash, ChainBlockRef},
+    health::{MetricsRecorder, WorkerName},
     services::{
         orders::Clock,
         payment_windows::PaymentWindowLookup,
@@ -202,6 +203,7 @@ pub struct PaymentScannerWorker<R, M, L, H, C> {
     head_reader: H,
     clock: C,
     config: PaymentScannerConfig,
+    metrics: Option<MetricsRecorder>,
 }
 
 impl<R, M, L, H, C> PaymentScannerWorker<R, M, L, H, C> {
@@ -220,7 +222,13 @@ impl<R, M, L, H, C> PaymentScannerWorker<R, M, L, H, C> {
             head_reader,
             clock,
             config,
+            metrics: None,
         }
+    }
+
+    pub fn with_metrics(mut self, metrics: MetricsRecorder) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -232,6 +240,25 @@ where
     H: ChainHeaderReader,
     C: Clock,
 {
+    fn record_scanner_lag(
+        &self,
+        kv_completed_block: Option<u64>,
+        scanner_block: u64,
+        min_confirmations: u64,
+    ) {
+        let Some(metrics) = &self.metrics else {
+            return;
+        };
+
+        let completed_block = kv_completed_block.unwrap_or(scanner_block);
+        let lag_blocks = completed_block.saturating_sub(scanner_block);
+        metrics.record_worker_lag(
+            WorkerName::PaymentScanner,
+            lag_blocks,
+            scanner_lookback_blocks(min_confirmations),
+        );
+    }
+
     pub async fn tick(&self) -> Result<PaymentScannerTickOutcome, PaymentScannerError> {
         let matcher_config = self.matcher.config();
         self.config.validate(matcher_config)?;
@@ -260,21 +287,39 @@ where
 
         let cursor = self.log_reader.cursor(stream).await?;
         if cursor.reorg_epoch != lease.seen_kv_reorg_epoch {
+            self.record_scanner_lag(
+                cursor.last_completed_block,
+                lease.last_scanned_block,
+                matcher_config.min_confirmations,
+            );
             return self.handle_kv_reorg(lease, cursor).await;
         }
 
         let page = self
             .matcher
-            .match_next_payment_page(after_token(lease.last_scanned_block))
+            .match_next_payment_page(after_token_with_lookback(
+                lease.last_scanned_block,
+                scanner_lookback_blocks(matcher_config.min_confirmations),
+            ))
             .await?;
         if page.kv_reorg_epoch != lease.seen_kv_reorg_epoch {
             let cursor = self.log_reader.cursor(stream).await?;
+            self.record_scanner_lag(
+                cursor.last_completed_block,
+                lease.last_scanned_block,
+                matcher_config.min_confirmations,
+            );
             return self.handle_kv_reorg(lease, cursor).await;
         }
 
         let Some(complete_to_block) =
             complete_to_block_for_commit(&page, &cursor, lease.last_scanned_block)
         else {
+            self.record_scanner_lag(
+                cursor.last_completed_block,
+                lease.last_scanned_block,
+                matcher_config.min_confirmations,
+            );
             return Ok(PaymentScannerTickOutcome::PageIncomplete {
                 stream,
                 last_scanned_block: lease.last_scanned_block,
@@ -284,8 +329,18 @@ where
 
         if complete_to_block <= lease.last_scanned_block {
             if let Some(outcome) = self.sweep_confirmations(matcher_config).await? {
+                self.record_scanner_lag(
+                    cursor.last_completed_block,
+                    lease.last_scanned_block,
+                    matcher_config.min_confirmations,
+                );
                 return Ok(outcome);
             }
+            self.record_scanner_lag(
+                cursor.last_completed_block,
+                lease.last_scanned_block,
+                matcher_config.min_confirmations,
+            );
             return Ok(PaymentScannerTickOutcome::Idle {
                 stream,
                 last_scanned_block: lease.last_scanned_block,
@@ -310,6 +365,12 @@ where
                 recompute_order_ids: recompute_order_ids.clone(),
             })
             .await?;
+
+        self.record_scanner_lag(
+            cursor.last_completed_block,
+            complete_to_block,
+            matcher_config.min_confirmations,
+        );
 
         Ok(PaymentScannerTickOutcome::Committed {
             stream,
@@ -460,9 +521,25 @@ where
 
         loop {
             interval.tick().await;
+            let started_at = Instant::now();
             match self.tick().await {
-                Ok(outcome) => log_tick_outcome(&outcome),
+                Ok(outcome) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_worker_success(
+                            WorkerName::PaymentScanner,
+                            started_at.elapsed(),
+                        );
+                    }
+                    log_tick_outcome(&outcome);
+                }
                 Err(error) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_worker_error(
+                            WorkerName::PaymentScanner,
+                            started_at.elapsed(),
+                            error.to_string(),
+                        );
+                    }
                     let stream = self.config.stream;
                     tracing::error!(
                         chain_id = stream.chain_id,
@@ -495,6 +572,29 @@ where
         });
     }
 
+    Ok(tokio::spawn(worker.run_forever(poll_interval)))
+}
+
+pub fn spawn_payment_scanner_loop_with_metrics<R, M, L, H, C>(
+    worker: PaymentScannerWorker<R, M, L, H, C>,
+    poll_interval: StdDuration,
+    metrics: MetricsRecorder,
+) -> Result<JoinHandle<()>, PaymentScannerError>
+where
+    R: PaymentRepository + 'static,
+    M: PaymentPageMatcher + 'static,
+    L: TransferLogReader + 'static,
+    H: ChainHeaderReader + 'static,
+    C: Clock + 'static,
+{
+    if poll_interval.is_zero() {
+        return Err(PaymentScannerError::InvalidConfig {
+            field: "poll_interval",
+            message: "must be greater than zero".to_string(),
+        });
+    }
+
+    let worker = worker.with_metrics(metrics);
     Ok(tokio::spawn(worker.run_forever(poll_interval)))
 }
 
@@ -584,14 +684,6 @@ fn log_tick_outcome(outcome: &PaymentScannerTickOutcome) {
     }
 }
 
-fn after_token(last_scanned_block: u64) -> Option<LogPageToken> {
-    if last_scanned_block == 0 {
-        None
-    } else {
-        Some(LogPageToken::new(last_scanned_block, u64::MAX))
-    }
-}
-
 fn complete_to_block_for_commit(
     page: &PaymentMatchPage,
     cursor: &TransferLogCursor,
@@ -642,6 +734,22 @@ fn max_confirmable_block(canonical_head: ChainBlockRef, min_confirmations: u64) 
     }
 }
 
+fn after_token_with_lookback(
+    last_scanned_block: u64,
+    lookback_blocks: u64,
+) -> Option<LogPageToken> {
+    let start_block = last_scanned_block.saturating_sub(lookback_blocks.saturating_sub(1));
+    if start_block <= 1 {
+        None
+    } else {
+        Some(LogPageToken::new(start_block - 1, u64::MAX))
+    }
+}
+
+fn scanner_lookback_blocks(min_confirmations: u64) -> u64 {
+    min_confirmations.saturating_mul(2).max(12)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -680,7 +788,7 @@ mod tests {
 
         let outcome = worker.tick().await.unwrap();
 
-        assert_eq!(matcher.calls(), vec![Some(LogPageToken::new(10, u64::MAX))]);
+        assert_eq!(matcher.calls(), vec![None]);
         assert_eq!(
             outcome,
             PaymentScannerTickOutcome::Committed {

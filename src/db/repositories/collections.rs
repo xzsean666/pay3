@@ -45,6 +45,8 @@ pub trait CollectionRepository: Send + Sync {
 
     async fn get_collection(&self, id: Uuid) -> Result<Option<CollectionRecord>, RepositoryError>;
 
+    async fn get_collection_job(&self, id: Uuid) -> Result<Option<CollectionJob>, RepositoryError>;
+
     async fn claim_collection_job(
         &self,
         worker_id: &str,
@@ -54,6 +56,7 @@ pub trait CollectionRepository: Send + Sync {
         &self,
         collection_id: Uuid,
         outbound_tx_id: Uuid,
+        resolved_amount_raw: RawAmount,
     ) -> Result<CollectionRecord, RepositoryError>;
 }
 
@@ -133,6 +136,31 @@ impl CollectionRepository for PgCollectionRepository {
             .transpose()
     }
 
+    async fn get_collection_job(&self, id: Uuid) -> Result<Option<CollectionJob>, RepositoryError> {
+        let sql = format!(
+            r#"
+            SELECT {COLLECTION_COLUMNS}
+            FROM collections
+            WHERE id = $1
+            FOR UPDATE
+            "#
+        );
+
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(&sql).bind(id).fetch_optional(&mut *tx).await?;
+
+        let job = match row {
+            Some(row) => {
+                let collection = collection_record_from_row(&row)?;
+                Some(collection_job_from_record(&mut tx, collection).await?)
+            }
+            None => None,
+        };
+
+        tx.commit().await?;
+        Ok(job)
+    }
+
     async fn claim_collection_job(
         &self,
         worker_id: &str,
@@ -183,11 +211,13 @@ impl CollectionRepository for PgCollectionRepository {
         &self,
         collection_id: Uuid,
         outbound_tx_id: Uuid,
+        resolved_amount_raw: RawAmount,
     ) -> Result<CollectionRecord, RepositoryError> {
         let sql = format!(
             r#"
             UPDATE collections
             SET outbound_tx_id = $2,
+                amount_raw = COALESCE(amount_raw, $3),
                 status = 'transferring',
                 locked_by = NULL,
                 locked_until = NULL,
@@ -202,6 +232,7 @@ impl CollectionRepository for PgCollectionRepository {
         let row = sqlx::query(&sql)
             .bind(collection_id)
             .bind(outbound_tx_id)
+            .bind(raw_amount_to_decimal(resolved_amount_raw)?)
             .fetch_optional(&self.pool)
             .await?;
 

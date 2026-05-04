@@ -55,9 +55,13 @@ struct ApiState {
 
 impl ApiState {
     fn new(dependencies: SharedDependencyRegistry) -> Self {
+        Self::new_with_metrics(dependencies, MetricsRecorder::default())
+    }
+
+    fn new_with_metrics(dependencies: SharedDependencyRegistry, metrics: MetricsRecorder) -> Self {
         Self {
             dependencies,
-            metrics: MetricsRecorder::default(),
+            metrics,
             auth: None,
             orders: None,
             order_verify: None,
@@ -328,8 +332,31 @@ pub fn router_with_runtime_services<R>(
 where
     R: DependencyRegistry,
 {
+    router_with_runtime_services_and_metrics(
+        registry,
+        MetricsRecorder::default(),
+        auth,
+        orders,
+        order_verify,
+        collections,
+        order_response_config,
+    )
+}
+
+pub fn router_with_runtime_services_and_metrics<R>(
+    registry: R,
+    metrics: MetricsRecorder,
+    auth: JwtVerifier,
+    orders: Arc<dyn OrderApiService>,
+    order_verify: Arc<dyn verify::OrderVerifyApiService>,
+    collections: Arc<dyn CollectionApiService>,
+    order_response_config: OrderResponseConfig,
+) -> Router
+where
+    R: DependencyRegistry,
+{
     let auth = Arc::new(auth);
-    let state = ApiState::new(Arc::new(registry))
+    let state = ApiState::new_with_metrics(Arc::new(registry), metrics)
         .with_orders(auth.clone(), orders, order_response_config)
         .with_order_verify(auth.clone(), order_verify)
         .with_collections(auth, collections);

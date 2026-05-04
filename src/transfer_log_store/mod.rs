@@ -139,6 +139,11 @@ pub trait TransferLogReader: Send + Sync {
     ) -> TransferLogStoreResult<LogsPage>;
 }
 
+#[async_trait]
+pub trait TransferLogLagReporter: Send + Sync {
+    async fn lag_blocks(&self, stream: StreamId) -> TransferLogStoreResult<u64>;
+}
+
 #[derive(Clone)]
 pub struct InMemoryTransferLogStore<S> {
     source: S,
@@ -210,6 +215,13 @@ impl<S> RedbTransferLogIngestor<S> {
             .ok_or(TransferLogStoreError::StreamNotFound { stream })?;
         Ok((config, cursor))
     }
+}
+
+fn cursor_scan_lag(cursor: &TransferLogCursor, target: u64) -> u64 {
+    let completed = cursor
+        .last_completed_block
+        .unwrap_or_else(|| cursor.start_block.saturating_sub(1));
+    target.saturating_sub(completed)
 }
 
 #[async_trait]
@@ -366,6 +378,18 @@ where
             .rewind_delete_from_block(stream, rewind_to, self.now())?
             .ok_or(TransferLogStoreError::StreamNotFound { stream })?;
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<S> TransferLogLagReporter for RedbTransferLogIngestor<S>
+where
+    S: ChainHeaderReader + TransferLogSource + Send + Sync,
+{
+    async fn lag_blocks(&self, stream: StreamId) -> TransferLogStoreResult<u64> {
+        let (config, cursor) = self.load_stream(stream)?;
+        let target = resolve_target(&self.source, &config).await?;
+        Ok(cursor_scan_lag(&cursor, target))
     }
 }
 
@@ -700,6 +724,28 @@ where
         let rewind_to = block.max(data.config.start_block);
         apply_rewind(data, rewind_to, now);
         Ok(())
+    }
+}
+
+#[async_trait]
+impl<S> TransferLogLagReporter for InMemoryTransferLogStore<S>
+where
+    S: ChainHeaderReader + TransferLogSource + Send + Sync,
+{
+    async fn lag_blocks(&self, stream: StreamId) -> TransferLogStoreResult<u64> {
+        let (config, cursor) = {
+            let state = self
+                .state
+                .lock()
+                .expect("transfer log store mutex poisoned");
+            let data = state
+                .streams
+                .get(&stream)
+                .ok_or(TransferLogStoreError::StreamNotFound { stream })?;
+            (data.config.clone(), data.cursor.clone())
+        };
+        let target = resolve_target(&self.source, &config).await?;
+        Ok(cursor_scan_lag(&cursor, target))
     }
 }
 

@@ -1,13 +1,17 @@
 //! Background transfer-log ingestor loop.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
-use crate::transfer_log_store::{
-    PollOutcome, StreamId, TransferLogIngestor, TransferLogStoreError, TransferLogStoreResult,
+use crate::{
+    health::{MetricsRecorder, WorkerName},
+    transfer_log_store::{
+        PollOutcome, StreamId, TransferLogIngestor, TransferLogLagReporter, TransferLogStoreError,
+        TransferLogStoreResult,
+    },
 };
 
 #[async_trait]
@@ -29,13 +33,15 @@ where
 pub struct TransferLogIngestorLoopConfig {
     pub stream: StreamId,
     pub poll_interval: Duration,
+    pub lag_threshold_blocks: u64,
 }
 
 impl TransferLogIngestorLoopConfig {
-    pub const fn new(stream: StreamId, poll_interval: Duration) -> Self {
+    pub const fn new(stream: StreamId, poll_interval: Duration, lag_threshold_blocks: u64) -> Self {
         Self {
             stream,
             poll_interval,
+            lag_threshold_blocks,
         }
     }
 
@@ -65,6 +71,7 @@ pub enum TransferLogIngestorLoopError {
 pub struct TransferLogIngestorLoop<P> {
     poller: P,
     config: TransferLogIngestorLoopConfig,
+    metrics: Option<MetricsRecorder>,
 }
 
 impl<P> TransferLogIngestorLoop<P> {
@@ -73,7 +80,16 @@ impl<P> TransferLogIngestorLoop<P> {
         config: TransferLogIngestorLoopConfig,
     ) -> Result<Self, TransferLogIngestorLoopError> {
         config.validate()?;
-        Ok(Self { poller, config })
+        Ok(Self {
+            poller,
+            config,
+            metrics: None,
+        })
+    }
+
+    pub fn with_metrics(mut self, metrics: MetricsRecorder) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 }
 
@@ -91,9 +107,82 @@ where
 
         loop {
             interval.tick().await;
+            let started_at = Instant::now();
             match self.tick().await {
-                Ok(outcome) => log_poll_outcome(&outcome),
+                Ok(outcome) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_worker_success(
+                            WorkerName::TransferLogIngestor,
+                            started_at.elapsed(),
+                        );
+                    }
+                    log_poll_outcome(&outcome);
+                }
                 Err(error) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_worker_error(
+                            WorkerName::TransferLogIngestor,
+                            started_at.elapsed(),
+                            error.to_string(),
+                        );
+                    }
+                    let stream = self.config.stream;
+                    tracing::error!(
+                        chain_id = stream.chain_id,
+                        token_address = %stream.token_address,
+                        error = %error,
+                        "transfer log ingestor tick failed"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn run_forever_with_metrics(self)
+    where
+        P: TransferLogLagReporter,
+    {
+        let mut interval = tokio::time::interval(self.config.poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+            let started_at = Instant::now();
+            match self.tick().await {
+                Ok(outcome) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_worker_success(
+                            WorkerName::TransferLogIngestor,
+                            started_at.elapsed(),
+                        );
+                        match self.poller.lag_blocks(self.config.stream).await {
+                            Ok(lag_blocks) => {
+                                metrics.record_worker_lag(
+                                    WorkerName::TransferLogIngestor,
+                                    lag_blocks,
+                                    self.config.lag_threshold_blocks,
+                                );
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    chain_id = self.config.stream.chain_id,
+                                    token_address = %self.config.stream.token_address,
+                                    error = %error,
+                                    "transfer log ingestor lag probe failed"
+                                );
+                            }
+                        }
+                    }
+                    log_poll_outcome(&outcome);
+                }
+                Err(error) => {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.record_worker_error(
+                            WorkerName::TransferLogIngestor,
+                            started_at.elapsed(),
+                            error.to_string(),
+                        );
+                    }
                     let stream = self.config.stream;
                     tracing::error!(
                         chain_id = stream.chain_id,
@@ -116,6 +205,18 @@ where
 {
     let worker = TransferLogIngestorLoop::new(poller, config)?;
     Ok(tokio::spawn(worker.run_forever()))
+}
+
+pub fn spawn_transfer_log_ingestor_loop_with_metrics<P>(
+    poller: P,
+    config: TransferLogIngestorLoopConfig,
+    metrics: MetricsRecorder,
+) -> Result<JoinHandle<()>, TransferLogIngestorLoopError>
+where
+    P: TransferLogPoller + TransferLogLagReporter + 'static,
+{
+    let worker = TransferLogIngestorLoop::new(poller, config)?.with_metrics(metrics);
+    Ok(tokio::spawn(worker.run_forever_with_metrics()))
 }
 
 fn log_poll_outcome(outcome: &PollOutcome) {
@@ -215,7 +316,7 @@ mod tests {
     fn zero_poll_interval_is_rejected() {
         let error = TransferLogIngestorLoop::new(
             FakePoller::with_outcomes(Vec::new()),
-            TransferLogIngestorLoopConfig::new(stream(), Duration::ZERO),
+            TransferLogIngestorLoopConfig::new(stream(), Duration::ZERO, 24),
         )
         .err()
         .expect("zero interval should be invalid");
@@ -272,7 +373,7 @@ mod tests {
     }
 
     fn config() -> TransferLogIngestorLoopConfig {
-        TransferLogIngestorLoopConfig::new(stream(), Duration::from_millis(50))
+        TransferLogIngestorLoopConfig::new(stream(), Duration::from_millis(50), 24)
     }
 
     fn cursor(next_block: u64) -> TransferLogCursor {
