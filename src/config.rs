@@ -5,9 +5,15 @@ use std::{
     fmt,
     net::SocketAddr,
     path::PathBuf,
+    time::Duration,
 };
 
-use crate::domain::EvmAddress;
+use crate::domain::{EvmAddress, RawAmount};
+
+const DEFAULT_COLLECTION_GAS_LIMIT: u64 = 80_000;
+const DEFAULT_COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 50_000_000_000;
+const DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 2_000_000_000;
+const DEFAULT_COLLECTION_COLLECTOR_REPLACEMENT_STUCK_AFTER_SECS: u64 = 30 * 60;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppProfile {
@@ -45,6 +51,8 @@ pub struct AppConfig {
     pub kvdb: KvdbConfig,
     pub jwt: JwtConfig,
     pub chain: ChainConfig,
+    pub collection: CollectionConfig,
+    pub collector: CollectorConfig,
     pub signer: SignerConfig,
 }
 
@@ -101,6 +109,40 @@ pub struct ChainConfig {
     pub start_block: u64,
     pub min_confirmations: u64,
     pub allow_full_history_replay: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectionConfig {
+    pub gas_limit: u64,
+    pub max_fee_per_gas_wei: RawAmount,
+    pub max_priority_fee_per_gas_wei: RawAmount,
+}
+
+impl Default for CollectionConfig {
+    fn default() -> Self {
+        Self {
+            gas_limit: DEFAULT_COLLECTION_GAS_LIMIT,
+            max_fee_per_gas_wei: RawAmount::from(DEFAULT_COLLECTION_MAX_FEE_PER_GAS_WEI),
+            max_priority_fee_per_gas_wei: RawAmount::from(
+                DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI,
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectorConfig {
+    pub replacement_stuck_after: Duration,
+}
+
+impl Default for CollectorConfig {
+    fn default() -> Self {
+        Self {
+            replacement_stuck_after: Duration::from_secs(
+                DEFAULT_COLLECTION_COLLECTOR_REPLACEMENT_STUCK_AFTER_SECS,
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,6 +287,36 @@ impl AppConfig {
                     false,
                 )?,
             },
+            collection: {
+                let defaults = CollectionConfig::default();
+                CollectionConfig {
+                    gas_limit: parse_optional_u64(
+                        &values,
+                        &["COLLECTION_GAS_LIMIT"],
+                        defaults.gas_limit,
+                    )?,
+                    max_fee_per_gas_wei: parse_optional_raw_amount(
+                        &values,
+                        &["COLLECTION_MAX_FEE_PER_GAS_WEI"],
+                        defaults.max_fee_per_gas_wei,
+                    )?,
+                    max_priority_fee_per_gas_wei: parse_optional_raw_amount(
+                        &values,
+                        &["COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI"],
+                        defaults.max_priority_fee_per_gas_wei,
+                    )?,
+                }
+            },
+            collector: {
+                let defaults = CollectorConfig::default();
+                CollectorConfig {
+                    replacement_stuck_after: parse_optional_duration_secs(
+                        &values,
+                        &["COLLECTION_REPLACEMENT_STUCK_AFTER_SECS"],
+                        defaults.replacement_stuck_after,
+                    )?,
+                }
+            },
             signer: SignerConfig {
                 mode: SignerMode::parse(values.required_ref(&["SIGNER_MODE", "SIGNER_PROVIDER"])?)?,
                 key_ref: values.required(&["SIGNER_KEY_REF"])?,
@@ -356,11 +428,51 @@ fn parse_required_u64(values: &EnvPairs, keys: &[&'static str]) -> Result<u64, C
         .map_err(|_| ConfigError::invalid(keys[0], value, "expected unsigned integer"))
 }
 
+fn parse_optional_u64(
+    values: &EnvPairs,
+    keys: &[&'static str],
+    default: u64,
+) -> Result<u64, ConfigError> {
+    let Some(value) = values.optional(keys) else {
+        return Ok(default);
+    };
+    value
+        .parse::<u64>()
+        .map_err(|_| ConfigError::invalid(keys[0], value, "expected unsigned integer"))
+}
+
 fn parse_required_u8(values: &EnvPairs, keys: &[&'static str]) -> Result<u8, ConfigError> {
     let value = values.required_ref(keys)?;
     value
         .parse::<u8>()
         .map_err(|_| ConfigError::invalid(keys[0], value, "expected unsigned 8-bit integer"))
+}
+
+fn parse_optional_raw_amount(
+    values: &EnvPairs,
+    keys: &[&'static str],
+    default: RawAmount,
+) -> Result<RawAmount, ConfigError> {
+    let Some(value) = values.optional(keys) else {
+        return Ok(default);
+    };
+    value
+        .parse::<RawAmount>()
+        .map_err(|_| ConfigError::invalid(keys[0], value, "expected raw amount integer"))
+}
+
+fn parse_optional_duration_secs(
+    values: &EnvPairs,
+    keys: &[&'static str],
+    default: Duration,
+) -> Result<Duration, ConfigError> {
+    let Some(value) = values.optional(keys) else {
+        return Ok(default);
+    };
+    let secs = value
+        .parse::<u64>()
+        .map_err(|_| ConfigError::invalid(keys[0], value, "expected unsigned integer seconds"))?;
+    Ok(Duration::from_secs(secs))
 }
 
 fn parse_required_address(
@@ -523,8 +635,39 @@ mod tests {
         assert_eq!(config.chain.rpc_http_urls.len(), 2);
         assert_eq!(config.chain.start_block, 1);
         assert_eq!(config.chain.min_confirmations, 12);
+        assert_eq!(config.collection, CollectionConfig::default());
+        assert_eq!(config.collector, CollectorConfig::default());
         assert_eq!(config.signer.mode, SignerMode::External);
         assert_eq!(config.signer.key_ref, "pay3-master");
+    }
+
+    #[test]
+    fn collection_fee_config_can_be_overridden_from_pairs() {
+        let config = config_with(&[
+            ("COLLECTION_GAS_LIMIT", "90000"),
+            ("COLLECTION_MAX_FEE_PER_GAS_WEI", "60000000000"),
+            ("COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI", "3000000000"),
+        ]);
+
+        assert_eq!(config.collection.gas_limit, 90_000);
+        assert_eq!(
+            config.collection.max_fee_per_gas_wei,
+            RawAmount::from(60_000_000_000)
+        );
+        assert_eq!(
+            config.collection.max_priority_fee_per_gas_wei,
+            RawAmount::from(3_000_000_000)
+        );
+    }
+
+    #[test]
+    fn collector_replacement_timeout_can_be_overridden_from_pairs() {
+        let config = config_with(&[("COLLECTION_REPLACEMENT_STUCK_AFTER_SECS", "120")]);
+
+        assert_eq!(
+            config.collector.replacement_stuck_after,
+            Duration::from_secs(120)
+        );
     }
 
     #[test]

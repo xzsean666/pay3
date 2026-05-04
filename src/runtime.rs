@@ -18,8 +18,8 @@ use crate::{
             PgPaymentRepository, PgVerifiedPaymentRecorder,
         },
     },
-    domain::{CollectionFees, RawAmount},
-    health::StaticDependencyRegistry,
+    domain::CollectionFees,
+    health::{MetricsRecorder, RuntimeDependencyRegistry, StaticDependencyRegistry},
     services::{
         collections::{AssumePrefundedGas, CollectionService, CollectionServiceConfig},
         orders::{OrderService, OrderServiceConfig, SystemClock},
@@ -35,14 +35,15 @@ use crate::{
     wallet::{DeterministicFakeDeriver, HdWallet, WalletError},
     workers::collector::{
         CollectionCollectorConfig, CollectionCollectorError, CollectionCollectorWorker,
-        spawn_collection_collector_loop,
+        spawn_collection_collector_loop_with_metrics,
     },
     workers::scanner::{
-        PaymentScannerConfig, PaymentScannerError, PaymentScannerWorker, spawn_payment_scanner_loop,
+        PaymentScannerConfig, PaymentScannerError, PaymentScannerWorker,
+        spawn_payment_scanner_loop_with_metrics,
     },
     workers::transfer_log_ingestor::{
         TransferLogIngestorLoopConfig, TransferLogIngestorLoopError,
-        spawn_transfer_log_ingestor_loop,
+        spawn_transfer_log_ingestor_loop_with_metrics,
     },
 };
 
@@ -58,9 +59,6 @@ const TRANSFER_LOG_RPC_MAX_RETRIES: u32 = 3;
 const PAYMENT_SCANNER_POLL_INTERVAL_MS: u64 = 5_000;
 const PAYMENT_SCANNER_LEASE_SECONDS: i64 = 30;
 const COLLECTION_COLLECTOR_POLL_INTERVAL_MS: u64 = 5_000;
-const COLLECTION_GAS_LIMIT: u64 = 80_000;
-const COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 50_000_000_000;
-const COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 2_000_000_000;
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -128,21 +126,27 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
     rpc_source.manager().validate_chain_ids().await?;
 
     ensure_runtime_signer_health(&config).await?;
+    let metrics = MetricsRecorder::default();
+    let dependency_registry =
+        RuntimeDependencyRegistry::new(StaticDependencyRegistry::all_healthy(), metrics.clone());
 
     let log_store = RedbTransferLogIngestor::open(rpc_source.clone(), &config.kvdb.path)?;
     let stream_config = transfer_log_stream_config(&config);
     let stream = stream_config.stream_id();
     log_store.ensure_stream(stream_config.clone()).await?;
-    let _log_ingestor_loop = spawn_transfer_log_ingestor_loop(
+    let _log_ingestor_loop = spawn_transfer_log_ingestor_loop_with_metrics(
         log_store.clone(),
         TransferLogIngestorLoopConfig::new(
             stream,
             std::time::Duration::from_millis(stream_config.poll_interval_ms),
+            config.chain.min_confirmations.saturating_mul(2),
         ),
+        metrics.clone(),
     )?;
-    let _payment_scanner_loop = spawn_payment_scanner_loop(
+    let _payment_scanner_loop = spawn_payment_scanner_loop_with_metrics(
         payment_scanner_worker(&config, pool.clone(), log_store.clone(), rpc_source.clone()),
         std::time::Duration::from_millis(PAYMENT_SCANNER_POLL_INTERVAL_MS),
+        metrics.clone(),
     )?;
 
     let auth = jwt_verifier(&config)?;
@@ -152,14 +156,15 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
         pool.clone(),
         rpc_source.clone(),
     )?);
-    let _collection_collector_loop = spawn_collection_collector_loop(
+    let _collection_collector_loop = spawn_collection_collector_loop_with_metrics(
         CollectionCollectorWorker::new(
             collection_service(&config, pool.clone(), rpc_source.clone())?,
             PgOutboundRepository::new(pool.clone()),
             rpc_source.clone(),
-            CollectionCollectorConfig::new(format!("collection-collector-{}", std::process::id())),
+            collection_collector_config(&config),
         ),
         std::time::Duration::from_millis(COLLECTION_COLLECTOR_POLL_INTERVAL_MS),
+        metrics.clone(),
     )?;
     let order_verify = Arc::new(ManualOrderVerifyService::new(
         PgOrderRepository::new(pool.clone()),
@@ -173,8 +178,9 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
         ),
     ));
 
-    Ok(api::router_with_runtime_services(
-        StaticDependencyRegistry::all_healthy(),
+    Ok(api::router_with_runtime_services_and_metrics(
+        dependency_registry,
+        metrics,
         auth,
         orders,
         order_verify,
@@ -261,16 +267,7 @@ fn collection_service(
     };
 
     Ok(CollectionService::new(
-        CollectionServiceConfig::new(
-            config.chain.chain_id,
-            config.chain.token_address,
-            config.chain.treasury_address,
-            CollectionFees::new(
-                COLLECTION_GAS_LIMIT,
-                RawAmount::from(COLLECTION_MAX_FEE_PER_GAS_WEI),
-                RawAmount::from(COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI),
-            ),
-        ),
+        collection_service_config(config),
         PgOrderRepository::new(pool.clone()),
         PgCollectionRepository::new(pool.clone()),
         PgOutboundRepository::new(pool.clone()),
@@ -279,6 +276,24 @@ fn collection_service(
         rpc_source,
         AssumePrefundedGas,
     )?)
+}
+
+fn collection_service_config(config: &AppConfig) -> CollectionServiceConfig {
+    CollectionServiceConfig::new(
+        config.chain.chain_id,
+        config.chain.token_address,
+        config.chain.treasury_address,
+        CollectionFees::new(
+            config.collection.gas_limit,
+            config.collection.max_fee_per_gas_wei,
+            config.collection.max_priority_fee_per_gas_wei,
+        ),
+    )
+}
+
+fn collection_collector_config(config: &AppConfig) -> CollectionCollectorConfig {
+    CollectionCollectorConfig::new(format!("collection-collector-{}", std::process::id()))
+        .with_replacement_stuck_after(config.collector.replacement_stuck_after)
 }
 
 fn payment_scanner_worker(
@@ -386,6 +401,7 @@ mod tests {
 
     use super::*;
     use crate::config::AppConfig;
+    use crate::domain::RawAmount;
 
     #[test]
     fn transfer_log_stream_config_uses_confirmed_target() {
@@ -406,6 +422,49 @@ mod tests {
         );
         assert_eq!(stream.reorg_lookback_blocks, 24);
         assert_eq!(stream.log_source, LogSourceKind::RpcRange);
+    }
+
+    #[test]
+    fn collection_service_config_uses_app_config_collection_fees() {
+        let config = test_config(&[
+            ("COLLECTION_GAS_LIMIT", "90000"),
+            ("COLLECTION_MAX_FEE_PER_GAS_WEI", "60000000000"),
+            ("COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI", "3000000000"),
+        ]);
+
+        let service_config = collection_service_config(&config);
+
+        assert_eq!(service_config.chain_id, config.chain.chain_id);
+        assert_eq!(service_config.token_address, config.chain.token_address);
+        assert_eq!(
+            service_config.treasury_address,
+            config.chain.treasury_address
+        );
+        assert_eq!(service_config.fees.gas_limit, 90_000);
+        assert_eq!(
+            service_config.fees.max_fee_per_gas,
+            RawAmount::from(60_000_000_000)
+        );
+        assert_eq!(
+            service_config.fees.max_priority_fee_per_gas,
+            RawAmount::from(3_000_000_000)
+        );
+    }
+
+    #[test]
+    fn collection_collector_config_uses_app_config_timeout() {
+        let config = test_config(&[("COLLECTION_REPLACEMENT_STUCK_AFTER_SECS", "120")]);
+
+        let collector_config = collection_collector_config(&config);
+
+        assert_eq!(
+            collector_config.worker_id,
+            format!("collection-collector-{}", std::process::id())
+        );
+        assert_eq!(
+            collector_config.replacement_stuck_after,
+            std::time::Duration::from_secs(120)
+        );
     }
 
     #[test]

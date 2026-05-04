@@ -1,9 +1,10 @@
 //! Collection collector worker tick.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use thiserror::Error;
+use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -14,6 +15,7 @@ use crate::{
         RepositoryError,
     },
     domain::TxHash,
+    health::{MetricsRecorder, WorkerName},
     services::{
         collections::{CollectionService, CollectionServiceError, PrepareCollectionJobOutcome},
         orders::IdGenerator,
@@ -23,13 +25,20 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionCollectorConfig {
     pub worker_id: String,
+    pub replacement_stuck_after: Duration,
 }
 
 impl CollectionCollectorConfig {
     pub fn new(worker_id: impl Into<String>) -> Self {
         Self {
             worker_id: worker_id.into(),
+            replacement_stuck_after: Duration::ZERO,
         }
+    }
+
+    pub fn with_replacement_stuck_after(mut self, replacement_stuck_after: Duration) -> Self {
+        self.replacement_stuck_after = replacement_stuck_after;
+        self
     }
 
     fn validate(&self) -> Result<(), CollectionCollectorError> {
@@ -129,6 +138,38 @@ where
 }
 
 #[async_trait]
+pub trait CollectionJobReplacer: Send + Sync {
+    async fn replace_stuck_collection_job(
+        &self,
+        worker_id: &str,
+        job: ReceiptCheckableOutboundTx,
+        replacement_reason: &str,
+    ) -> Result<PrepareCollectionJobOutcome, CollectionServiceError>;
+}
+
+#[async_trait]
+impl<O, C, B, A, S, H, G, I> CollectionJobReplacer for CollectionService<O, C, B, A, S, H, G, I>
+where
+    O: crate::db::repositories::OrderRepository,
+    C: crate::db::repositories::CollectionRepository,
+    B: OutboundRepository,
+    A: crate::db::repositories::AuditRepository,
+    S: crate::signer::SignerProvider,
+    H: crate::chain::Erc20ChainClient,
+    G: crate::services::collections::PrefundedGasChecker,
+    I: IdGenerator,
+{
+    async fn replace_stuck_collection_job(
+        &self,
+        worker_id: &str,
+        job: ReceiptCheckableOutboundTx,
+        replacement_reason: &str,
+    ) -> Result<PrepareCollectionJobOutcome, CollectionServiceError> {
+        CollectionService::replace_collection_job(self, worker_id, job, replacement_reason).await
+    }
+}
+
+#[async_trait]
 pub trait SignedTxBroadcaster: Send + Sync {
     async fn broadcast_signed_tx(&self, signed_tx: Vec<u8>) -> Result<TxHash, ChainError>;
 }
@@ -183,7 +224,7 @@ impl<P, O, B> CollectionCollectorWorker<P, O, B> {
 
 impl<P, O, B> CollectionCollectorWorker<P, O, B>
 where
-    P: CollectionJobPreparer,
+    P: CollectionJobPreparer + CollectionJobReplacer,
     O: OutboundRepository,
     B: SignedTxBroadcaster + TxReceiptReader,
 {
@@ -204,7 +245,9 @@ where
             .claim_broadcast_collect_tx_for_receipt(worker_id)
             .await?
         {
-            return self.check_outbound_receipt(receipt_checkable).await;
+            return self
+                .check_outbound_receipt(worker_id, receipt_checkable)
+                .await;
         }
 
         let outcome = self.preparer.prepare_next_collection_job(worker_id).await?;
@@ -252,6 +295,7 @@ where
 
     async fn check_outbound_receipt(
         &self,
+        worker_id: &str,
         checkable: ReceiptCheckableOutboundTx,
     ) -> Result<CollectionCollectorTickOutcome, CollectionCollectorError> {
         let Some(receipt) = self
@@ -259,6 +303,35 @@ where
             .transaction_receipt(checkable.outbound.tx_hash)
             .await?
         else {
+            if self.outbound_replacement_due(&checkable.outbound) {
+                let outcome = self
+                    .preparer
+                    .replace_stuck_collection_job(
+                        worker_id,
+                        checkable.clone(),
+                        "receipt missing beyond replacement threshold",
+                    )
+                    .await?;
+                return match outcome {
+                    PrepareCollectionJobOutcome::NoJob => {
+                        Ok(CollectionCollectorTickOutcome::ReceiptPending {
+                            collection_id: checkable.collection_id,
+                            outbound: checkable.outbound,
+                        })
+                    }
+                    PrepareCollectionJobOutcome::Prepared {
+                        collection,
+                        outbound,
+                        signed_tx: _,
+                    } => {
+                        self.broadcast_outbound(BroadcastableOutboundTx {
+                            collection_id: collection.id,
+                            outbound,
+                        })
+                        .await
+                    }
+                };
+            }
             return Ok(CollectionCollectorTickOutcome::ReceiptPending {
                 collection_id: checkable.collection_id,
                 outbound: checkable.outbound,
@@ -297,15 +370,41 @@ where
         }
     }
 
-    async fn run_forever(self, poll_interval: Duration) {
+    fn outbound_replacement_due(&self, outbound: &OutboundTxRecord) -> bool {
+        let Some(last_broadcast_at) = outbound.last_broadcast_at else {
+            return false;
+        };
+
+        let cutoff = OffsetDateTime::now_utc()
+            - TimeDuration::seconds(self.config.replacement_stuck_after.as_secs() as i64);
+        last_broadcast_at <= cutoff
+    }
+
+    async fn run_forever(self, poll_interval: Duration, metrics: Option<MetricsRecorder>) {
         let mut interval = tokio::time::interval(poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             interval.tick().await;
+            let started_at = Instant::now();
             match self.tick().await {
-                Ok(outcome) => log_tick_outcome(&outcome),
+                Ok(outcome) => {
+                    if let Some(metrics) = &metrics {
+                        metrics.record_worker_success(
+                            WorkerName::CollectionCollector,
+                            started_at.elapsed(),
+                        );
+                    }
+                    log_tick_outcome(&outcome);
+                }
                 Err(error) => {
+                    if let Some(metrics) = &metrics {
+                        metrics.record_worker_error(
+                            WorkerName::CollectionCollector,
+                            started_at.elapsed(),
+                            error.to_string(),
+                        );
+                    }
                     tracing::error!(
                         worker_id = %self.config.worker_id,
                         error = %error,
@@ -322,7 +421,33 @@ pub fn spawn_collection_collector_loop<P, O, B>(
     poll_interval: Duration,
 ) -> Result<JoinHandle<()>, CollectionCollectorError>
 where
-    P: CollectionJobPreparer + 'static,
+    P: CollectionJobPreparer + CollectionJobReplacer + 'static,
+    O: OutboundRepository + 'static,
+    B: SignedTxBroadcaster + TxReceiptReader + 'static,
+{
+    spawn_collection_collector_loop_with_optional_metrics(worker, poll_interval, None)
+}
+
+pub fn spawn_collection_collector_loop_with_metrics<P, O, B>(
+    worker: CollectionCollectorWorker<P, O, B>,
+    poll_interval: Duration,
+    metrics: MetricsRecorder,
+) -> Result<JoinHandle<()>, CollectionCollectorError>
+where
+    P: CollectionJobPreparer + CollectionJobReplacer + 'static,
+    O: OutboundRepository + 'static,
+    B: SignedTxBroadcaster + TxReceiptReader + 'static,
+{
+    spawn_collection_collector_loop_with_optional_metrics(worker, poll_interval, Some(metrics))
+}
+
+fn spawn_collection_collector_loop_with_optional_metrics<P, O, B>(
+    worker: CollectionCollectorWorker<P, O, B>,
+    poll_interval: Duration,
+    metrics: Option<MetricsRecorder>,
+) -> Result<JoinHandle<()>, CollectionCollectorError>
+where
+    P: CollectionJobPreparer + CollectionJobReplacer + 'static,
     O: OutboundRepository + 'static,
     B: SignedTxBroadcaster + TxReceiptReader + 'static,
 {
@@ -333,7 +458,7 @@ where
         });
     }
 
-    Ok(tokio::spawn(worker.run_forever(poll_interval)))
+    Ok(tokio::spawn(worker.run_forever(poll_interval, metrics)))
 }
 
 fn log_tick_outcome(outcome: &CollectionCollectorTickOutcome) {
@@ -349,6 +474,7 @@ fn log_tick_outcome(outcome: &CollectionCollectorTickOutcome) {
                 collection_id = %collection_id,
                 outbound_tx_id = %outbound.id,
                 tx_hash = %outbound.tx_hash,
+                replacement_of = ?outbound.replacement_of,
                 "collection collector broadcast outbound tx"
             );
         }
@@ -398,7 +524,7 @@ mod tests {
     };
 
     use async_trait::async_trait;
-    use time::{OffsetDateTime, macros::datetime};
+    use time::{Duration as TimeDuration, OffsetDateTime, macros::datetime};
 
     use super::*;
     use crate::{
@@ -571,6 +697,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tick_replaces_stale_broadcast_outbound_when_receipt_is_missing() {
+        let mut outbound = outbound_record(16, OutboundTxStatus::Broadcast);
+        outbound.last_broadcast_at =
+            Some(OffsetDateTime::now_utc() - TimeDuration::seconds(10 * 60 + 1));
+        let replacement = outbound_record(17, OutboundTxStatus::Signed);
+        let worker = CollectionCollectorWorker::new(
+            FakePreparer::with_replacement_outcomes(
+                vec![Ok(PrepareCollectionJobOutcome::NoJob)],
+                vec![Ok(prepared_outcome(replacement.clone()))],
+            ),
+            FakeOutboundRepository::with_receipt_checkable(ReceiptCheckableOutboundTx {
+                collection_id: collection_id(),
+                outbound: outbound.clone(),
+            }),
+            FakeBroadcaster::returning(replacement.tx_hash),
+            CollectionCollectorConfig::new("collector-1")
+                .with_replacement_stuck_after(Duration::from_secs(1)),
+        );
+
+        let outcome = worker.tick().await.unwrap();
+
+        assert_eq!(
+            outcome,
+            CollectionCollectorTickOutcome::Broadcast {
+                collection_id: collection_id(),
+                outbound: outbound_record(17, OutboundTxStatus::Broadcast),
+            }
+        );
+        assert_eq!(
+            worker.preparer.replacement_calls(),
+            vec![("collector-1".to_string(), collection_id(), outbound.id)]
+        );
+        assert_eq!(worker.broadcaster.broadcasts(), vec![replacement.signed_tx]);
+        assert_eq!(worker.outbound.marked(), vec![replacement.id]);
+    }
+
+    #[tokio::test]
     async fn tick_fails_closed_when_broadcast_hash_differs_from_signed_hash() {
         let outbound = outbound_record(11, OutboundTxStatus::Signed);
         let worker = worker(
@@ -638,12 +801,22 @@ mod tests {
         outbound: FakeOutboundRepository,
         broadcaster: FakeBroadcaster,
     ) -> CollectionCollectorWorker<FakePreparer, FakeOutboundRepository, FakeBroadcaster> {
-        CollectionCollectorWorker::new(
+        worker_with_config(
             preparer,
             outbound,
             broadcaster,
-            CollectionCollectorConfig::new("collector-1"),
+            CollectionCollectorConfig::new("collector-1")
+                .with_replacement_stuck_after(Duration::from_secs(365 * 24 * 60 * 60)),
         )
+    }
+
+    fn worker_with_config(
+        preparer: FakePreparer,
+        outbound: FakeOutboundRepository,
+        broadcaster: FakeBroadcaster,
+        config: CollectionCollectorConfig,
+    ) -> CollectionCollectorWorker<FakePreparer, FakeOutboundRepository, FakeBroadcaster> {
+        CollectionCollectorWorker::new(preparer, outbound, broadcaster, config)
     }
 
     #[derive(Clone, Debug)]
@@ -654,7 +827,9 @@ mod tests {
     #[derive(Debug)]
     struct FakePreparerState {
         outcomes: VecDeque<Result<PrepareCollectionJobOutcome, CollectionServiceError>>,
+        replacement_outcomes: VecDeque<Result<PrepareCollectionJobOutcome, CollectionServiceError>>,
         calls: Vec<String>,
+        replacement_calls: Vec<(String, Uuid, Uuid)>,
     }
 
     impl FakePreparer {
@@ -664,7 +839,23 @@ mod tests {
             Self {
                 state: Arc::new(Mutex::new(FakePreparerState {
                     outcomes: VecDeque::from(outcomes),
+                    replacement_outcomes: VecDeque::new(),
                     calls: Vec::new(),
+                    replacement_calls: Vec::new(),
+                })),
+            }
+        }
+
+        fn with_replacement_outcomes(
+            outcomes: Vec<Result<PrepareCollectionJobOutcome, CollectionServiceError>>,
+            replacement_outcomes: Vec<Result<PrepareCollectionJobOutcome, CollectionServiceError>>,
+        ) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakePreparerState {
+                    outcomes: VecDeque::from(outcomes),
+                    replacement_outcomes: VecDeque::from(replacement_outcomes),
+                    calls: Vec::new(),
+                    replacement_calls: Vec::new(),
                 })),
             }
         }
@@ -674,6 +865,14 @@ mod tests {
                 .lock()
                 .expect("fake preparer mutex poisoned")
                 .calls
+                .clone()
+        }
+
+        fn replacement_calls(&self) -> Vec<(String, Uuid, Uuid)> {
+            self.state
+                .lock()
+                .expect("fake preparer mutex poisoned")
+                .replacement_calls
                 .clone()
         }
     }
@@ -690,6 +889,27 @@ mod tests {
                 .outcomes
                 .pop_front()
                 .expect("fake preparer outcomes exhausted")
+        }
+    }
+
+    #[async_trait]
+    impl CollectionJobReplacer for FakePreparer {
+        async fn replace_stuck_collection_job(
+            &self,
+            worker_id: &str,
+            job: ReceiptCheckableOutboundTx,
+            _replacement_reason: &str,
+        ) -> Result<PrepareCollectionJobOutcome, CollectionServiceError> {
+            let mut state = self.state.lock().expect("fake preparer mutex poisoned");
+            state.replacement_calls.push((
+                worker_id.to_string(),
+                job.collection_id,
+                job.outbound.id,
+            ));
+            state
+                .replacement_outcomes
+                .pop_front()
+                .expect("fake preparer replacement outcomes exhausted")
         }
     }
 
