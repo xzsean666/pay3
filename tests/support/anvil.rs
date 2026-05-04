@@ -42,6 +42,40 @@ fn helper_error(message: impl Into<String>) -> AnyError {
     Box::new(HelperError(message.into()))
 }
 
+async fn rpc_request(rpc_url: &str, method: &str, params: Value) -> Result<Value, AnyError> {
+    let client = Client::new();
+    let response = client
+        .post(rpc_url)
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        }))
+        .send()
+        .await
+        .map_err(|error| helper_error(format!("{method} request failed: {error}")))?;
+
+    if !response.status().is_success() {
+        return Err(helper_error(format!(
+            "{method} returned HTTP {}",
+            response.status()
+        )));
+    }
+
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| helper_error(format!("{method} json: {error}")))?;
+    if let Some(error) = payload.get("error") {
+        return Err(helper_error(format!(
+            "{method} returned RPC error: {error}"
+        )));
+    }
+
+    Ok(payload)
+}
+
 #[derive(Debug)]
 pub struct AnvilHarness {
     child: Child,
@@ -93,6 +127,16 @@ impl AnvilHarness {
 
     pub fn mnemonic(&self) -> &str {
         &self.mnemonic
+    }
+
+    pub async fn set_automine(&self, automine: bool) -> Result<(), AnyError> {
+        let _ = rpc_request(&self.rpc_url, "evm_setAutomine", json!([automine])).await?;
+        Ok(())
+    }
+
+    pub async fn mine_block(&self) -> Result<(), AnyError> {
+        let _ = rpc_request(&self.rpc_url, "evm_mine", json!([])).await?;
+        Ok(())
     }
 
     pub async fn derive_address(&self, derivation_path: &str) -> Result<EvmAddress, AnyError> {

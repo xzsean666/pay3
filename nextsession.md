@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，已完成 Phase 5 `workers/scanner` tick contract、常驻 loop、confirmation sweep、rolling lookback rescan 和 lag/readiness 初版，已完成 `services/collections` prefunded 初版、collector broadcast tick 初版、collector 常驻 loop 初版、collector broadcast 前/后崩溃恢复与 receipt sweep tick 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版和 collection create/read API route contract 初版，并新增真实 API 启动路径的 runtime composition 初版、真实 PostgreSQL 集成测试 `tests/collection_db_integration.rs` 和 Anvil+mock ERC20 e2e `tests/anvil_e2e.rs`。
+仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，已完成 Phase 5 `workers/scanner` tick contract、常驻 loop、confirmation sweep、rolling lookback rescan 和 lag/readiness 初版，已完成 `services/collections` prefunded 初版、collector broadcast tick 初版、collector 常驻 loop 初版、collector broadcast 前/后崩溃恢复与 receipt sweep tick 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版和 collection create/read API route contract 初版，并新增真实 API 启动路径的 runtime composition 初版、真实 PostgreSQL 集成测试 `tests/collection_db_integration.rs` 和 Anvil+mock ERC20 e2e `tests/anvil_e2e.rs`，其中补了 collect replacement 回归。
 
 已完成：
 
@@ -44,7 +44,7 @@
   - 要求订单为 `paid` 且 chain/token 匹配后才调用 `CollectionRepository::create_collection_idempotent`。
   - 处理 queued job 时检查 ERC20 token balance、prefunded gas gate、signer health，预留 nonce，构造 ERC20 `transfer(treasury, amount)` calldata，签名并持久化 outbound tx，再 attach collection outbound。
   - 写 `collection.create` / `collection.signed` audit event。
-  - 注意：当前是 service contract 初版，broadcast/retry/receipt/replacement 和真正跨 repository 原子化恢复仍需 collector/outbound 进一步补齐。
+  - 注意：当前是 service contract 初版，broadcast/retry/receipt/replacement 仍需与 collector/outbound 的真实运行态持续联调，不过已有真实 PostgreSQL 集成测试和 Anvil replacement e2e 回归。
 - `src/services/verify/**`: manual verify service contract，按订单窗口读取 bounded KV logs，复用 `services::payments::match_stored_transfer_logs`，通过 `VerifiedPaymentRecorder` 小 trait 与具体 Pg 写入解耦。
 - `src/services/mod.rs`: services 模块入口，已导出 orders/payment_windows/payments/verify/collections。
 - `src/workers/scanner.rs`: payment scanner tick contract 初版：
@@ -64,7 +64,7 @@
   - tick 开始时会优先通过 `OutboundRepository::claim_signed_collect_tx_for_broadcast` claim 已持久化但未广播的 `transferring + signed` collect outbound，重播同一 `signed_tx`，覆盖 broadcast 前崩溃恢复。
   - 无待重播 signed outbound 时，会通过 `OutboundRepository::claim_broadcast_collect_tx_for_receipt` claim `confirming + broadcast` collect outbound，查询 receipt；success 标记 outbound/collection confirmed，reverted 标记 failed，receipt missing 保持 pending。
   - 新增 `spawn_collection_collector_loop` 常驻 loop 初版，按固定 interval 调用 tick，单次错误记录结构化 tracing 后继续运行；覆盖零 poll interval 配置校验。
-  - 仍缺确认数/finality 策略和更完整的 replacement/e2e 复测。
+  - 仍缺确认数/finality 策略和更完整的 finality/reorg 复测。
 - `src/workers/transfer_log_ingestor.rs`: transfer log ingestor 常驻 poll loop 初版：
   - `TransferLogIngestorLoop` 包装 `TransferLogIngestor::poll_once`，校验非零 poll interval。
   - `spawn_transfer_log_ingestor_loop` 使用 `tokio::time::interval` 周期 poll，`Advanced/Rewound/Idle` 写结构化 tracing，单次错误记录后继续循环。
@@ -100,7 +100,7 @@
 - `src/transfer_log_store/redb_store.rs`: redb persistence layer，支持 config/cursor/header/log/range manifest 持久化、stream config + cursor 原子初始化、atomic batch write、bounded `logs_in_range`、exclusive `logs_page`、rewind delete。
 - `tests/migration_contract.rs`: migration contract 测试；有 `PAY3_TEST_DATABASE_URL`/`TEST_DATABASE_URL` 时会实际 apply 到临时 schema，否则跳过 DB apply 分支。
 - `tests/collection_db_integration.rs`: 真实 PostgreSQL 集成测试，临时 schema + migrations 之后直接用 SQL 验证 collection/outbound trigger、collect-only purpose check 和 outbound active nonce replacement trajectory；无数据库 URL 时自动跳过。
-- `tests/anvil_e2e.rs`: 真实 Anvil + mock ERC20 e2e，覆盖订单创建、Transfer log 采集、scanner 付款确认、collection 广播/确认和 treasury 余额断言。
+- `tests/anvil_e2e.rs`: 真实 Anvil + mock ERC20 e2e，覆盖订单创建、Transfer log 采集、scanner 付款确认、collection 广播/确认、stuck replacement 和 treasury 余额断言。
 - `tests/support/anvil.rs`: Anvil/Foundry 测试支撑层，封装 mnemonic 派生、mock ERC20 部署和 ERC20 转账广播。
 - `tests/repository_contract.rs`: repository SQL/contract 静态测试，覆盖幂等、lease/CAS、matched-only payments、collection job lock、nonce/replacement、audit insert。
 - `tests/chain_contract.rs`: chain 模块静态 contract 测试，确保暴露必要 trait/fake/RPC 控制点，且不依赖 axum API DTO、DB 或订单业务状态。
@@ -124,17 +124,17 @@
 最近验证：
 
 - `cargo fmt -- --check`: 通过。
-- `cargo test --test anvil_e2e`: 通过，1 个 Anvil e2e 测试。
-- `cargo test`: 通过，144 个库测试 + 58 个 integration/contract 测试 + 1 个 Anvil e2e：
+- `cargo test --test anvil_e2e`: 通过，2 个 Anvil e2e 测试。
+- `cargo test`: 上次全量通过，144 个库测试 + 58 个 integration/contract 测试；当时 Anvil e2e 只有 1 个测试，本轮新增 replacement 场景后尚未重新全量复跑：
   - chain 2、collection_db integration 2、manual verify service 5、migration 6、order verify API 8、payment matching 9、payment window lookup 4、repository 5、signer 5、transfer log redb 7、transfer log store types 5。
 
 ## 多 Agent 审计结论
 
-当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store redb-backed runtime 初版和常驻 poll loop、M12 付款匹配纯 service、手动 verify service/API route contract、collection create/read API route contract、API runtime composition 初版、scanner worker tick + 常驻 loop + confirmation sweep + rolling lookback rescan + lag/readiness 初版、`services/collections` prefunded 初版、collector broadcast tick + 常驻 loop 初版和 broadcast 前/后崩溃恢复与 receipt sweep tick 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版已经完成并通过编译/静态 contract 测试，且已经补了一组真实 PostgreSQL 集成测试和 Anvil ERC20 e2e，但 collect replacement 的真实 DB/e2e 复测、部署工件和演练记录仍未补齐。
+当前项目仍不可用于生产接真实资金。虽然 Phase 1、M4 migration、M5 repository 初版、M6 wallet、M7 signer contract/fake、订单创建 service、订单 API route contract、M8 chain 纯契约/fake、RPC provider manager/RpcRangeSource 初版、M9 transfer log store redb-backed runtime 初版和常驻 poll loop、M12 付款匹配纯 service、手动 verify service/API route contract、collection create/read API route contract、API runtime composition 初版、scanner worker tick + 常驻 loop + confirmation sweep + rolling lookback rescan + lag/readiness 初版、`services/collections` prefunded 初版、collector broadcast tick + 常驻 loop 初版和 broadcast 前/后崩溃恢复与 receipt sweep tick 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版已经完成并通过编译/静态 contract 测试，且已经补了一组真实 PostgreSQL 集成测试和 Anvil ERC20 e2e（包含 collect replacement 回归），但部署工件和演练记录仍未补齐。
 
 原因：
 
-- 仓库已有订单 API、manual verify、collection create/read、transfer log ingestor poll loop、payment scanner loop/confirmation sweep 和 collector loop 的真实启动组装初版，也已有 collector broadcast 前/后崩溃恢复和 receipt sweep tick 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版、scanner lag/readiness 初版；已经新增 collection/outbound 的真实 PostgreSQL 集成测试和 Anvil ERC20 e2e，但 collect replacement 的真实 DB/e2e 复测、部署和 runbook 演练记录仍未补齐。
+  - 仓库已有订单 API、manual verify、collection create/read、transfer log ingestor poll loop、payment scanner loop/confirmation sweep 和 collector loop 的真实启动组装初版，也已有 collector broadcast 前/后崩溃恢复和 receipt sweep tick 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版、scanner lag/readiness 初版；已经新增 collection/outbound 的真实 PostgreSQL 集成测试和 Anvil ERC20 e2e（含 replacement 回归），但部署和 runbook 演练记录仍未补齐。
 - runtime 目前只支持 non-production fake signer 作为开发/联调桥接；外部 signer/KMS/HSM adapter 未实现前不能 production。
 - 地址复用在 ERC20 场景无法绝对消除迟到付款歧义，已从 MVP 砍掉。
 - collect 不能允许任意 `to_address`，必须固定 treasury。
@@ -287,7 +287,7 @@
    - collector 单测覆盖 no job、broadcast success、hash mismatch fail closed、不合法 worker id、broadcast 前崩溃恢复优先于新 job、receipt success/reverted/missing、零 poll interval 配置校验。
    - `POST /v1/collections` API route contract 初版已完成并接入 runtime：只允许 `amount=max`，拒绝未知字段/`to_address`，使用 `collections:create` scope，映射 created/existing/conflict/dependency 错误。
    - `GET /v1/collections/{id}` API route contract 初版已完成并接入 runtime：使用 `collections:read` scope，返回 collection 状态、outbound 引用、attempt/error 和时间字段，missing -> `404`。
-   - 仍需确认数/finality 策略、真实 DB 原子化/并发测试和 replacement/e2e 复测。
+  - 仍需确认数/finality 策略和更完整的真实 DB/Anvil 确认数回归。
 21. 实现 API runtime composition。已完成初版：
    - `src/runtime.rs` 组装 PgPool、migration/seed、JWT、RPC chain id probe、redb stream、订单 service 和 manual verify service。
    - runtime 已组装 collection create/read API 所需的 Pg collection/outbound/audit repositories、fake signer、RPC chain client 和 prefunded gas checker。
@@ -323,11 +323,11 @@
 | 付款 verify | 完成 service + route + runtime 初版 | `POST /v1/orders/{id}/verify` + `orders:verify` scope；manual service 已复用 matcher；Pg recorder 已完成并接入 runtime；真实 DB/Anvil e2e 未做 |
 | scanner worker | 完成初版 | tick contract + 常驻 loop + confirmation sweep + rolling lookback rescan 初版已完成：lease/CAS、KV reorg epoch、paged matcher、commit batch、canonical block hash 校验、结构化 tick 日志、worker tick metrics/readyz；真实 DB 集成测试未做 |
 | redb/KVDB | 完成 transfer log KV 初版 | `transfer_log_store/redb_store.rs` + `RedbTransferLogIngestor` 通过 contract；通用 cache 后置 |
-| services/collections | 完成初版 | treasury-only create + prefunded job prepare + signer/outbound/audit contract；collection create/read API route/runtime 已完成初版；broadcast 前/后崩溃恢复和 receipt sweep 已由 collector/outbound claim 覆盖；collection fee/collector timeout 已改为 AppConfig 驱动；已新增 collection/outbound 真实 PostgreSQL 集成测试，replacement/e2e 仍待补 |
-| collect worker | 完成初版 | broadcast tick + 常驻 loop 初版已完成：优先重播 transferring+signed outbound，其次检查 confirming+broadcast receipt，receipt 长时间缺失时触发同 nonce replacement/gas bump 初版；仍需确认数/finality 策略、replacement/e2e 复测 |
+| services/collections | 完成初版 | treasury-only create + prefunded job prepare + signer/outbound/audit contract；collection create/read API route/runtime 已完成初版；broadcast 前/后崩溃恢复和 receipt sweep 已由 collector/outbound claim 覆盖；collection fee/collector timeout 已改为 AppConfig 驱动；已新增 collection/outbound 真实 PostgreSQL 集成测试和 Anvil replacement e2e |
+| collect worker | 完成初版 | broadcast tick + 常驻 loop 初版已完成：优先重播 transferring+signed outbound，其次检查 confirming+broadcast receipt，receipt 长时间缺失时触发同 nonce replacement/gas bump 初版；replacement 路径已补 Anvil e2e，仍需确认数/finality 策略 |
 | 外部 signer adapter | 未开始 | 已有 signer trait/fake；production 需要 KMS/HSM/external signer adapter |
 | 可观测性/告警 | 部分完成 | `/metrics`、结构化日志已接入，alert dry-run 仍未开始 |
-| e2e 测试 | 未开始 | Anvil + mock ERC20 |
+| e2e 测试 | 部分完成 | Anvil + mock ERC20 happy path + stuck collect replacement |
 | 部署/runbook | 文档完成 | 见 `docs/DEPLOYMENT.md`、`docs/RUNBOOK.md`；演练未开始 |
 | MVP 出口准入 | 未开始 | `docs/PRODUCTION_READINESS.md` 清单全部通过才可评估真实资金 |
 
