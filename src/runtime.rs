@@ -1,5 +1,6 @@
 use std::{fs, path::Path, sync::Arc};
 
+use async_trait::async_trait;
 use axum::Router;
 use sqlx::PgPool;
 use thiserror::Error;
@@ -27,12 +28,15 @@ use crate::{
         payments::{PaymentMatcher, PaymentMatchingConfig},
         verify::{ManualOrderVerifyService, ManualVerifyConfig},
     },
-    signer::{DeterministicFakeSigner, SignerError, SignerProvider},
+    signer::{
+        DeterministicFakeSigner, RemoteHttpSigner, SignedTx, SignerError, SignerProvider,
+        UnsignedTx,
+    },
     transfer_log_store::{
         LogSourceKind, RedbTransferLogIngestor, ScanTargetMode, StreamId, TransferLogIngestor,
         TransferLogStoreError, TransferLogStreamConfig,
     },
-    wallet::{DeterministicFakeDeriver, HdWallet, WalletError},
+    wallet::{AddressDeriver, DeterministicFakeDeriver, HdWallet, WalletError},
     workers::collector::{
         CollectionCollectorConfig, CollectionCollectorError, CollectionCollectorWorker,
         spawn_collection_collector_loop_with_metrics,
@@ -59,6 +63,70 @@ const TRANSFER_LOG_RPC_MAX_RETRIES: u32 = 3;
 const PAYMENT_SCANNER_POLL_INTERVAL_MS: u64 = 5_000;
 const PAYMENT_SCANNER_LEASE_SECONDS: i64 = 30;
 const COLLECTION_COLLECTOR_POLL_INTERVAL_MS: u64 = 5_000;
+
+#[derive(Clone, Debug)]
+enum RuntimeSigner {
+    Fake {
+        deriver: DeterministicFakeDeriver,
+        signer: DeterministicFakeSigner,
+    },
+    Remote(RemoteHttpSigner),
+}
+
+#[async_trait]
+impl AddressDeriver for RuntimeSigner {
+    async fn derive_address(
+        &self,
+        key_ref: &str,
+        path: &str,
+    ) -> Result<crate::domain::EvmAddress, WalletError> {
+        match self {
+            Self::Fake { deriver, .. } => {
+                AddressDeriver::derive_address(deriver, key_ref, path).await
+            }
+            Self::Remote(signer) => AddressDeriver::derive_address(signer, key_ref, path).await,
+        }
+    }
+}
+
+#[async_trait]
+impl SignerProvider for RuntimeSigner {
+    async fn derive_address(
+        &self,
+        key_ref: &str,
+        path: &str,
+    ) -> Result<crate::domain::EvmAddress, SignerError> {
+        match self {
+            Self::Fake { signer, .. } => {
+                SignerProvider::derive_address(signer, key_ref, path).await
+            }
+            Self::Remote(signer) => SignerProvider::derive_address(signer, key_ref, path).await,
+        }
+    }
+
+    async fn sign_transaction(
+        &self,
+        key_ref: &str,
+        path: &str,
+        tx: UnsignedTx,
+    ) -> Result<SignedTx, SignerError> {
+        match self {
+            Self::Fake { signer, .. } => {
+                SignerProvider::sign_transaction(signer, key_ref, path, tx).await
+            }
+            Self::Remote(signer) => {
+                SignerProvider::sign_transaction(signer, key_ref, path, tx).await
+            }
+        }
+    }
+
+    async fn health_check(&self) -> Result<(), SignerError> {
+        match self {
+            Self::Fake { signer, .. } => SignerProvider::health_check(signer).await,
+            Self::Remote(signer) => SignerProvider::health_check(signer).await,
+        }
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -104,9 +172,7 @@ pub enum RuntimeError {
     #[error(transparent)]
     Signer(#[from] SignerError),
 
-    #[error(
-        "runtime signer mode {mode:?} is not implemented yet; use SIGNER_MODE=fake only for development/test"
-    )]
+    #[error("runtime signer mode {mode:?} is not supported; SIGNER_MODE=local remains disabled")]
     UnsupportedSignerMode { mode: SignerMode },
 }
 
@@ -125,7 +191,8 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
     )?;
     rpc_source.manager().validate_chain_ids().await?;
 
-    ensure_runtime_signer_health(&config).await?;
+    let signer = runtime_signer(&config)?;
+    ensure_runtime_signer_health(&signer).await?;
     let metrics = MetricsRecorder::default();
     let dependency_registry =
         RuntimeDependencyRegistry::new(StaticDependencyRegistry::all_healthy(), metrics.clone());
@@ -150,15 +217,21 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
     )?;
 
     let auth = jwt_verifier(&config)?;
-    let orders = Arc::new(order_service(&config, pool.clone(), rpc_source.clone())?);
+    let orders = Arc::new(order_service(
+        &config,
+        pool.clone(),
+        rpc_source.clone(),
+        signer.clone(),
+    )?);
     let collections = Arc::new(collection_service(
         &config,
         pool.clone(),
         rpc_source.clone(),
+        signer.clone(),
     )?);
     let _collection_collector_loop = spawn_collection_collector_loop_with_metrics(
         CollectionCollectorWorker::new(
-            collection_service(&config, pool.clone(), rpc_source.clone())?,
+            collection_service(&config, pool.clone(), rpc_source.clone(), signer.clone())?,
             PgOutboundRepository::new(pool.clone()),
             rpc_source.clone(),
             collection_collector_config(&config),
@@ -212,22 +285,47 @@ fn jwt_verifier(config: &AppConfig) -> Result<JwtVerifier, RuntimeError> {
     )?)
 }
 
-fn order_service(
+fn runtime_signer(config: &AppConfig) -> Result<RuntimeSigner, RuntimeError> {
+    match &config.signer.mode {
+        SignerMode::Fake => Ok(RuntimeSigner::Fake {
+            deriver: DeterministicFakeDeriver::with_allowed_key_refs(
+                "pay3-runtime-fake",
+                [config.signer.key_ref.clone()],
+            )?,
+            signer: DeterministicFakeSigner::with_allowed_key_refs(
+                "pay3-runtime-fake",
+                [config.signer.key_ref.clone()],
+            )?,
+        }),
+        SignerMode::External | SignerMode::Kms | SignerMode::Hsm => {
+            let endpoint = config.signer.remote_endpoint.as_deref().ok_or_else(|| {
+                RuntimeError::Config(ConfigError::Validation {
+                    errors: vec![
+                        "non-fake signer modes require SIGNER_REMOTE_ENDPOINT".to_string(),
+                    ],
+                })
+            })?;
+
+            Ok(RuntimeSigner::Remote(RemoteHttpSigner::new(
+                endpoint,
+                config.signer.remote_request_timeout,
+            )?))
+        }
+        SignerMode::Local => Err(RuntimeError::UnsupportedSignerMode {
+            mode: SignerMode::Local,
+        }),
+    }
+}
+
+fn order_service<D>(
     config: &AppConfig,
     pool: PgPool,
     rpc_source: RpcRangeSource,
-) -> Result<OrderService<PgOrderRepository, DeterministicFakeDeriver, RpcRangeSource>, RuntimeError>
+    deriver: D,
+) -> Result<OrderService<PgOrderRepository, D, RpcRangeSource>, RuntimeError>
+where
+    D: AddressDeriver,
 {
-    let deriver = match &config.signer.mode {
-        SignerMode::Fake => DeterministicFakeDeriver::with_allowed_key_refs(
-            "pay3-runtime-fake",
-            [config.signer.key_ref.clone()],
-        )?,
-        mode => {
-            return Err(RuntimeError::UnsupportedSignerMode { mode: mode.clone() });
-        }
-    };
-
     Ok(OrderService::new(
         OrderServiceConfig::new(
             config.chain.chain_id,
@@ -240,32 +338,26 @@ fn order_service(
     )?)
 }
 
-fn collection_service(
+fn collection_service<S>(
     config: &AppConfig,
     pool: PgPool,
     rpc_source: RpcRangeSource,
+    signer: S,
 ) -> Result<
     CollectionService<
         PgOrderRepository,
         PgCollectionRepository,
         PgOutboundRepository,
         PgAuditRepository,
-        DeterministicFakeSigner,
+        S,
         RpcRangeSource,
         AssumePrefundedGas,
     >,
     RuntimeError,
-> {
-    let signer = match &config.signer.mode {
-        SignerMode::Fake => DeterministicFakeSigner::with_allowed_key_refs(
-            "pay3-runtime-fake",
-            [config.signer.key_ref.clone()],
-        )?,
-        mode => {
-            return Err(RuntimeError::UnsupportedSignerMode { mode: mode.clone() });
-        }
-    };
-
+>
+where
+    S: SignerProvider,
+{
     Ok(CollectionService::new(
         collection_service_config(config),
         PgOrderRepository::new(pool.clone()),
@@ -343,18 +435,12 @@ fn payment_scanner_worker(
     )
 }
 
-async fn ensure_runtime_signer_health(config: &AppConfig) -> Result<(), RuntimeError> {
-    match &config.signer.mode {
-        SignerMode::Fake => {
-            let signer = DeterministicFakeSigner::with_allowed_key_refs(
-                "pay3-runtime-fake",
-                [config.signer.key_ref.clone()],
-            )?;
-            signer.health_check().await?;
-            Ok(())
-        }
-        mode => Err(RuntimeError::UnsupportedSignerMode { mode: mode.clone() }),
-    }
+async fn ensure_runtime_signer_health<S>(signer: &S) -> Result<(), RuntimeError>
+where
+    S: SignerProvider,
+{
+    signer.health_check().await?;
+    Ok(())
 }
 
 fn transfer_log_stream_config(config: &AppConfig) -> TransferLogStreamConfig {
@@ -399,9 +485,19 @@ fn ensure_kvdb_parent(path: &Path) -> Result<(), RuntimeError> {
 mod tests {
     use std::path::PathBuf;
 
+    use axum::{
+        Router,
+        extract::{Json, State},
+        routing::{get, post},
+    };
+    use serde::Deserialize;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
     use super::*;
     use crate::config::AppConfig;
-    use crate::domain::RawAmount;
+    use crate::domain::{DerivationSegment, EvmAddress, RawAmount, TxHash};
+    use crate::wallet::DeriveAddressRequest;
 
     #[test]
     fn transfer_log_stream_config_uses_confirmed_target() {
@@ -479,23 +575,229 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn runtime_signer_health_is_explicitly_fake_only_for_now() {
-        let fake = test_config(&[("SIGNER_MODE", "fake")]);
-        ensure_runtime_signer_health(&fake)
-            .await
-            .expect("fake signer should bootstrap in development");
+    async fn runtime_signer_bootstraps_fake_mode() {
+        let config = test_config(&[("SIGNER_MODE", "fake")]);
+        let signer = runtime_signer(&config).expect("fake signer should bootstrap");
 
-        let external = test_config(&[("SIGNER_MODE", "external")]);
-        let error = ensure_runtime_signer_health(&external)
+        assert!(matches!(&signer, RuntimeSigner::Fake { .. }));
+        ensure_runtime_signer_health(&signer)
             .await
-            .expect_err("external signer adapter is not implemented yet");
+            .expect("fake signer health check");
+
+        let wallet = HdWallet::new(signer.clone());
+        let request = DeriveAddressRequest::new("pay3-master", 1, DerivationSegment::ZERO).unwrap();
+        let derived = wallet.derive_child_address(request.clone()).await.unwrap();
+        let derived_again = wallet.derive_child_address(request).await.unwrap();
+
+        assert_eq!(derived.signer_key_ref, "pay3-master");
+        assert_eq!(derived.derivation_path, "m/44'/60'/0'/0/0");
+        assert_eq!(derived.address, derived_again.address);
+    }
+
+    #[tokio::test]
+    async fn runtime_signer_bootstraps_remote_modes_and_reuses_same_client() {
+        let state = RemoteTestState {
+            expected_key_ref: "pay3-master".to_string(),
+            expected_path: "m/44'/60'/7'/8/9".to_string(),
+            address: EvmAddress::from_bytes([0x11; 20]),
+            tx_hash: TxHash::from_bytes([0x22; 32]),
+        };
+        let (endpoint, handle) = spawn_remote_signer_server(state.clone()).await;
+
+        for mode in ["external", "kms", "hsm"] {
+            let config = test_config_owned(vec![
+                ("SIGNER_MODE", mode.to_string()),
+                ("SIGNER_REMOTE_ENDPOINT", endpoint.clone()),
+                ("SIGNER_REMOTE_REQUEST_TIMEOUT_SECS", "2".to_string()),
+            ]);
+            let signer = runtime_signer(&config).expect("remote signer should bootstrap");
+
+            assert!(matches!(&signer, RuntimeSigner::Remote(_)));
+            ensure_runtime_signer_health(&signer)
+                .await
+                .expect("remote signer health check");
+
+            let wallet = HdWallet::new(signer.clone());
+            let request = DeriveAddressRequest::new(
+                state.expected_key_ref.clone(),
+                1,
+                DerivationSegment::new(7, 8, 9).unwrap(),
+            )
+            .unwrap();
+            let derived = wallet.derive_child_address(request).await.unwrap();
+            assert_eq!(derived.address, state.address);
+            assert_eq!(derived.derivation_path, state.expected_path);
+
+            let unsigned = UnsignedTx::new(
+                "request-1",
+                31337,
+                9,
+                EvmAddress::from_bytes([0x33; 20]),
+                RawAmount::from(1_000u64),
+                80_000,
+                RawAmount::from(50_000_000_000u64),
+                RawAmount::from(2_000_000_000u64),
+                vec![0xaa, 0xbb, 0xcc],
+            )
+            .unwrap();
+            let signed = signer
+                .sign_transaction(
+                    &state.expected_key_ref,
+                    &state.expected_path,
+                    unsigned.clone(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(signed.request_id, unsigned.request_id);
+            assert_eq!(signed.from, state.address);
+            assert_eq!(signed.to, unsigned.to);
+            assert_eq!(signed.tx_hash, state.tx_hash);
+            assert_eq!(signed.raw_tx, vec![0xde, 0xad, 0xbe, 0xef]);
+        }
+
+        handle.abort();
+    }
+
+    #[test]
+    fn runtime_signer_rejects_local_mode() {
+        let config = test_config_owned(vec![
+            ("SIGNER_MODE", "local".to_string()),
+            (
+                "SIGNER_REMOTE_ENDPOINT",
+                "http://localhost:8081".to_string(),
+            ),
+        ]);
+
+        let error = runtime_signer(&config).expect_err("local mode should remain unsupported");
 
         assert!(matches!(
             error,
             RuntimeError::UnsupportedSignerMode {
-                mode: SignerMode::External
+                mode: SignerMode::Local
             }
         ));
+    }
+
+    #[derive(Clone)]
+    struct RemoteTestState {
+        expected_key_ref: String,
+        expected_path: String,
+        address: EvmAddress,
+        tx_hash: TxHash,
+    }
+
+    #[derive(Deserialize)]
+    struct RemoteDeriveRequest {
+        key_ref: String,
+        path: String,
+    }
+
+    #[derive(Deserialize)]
+    struct RemoteSignRequest {
+        key_ref: String,
+        path: String,
+        transaction: UnsignedTx,
+    }
+
+    async fn spawn_remote_signer_server(
+        state: RemoteTestState,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        async fn healthz() -> Json<serde_json::Value> {
+            Json(json!({ "status": "ok" }))
+        }
+
+        async fn derive_address(
+            State(state): State<RemoteTestState>,
+            Json(body): Json<RemoteDeriveRequest>,
+        ) -> Json<EvmAddress> {
+            assert_eq!(body.key_ref, state.expected_key_ref);
+            assert_eq!(body.path, state.expected_path);
+            Json(state.address)
+        }
+
+        async fn sign_transaction(
+            State(state): State<RemoteTestState>,
+            Json(body): Json<RemoteSignRequest>,
+        ) -> Json<SignedTx> {
+            assert_eq!(body.key_ref, state.expected_key_ref);
+            assert_eq!(body.path, state.expected_path);
+            assert_eq!(body.transaction.request_id, "request-1");
+            assert_eq!(body.transaction.chain_id, 31337);
+            assert_eq!(body.transaction.nonce, 9);
+            Json(SignedTx {
+                request_id: body.transaction.request_id,
+                chain_id: body.transaction.chain_id,
+                nonce: body.transaction.nonce,
+                from: state.address,
+                to: body.transaction.to,
+                tx_hash: state.tx_hash,
+                raw_tx: vec![0xde, 0xad, 0xbe, 0xef],
+            })
+        }
+
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/v1/addresses/derive", post(derive_address))
+            .route("/v1/transactions/sign", post(sign_transaction))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve remote signer");
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
+    fn test_config_owned(overrides: Vec<(&'static str, String)>) -> AppConfig {
+        let mut pairs = vec![
+            ("APP_PROFILE", "development".to_string()),
+            ("APP_BIND", "127.0.0.1:8080".to_string()),
+            (
+                "DATABASE_URL",
+                "postgres://pay3:pay3@localhost:5432/pay3".to_string(),
+            ),
+            ("KVDB_PATH", "./target/test-pay3.redb".to_string()),
+            ("JWT_ISSUER", "pay3".to_string()),
+            ("JWT_AUDIENCE", "pay3-api".to_string()),
+            ("JWT_SECRET", "0123456789abcdef0123456789abcdef".to_string()),
+            ("JWT_KEY_ID", "pay3-key-1".to_string()),
+            ("CHAIN_ID", "31337".to_string()),
+            (
+                "TOKEN_ADDRESS",
+                "0x0000000000000000000000000000000000000001".to_string(),
+            ),
+            ("TOKEN_DECIMALS", "6".to_string()),
+            ("TOKEN_SYMBOL", "USDT".to_string()),
+            (
+                "TREASURY_ADDRESS",
+                "0x0000000000000000000000000000000000000002".to_string(),
+            ),
+            ("RPC_HTTP_URLS", "http://localhost:8545".to_string()),
+            ("START_BLOCK", "1".to_string()),
+            ("MIN_CONFIRMATIONS", "12".to_string()),
+            ("SIGNER_MODE", "fake".to_string()),
+            ("SIGNER_KEY_REF", "pay3-master".to_string()),
+        ];
+
+        for (key, value) in overrides {
+            if let Some((_, existing)) = pairs
+                .iter_mut()
+                .find(|(existing_key, _)| *existing_key == key)
+            {
+                *existing = value;
+            } else {
+                pairs.push((key, value));
+            }
+        }
+
+        AppConfig::from_pairs(pairs).expect("test config should parse")
     }
 
     fn test_config(overrides: &[(&'static str, &'static str)]) -> AppConfig {

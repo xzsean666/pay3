@@ -167,6 +167,85 @@ fn transfer_log_redb_rewind_deletes_block_and_after_and_records_reorg_cursor() {
     assert!(store.range_manifests(stream, 10).unwrap().is_empty());
 }
 
+#[test]
+fn transfer_log_redb_prune_before_block_removes_old_data_and_preserves_cursor() {
+    let file = NamedTempFile::new().unwrap();
+    let store = RedbTransferLogStore::open(file.path()).unwrap();
+    let stream = stream();
+    let config = config(stream);
+
+    let mut old_cursor = TransferLogCursor::initial(&config, 1, now());
+    old_cursor.next_block = 4;
+    old_cursor.last_completed_block = Some(3);
+    old_cursor.last_completed_hash = Some(hash(3));
+
+    store
+        .write_batch(RedbTransferLogBatch {
+            stream,
+            headers: vec![header(stream, 2), header(stream, 3)],
+            logs: vec![log(stream, 2, 0)],
+            range_manifest: Some(RangeManifestDto {
+                stream,
+                from_block: 2,
+                to_block: 3,
+                block_count: 2,
+                log_count: 1,
+                writer_epoch: old_cursor.writer_epoch,
+                completed_at: now(),
+            }),
+            cursor: old_cursor,
+        })
+        .unwrap();
+
+    let mut new_cursor = TransferLogCursor::initial(&config, 1, now());
+    new_cursor.next_block = 6;
+    new_cursor.last_completed_block = Some(5);
+    new_cursor.last_completed_hash = Some(hash(5));
+
+    store
+        .write_batch(RedbTransferLogBatch {
+            stream,
+            headers: vec![header(stream, 4), header(stream, 5)],
+            logs: vec![log(stream, 4, 0)],
+            range_manifest: Some(RangeManifestDto {
+                stream,
+                from_block: 4,
+                to_block: 5,
+                block_count: 2,
+                log_count: 1,
+                writer_epoch: new_cursor.writer_epoch,
+                completed_at: now(),
+            }),
+            cursor: new_cursor.clone(),
+        })
+        .unwrap();
+
+    let cursor_before = store.load_cursor(stream).unwrap().unwrap();
+    store.prune_before_block(stream, 4).unwrap();
+
+    assert_eq!(store.load_cursor(stream).unwrap(), Some(cursor_before));
+    assert!(store.load_block_header(stream, 2).unwrap().is_none());
+    assert!(store.load_block_header(stream, 3).unwrap().is_none());
+    assert!(store.load_block_header(stream, 4).unwrap().is_some());
+    assert!(store.load_block_header(stream, 5).unwrap().is_some());
+    assert_eq!(
+        store.logs_in_range(stream, 4, 5, 10).unwrap(),
+        vec![log(stream, 4, 0)]
+    );
+    assert_eq!(
+        store.range_manifests(stream, 10).unwrap(),
+        vec![RangeManifestDto {
+            stream,
+            from_block: 4,
+            to_block: 5,
+            block_count: 2,
+            log_count: 1,
+            writer_epoch: new_cursor.writer_epoch,
+            completed_at: now(),
+        }]
+    );
+}
+
 #[tokio::test]
 async fn redb_ingestor_polls_persists_and_reopens_reader_state() {
     let file = NamedTempFile::new().unwrap();

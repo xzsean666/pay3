@@ -1,4 +1,4 @@
-//! Signer boundary and deterministic fake signer.
+//! Signer boundary, deterministic fake signer, and remote HTTP adapter.
 
 use std::{
     collections::BTreeSet,
@@ -12,6 +12,10 @@ use thiserror::Error;
 
 use crate::domain::{EvmAddress, MAX_DERIVATION_INDEX, RawAmount, TxHash};
 
+mod external;
+
+pub use external::RemoteHttpSigner;
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SignerError {
     #[error("signer key ref must not be empty")]
@@ -23,11 +27,35 @@ pub enum SignerError {
     #[error("fake signer namespace must not be empty")]
     InvalidFakeNamespace,
 
+    #[error("remote signer endpoint must not be empty")]
+    EmptyRemoteSignerEndpoint,
+
     #[error("signer key ref not found: {key_ref}")]
     UnknownSignerKeyRef { key_ref: String },
 
     #[error("signer health check failed: {message}")]
     HealthCheckFailed { message: String },
+
+    #[error("remote signer transport error during {operation}: {message}")]
+    RemoteTransport {
+        operation: &'static str,
+        message: String,
+    },
+
+    #[error(
+        "remote signer returned non-success status during {operation}: status={status}, body={body}"
+    )]
+    RemoteHttpStatus {
+        operation: &'static str,
+        status: u16,
+        body: String,
+    },
+
+    #[error("remote signer returned invalid json during {operation}: {message}")]
+    RemoteJson {
+        operation: &'static str,
+        message: String,
+    },
 
     #[error("transaction request id must not be empty")]
     EmptyRequestId,

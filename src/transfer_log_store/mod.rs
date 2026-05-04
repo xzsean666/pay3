@@ -167,6 +167,25 @@ impl<S> InMemoryTransferLogStore<S> {
     fn now(&self) -> OffsetDateTime {
         (self.now)()
     }
+
+    /// Prunes stored headers, logs, and range manifests older than `floor_block`.
+    pub fn prune_before_block(
+        &self,
+        stream: StreamId,
+        floor_block: u64,
+    ) -> TransferLogStoreResult<()> {
+        let now = self.now();
+        let mut state = self
+            .state
+            .lock()
+            .expect("transfer log store mutex poisoned");
+        let Some(data) = state.streams.get_mut(&stream) else {
+            return Ok(());
+        };
+
+        apply_retention_cleanup(data, floor_block, now);
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -1006,6 +1025,15 @@ fn apply_rewind(data: &mut StreamData, from_block: u64, now: OffsetDateTime) {
     data.state.updated_at = now;
 }
 
+fn apply_retention_cleanup(data: &mut StreamData, floor_block: u64, now: OffsetDateTime) {
+    data.headers.retain(|block, _| *block >= floor_block);
+    data.logs.retain(|_, log| log.block_number >= floor_block);
+    data.range_manifests
+        .retain(|range| range.to_block >= floor_block);
+    data.state.cursor = data.cursor.clone();
+    data.state.updated_at = now;
+}
+
 fn complete_to_block(logs: &[StoredTransferLog], data: &StreamData, has_more: bool) -> Option<u64> {
     let last = logs.last()?;
     if !has_more {
@@ -1164,6 +1192,44 @@ mod tests {
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0].to_address, address(0x99));
         assert_eq!(logs[0].block_hash, block_hash(0xaa));
+    }
+
+    #[tokio::test]
+    async fn prune_before_block_removes_old_data_and_preserves_cursor() {
+        let chain = chain()
+            .insert_block(block(4, 4))
+            .insert_block(block(5, 5))
+            .set_safe_head(crate::domain::ChainBlockRef::new(5, block_hash(5)))
+            .push_transfer_log(log(2, 0, 0x20))
+            .push_transfer_log(log(4, 0, 0x24));
+        let store = store(chain);
+        store.ensure_stream(config(2, 2)).await.unwrap();
+        store.poll_once(stream()).await.unwrap();
+        store.poll_once(stream()).await.unwrap();
+
+        let cursor_before = store.cursor(stream()).await.unwrap();
+        store.prune_before_block(stream(), 4).unwrap();
+        let cursor_after = store.cursor(stream()).await.unwrap();
+
+        assert_eq!(cursor_before, cursor_after);
+        assert!(store.block_header(stream(), 2).await.unwrap().is_none());
+        assert!(store.block_header(stream(), 3).await.unwrap().is_none());
+        assert!(store.block_header(stream(), 4).await.unwrap().is_some());
+        assert!(store.block_header(stream(), 5).await.unwrap().is_some());
+
+        let logs = store.logs_in_range(stream(), 2, 5, 10).await.unwrap();
+        assert_eq!(logs.len(), 1);
+        assert_eq!(logs[0].block_number, 4);
+        assert_eq!(logs[0].to_address, address(0x24));
+
+        let state = store
+            .state
+            .lock()
+            .expect("transfer log store mutex poisoned");
+        let data = state.streams.get(&stream()).expect("stream should exist");
+        assert_eq!(data.range_manifests.len(), 1);
+        assert_eq!(data.range_manifests[0].from_block, 4);
+        assert_eq!(data.range_manifests[0].to_block, 5);
     }
 
     fn store(chain: FakeErc20ChainClient) -> InMemoryTransferLogStore<FakeErc20ChainClient> {

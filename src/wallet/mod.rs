@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::{DerivationSegment, EvmAddress, MAX_DERIVATION_INDEX};
+use crate::signer::{RemoteHttpSigner, SignerError, SignerProvider};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WalletError {
@@ -25,6 +26,9 @@ pub enum WalletError {
 
     #[error("signer key ref not found: {key_ref}")]
     UnknownSignerKeyRef { key_ref: String },
+
+    #[error("remote signer call failed: {message}")]
+    RemoteSignerCallFailed { message: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +112,52 @@ where
             derivation_path,
             address,
         })
+    }
+}
+
+#[async_trait]
+impl AddressDeriver for RemoteHttpSigner {
+    async fn derive_address(&self, key_ref: &str, path: &str) -> Result<EvmAddress, WalletError> {
+        SignerProvider::derive_address(self, key_ref, path)
+            .await
+            .map_err(map_remote_signer_error)
+    }
+}
+
+fn map_remote_signer_error(error: SignerError) -> WalletError {
+    match error {
+        SignerError::EmptySignerKeyRef => WalletError::EmptySignerKeyRef,
+        SignerError::InvalidDerivationPath { path } => WalletError::InvalidDerivationPath { path },
+        SignerError::InvalidFakeNamespace => WalletError::RemoteSignerCallFailed {
+            message: "remote signer reported invalid fake namespace".to_string(),
+        },
+        SignerError::EmptyRemoteSignerEndpoint => WalletError::RemoteSignerCallFailed {
+            message: "remote signer endpoint must not be empty".to_string(),
+        },
+        SignerError::UnknownSignerKeyRef { key_ref } => {
+            WalletError::UnknownSignerKeyRef { key_ref }
+        }
+        SignerError::HealthCheckFailed { message } => WalletError::RemoteSignerCallFailed {
+            message: format!("health check failed: {message}"),
+        },
+        SignerError::RemoteTransport { operation, message } => {
+            WalletError::RemoteSignerCallFailed {
+                message: format!("{operation} transport error: {message}"),
+            }
+        }
+        SignerError::RemoteHttpStatus {
+            operation,
+            status,
+            body,
+        } => WalletError::RemoteSignerCallFailed {
+            message: format!("{operation} returned status {status}: {body}"),
+        },
+        SignerError::RemoteJson { operation, message } => WalletError::RemoteSignerCallFailed {
+            message: format!("{operation} returned invalid json: {message}"),
+        },
+        SignerError::EmptyRequestId => WalletError::RemoteSignerCallFailed {
+            message: "remote signer rejected empty request id".to_string(),
+        },
     }
 }
 
@@ -249,7 +299,99 @@ fn valid_decimal_index(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use axum::{
+        Router,
+        extract::{Json, State},
+        http::StatusCode,
+        routing::{get, post},
+    };
+    use serde::Deserialize;
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    use crate::domain::{RawAmount, TxHash};
+    use crate::signer::{SignedTx, UnsignedTx};
+
     use super::*;
+
+    #[derive(Clone)]
+    struct RemoteTestState {
+        expected_key_ref: String,
+        expected_path: String,
+        address: EvmAddress,
+        tx_hash: TxHash,
+    }
+
+    #[derive(Deserialize)]
+    struct RemoteDeriveRequest {
+        key_ref: String,
+        path: String,
+    }
+
+    #[derive(Deserialize)]
+    struct RemoteSignRequest {
+        key_ref: String,
+        path: String,
+        transaction: UnsignedTx,
+    }
+
+    async fn spawn_remote_signer_server(
+        state: RemoteTestState,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        async fn healthz() -> Json<serde_json::Value> {
+            Json(json!({ "status": "ok" }))
+        }
+
+        async fn derive_address(
+            State(state): State<RemoteTestState>,
+            Json(body): Json<RemoteDeriveRequest>,
+        ) -> Json<EvmAddress> {
+            assert_eq!(body.key_ref, state.expected_key_ref);
+            assert_eq!(body.path, state.expected_path);
+            Json(state.address)
+        }
+
+        async fn sign_transaction(
+            State(state): State<RemoteTestState>,
+            Json(body): Json<RemoteSignRequest>,
+        ) -> Json<SignedTx> {
+            assert_eq!(body.key_ref, state.expected_key_ref);
+            assert_eq!(body.path, state.expected_path);
+            assert_eq!(body.transaction.request_id, "request-1");
+            assert_eq!(body.transaction.chain_id, 31337);
+            assert_eq!(body.transaction.nonce, 9);
+            Json(SignedTx {
+                request_id: body.transaction.request_id,
+                chain_id: body.transaction.chain_id,
+                nonce: body.transaction.nonce,
+                from: state.address,
+                to: body.transaction.to,
+                tx_hash: state.tx_hash,
+                raw_tx: vec![0xde, 0xad, 0xbe, 0xef],
+            })
+        }
+
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/v1/addresses/derive", post(derive_address))
+            .route("/v1/transactions/sign", post(sign_transaction))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr: SocketAddr = listener.local_addr().expect("listener addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve remote signer");
+        });
+
+        (format!("http://{addr}"), handle)
+    }
 
     #[tokio::test]
     async fn derives_child_address_from_segment_path() {
@@ -386,5 +528,95 @@ mod tests {
             DeterministicFakeDeriver::new("  ").unwrap_err(),
             WalletError::InvalidFakeNamespace
         );
+    }
+
+    #[tokio::test]
+    async fn remote_http_signer_uses_http_contract_for_health_derivation_and_signing() {
+        let state = RemoteTestState {
+            expected_key_ref: "pay3-master".to_string(),
+            expected_path: "m/44'/60'/7'/8/9".to_string(),
+            address: EvmAddress::from_bytes([0x11; 20]),
+            tx_hash: TxHash::from_bytes([0x22; 32]),
+        };
+        let (endpoint, handle) = spawn_remote_signer_server(state.clone()).await;
+        let client = RemoteHttpSigner::new(endpoint, Duration::from_secs(2)).unwrap();
+
+        client.health_check().await.expect("health check");
+
+        let derived =
+            AddressDeriver::derive_address(&client, &state.expected_key_ref, &state.expected_path)
+                .await
+                .expect("remote derivation");
+        assert_eq!(derived, state.address);
+
+        let unsigned = UnsignedTx::new(
+            "request-1",
+            31337,
+            9,
+            EvmAddress::from_bytes([0x33; 20]),
+            RawAmount::from(1_000u64),
+            80_000,
+            RawAmount::from(50_000_000_000u64),
+            RawAmount::from(2_000_000_000u64),
+            vec![0xaa, 0xbb, 0xcc],
+        )
+        .expect("unsigned tx");
+        let signed = client
+            .sign_transaction(
+                &state.expected_key_ref,
+                &state.expected_path,
+                unsigned.clone(),
+            )
+            .await
+            .expect("remote signing");
+
+        assert_eq!(signed.request_id, "request-1");
+        assert_eq!(signed.chain_id, unsigned.chain_id);
+        assert_eq!(signed.nonce, unsigned.nonce);
+        assert_eq!(signed.from, state.address);
+        assert_eq!(signed.to, unsigned.to);
+        assert_eq!(signed.tx_hash, state.tx_hash);
+        assert_eq!(signed.raw_tx, vec![0xde, 0xad, 0xbe, 0xef]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn remote_http_signer_maps_http_failures_to_wallet_error() {
+        async fn healthz() -> StatusCode {
+            StatusCode::OK
+        }
+
+        async fn not_found() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+
+        let app = Router::new()
+            .route("/healthz", get(healthz))
+            .route("/v1/addresses/derive", post(not_found))
+            .route("/v1/transactions/sign", post(not_found));
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("listener addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve remote signer");
+        });
+
+        let client = RemoteHttpSigner::new(format!("http://{addr}"), Duration::from_secs(2))
+            .expect("remote signer client");
+        let error = AddressDeriver::derive_address(&client, "pay3-master", "m/44'/60'/0'/0/0")
+            .await
+            .expect_err("404 should map to remote signer failure");
+
+        assert!(matches!(
+            error,
+            WalletError::RemoteSignerCallFailed { message }
+                if message.contains("status 404")
+        ));
+
+        handle.abort();
     }
 }

@@ -14,6 +14,7 @@ const DEFAULT_COLLECTION_GAS_LIMIT: u64 = 80_000;
 const DEFAULT_COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 50_000_000_000;
 const DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 2_000_000_000;
 const DEFAULT_COLLECTION_COLLECTOR_REPLACEMENT_STUCK_AFTER_SECS: u64 = 30 * 60;
+const DEFAULT_SIGNER_REMOTE_REQUEST_TIMEOUT_SECS: u64 = 15;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppProfile {
@@ -149,6 +150,8 @@ impl Default for CollectorConfig {
 pub struct SignerConfig {
     pub mode: SignerMode,
     pub key_ref: String,
+    pub remote_endpoint: Option<String>,
+    pub remote_request_timeout: Duration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -179,6 +182,10 @@ impl SignerMode {
 
     fn is_local_or_fake(&self) -> bool {
         matches!(self, Self::Local | Self::Fake)
+    }
+
+    fn is_fake(&self) -> bool {
+        matches!(self, Self::Fake)
     }
 }
 
@@ -320,16 +327,46 @@ impl AppConfig {
             signer: SignerConfig {
                 mode: SignerMode::parse(values.required_ref(&["SIGNER_MODE", "SIGNER_PROVIDER"])?)?,
                 key_ref: values.required(&["SIGNER_KEY_REF"])?,
+                remote_endpoint: values.optional_owned(&[
+                    "SIGNER_REMOTE_ENDPOINT",
+                    "SIGNER_ENDPOINT",
+                    "REMOTE_SIGNER_ENDPOINT",
+                ]),
+                remote_request_timeout: parse_optional_duration_secs(
+                    &values,
+                    &[
+                        "SIGNER_REMOTE_REQUEST_TIMEOUT_SECS",
+                        "SIGNER_REQUEST_TIMEOUT_SECS",
+                        "REMOTE_SIGNER_REQUEST_TIMEOUT_SECS",
+                    ],
+                    Duration::from_secs(DEFAULT_SIGNER_REMOTE_REQUEST_TIMEOUT_SECS),
+                )?,
             },
         })
     }
 
     pub fn validate_profile(&self) -> Result<(), ConfigError> {
-        if !self.profile.is_production() {
-            return Ok(());
+        let mut errors = Vec::new();
+
+        if !self.signer.mode.is_fake()
+            && self
+                .signer
+                .remote_endpoint
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            errors.push("non-fake signer modes require SIGNER_REMOTE_ENDPOINT".to_string());
         }
 
-        let mut errors = Vec::new();
+        if !self.profile.is_production() {
+            return if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(ConfigError::Validation { errors })
+            };
+        }
 
         if self.signer.mode.is_local_or_fake() {
             errors.push("production profile requires an external/KMS/HSM signer".to_string());
@@ -589,6 +626,11 @@ mod tests {
             ("MIN_CONFIRMATIONS", "12".to_string()),
             ("SIGNER_MODE", "external".to_string()),
             ("SIGNER_KEY_REF", "pay3-master".to_string()),
+            (
+                "SIGNER_REMOTE_ENDPOINT",
+                "http://localhost:8081".to_string(),
+            ),
+            ("SIGNER_REMOTE_REQUEST_TIMEOUT_SECS", "15".to_string()),
         ]
     }
 
@@ -639,6 +681,14 @@ mod tests {
         assert_eq!(config.collector, CollectorConfig::default());
         assert_eq!(config.signer.mode, SignerMode::External);
         assert_eq!(config.signer.key_ref, "pay3-master");
+        assert_eq!(
+            config.signer.remote_endpoint.as_deref(),
+            Some("http://localhost:8081")
+        );
+        assert_eq!(
+            config.signer.remote_request_timeout,
+            Duration::from_secs(15)
+        );
     }
 
     #[test]
@@ -671,11 +721,13 @@ mod tests {
     }
 
     #[test]
-    fn development_profile_allows_fake_signer() {
+    fn development_profile_allows_fake_signer_without_remote_endpoint() {
         let mut pairs = valid_pairs("development");
         for (key, value) in &mut pairs {
             if *key == "SIGNER_MODE" {
                 *value = "fake".to_string();
+            } else if *key == "SIGNER_REMOTE_ENDPOINT" {
+                *value = "".to_string();
             }
         }
 
@@ -690,6 +742,22 @@ mod tests {
             let errors = validation_errors(&config);
             assert!(errors.iter().any(|error| error.contains("signer")));
         }
+    }
+
+    #[test]
+    fn non_fake_signer_requires_remote_endpoint_in_any_profile() {
+        let config = config_with(&[
+            ("APP_PROFILE", "development"),
+            ("SIGNER_MODE", "external"),
+            ("SIGNER_REMOTE_ENDPOINT", ""),
+        ]);
+
+        let errors = validation_errors(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("SIGNER_REMOTE_ENDPOINT"))
+        );
     }
 
     #[test]

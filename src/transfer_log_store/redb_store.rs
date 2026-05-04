@@ -325,15 +325,15 @@ impl RedbTransferLogStore {
 
         {
             let mut headers = write.open_table(HEADERS).map_err(redb_error)?;
-            remove_from_prefix_range(
-                &mut headers,
-                &header_key(stream, block),
-                &header_prefix(stream),
-            )?;
+            let start = header_key(stream, block);
+            let end = prefix_end(&header_prefix(stream));
+            remove_key_range(&mut headers, start.as_slice(), end.as_slice())?;
         }
         {
             let mut logs = write.open_table(LOGS).map_err(redb_error)?;
-            remove_from_prefix_range(&mut logs, &log_key(stream, block, 0), &log_prefix(stream))?;
+            let start = log_key(stream, block, 0);
+            let end = prefix_end(&log_prefix(stream));
+            remove_key_range(&mut logs, start.as_slice(), end.as_slice())?;
         }
         {
             let mut ranges = write.open_table(RANGES).map_err(redb_error)?;
@@ -353,6 +353,36 @@ impl RedbTransferLogStore {
 
         write.commit().map_err(redb_error)?;
         Ok(cursor)
+    }
+
+    /// Prunes stored headers, logs, and range manifests older than `floor_block`.
+    pub fn prune_before_block(
+        &self,
+        stream: StreamId,
+        floor_block: u64,
+    ) -> RedbTransferLogStoreResult<()> {
+        let write = self.db.begin_write().map_err(redb_error)?;
+        {
+            let mut headers = write.open_table(HEADERS).map_err(redb_error)?;
+            let start = header_prefix(stream);
+            let end = header_key(stream, floor_block);
+            remove_key_range(&mut headers, start.as_slice(), end.as_slice())?;
+        }
+        {
+            let mut logs = write.open_table(LOGS).map_err(redb_error)?;
+            let start = log_prefix(stream);
+            let end = log_key(stream, floor_block, 0);
+            remove_key_range(&mut logs, start.as_slice(), end.as_slice())?;
+        }
+        {
+            let mut ranges = write.open_table(RANGES).map_err(redb_error)?;
+            let keys = range_keys_with_to_before(&ranges, stream, floor_block)?;
+            for key in keys {
+                ranges.remove(key.as_slice()).map_err(redb_error)?;
+            }
+        }
+
+        write.commit().map_err(redb_error)
     }
 
     pub fn range_manifests(
@@ -397,14 +427,13 @@ impl RedbTransferLogStore {
     }
 }
 
-fn remove_from_prefix_range(
+fn remove_key_range(
     table: &mut redb::Table<'_, &[u8], &[u8]>,
     start: &[u8],
-    prefix: &[u8],
+    end: &[u8],
 ) -> RedbTransferLogStoreResult<()> {
-    let end = prefix_end(prefix);
     let keys = table
-        .range::<&[u8]>((Bound::Included(start), Bound::Excluded(end.as_slice())))
+        .range::<&[u8]>((Bound::Included(start), Bound::Excluded(end)))
         .map_err(redb_error)?
         .map(|item| item.map(|(key, _)| key.value().to_vec()))
         .collect::<Result<Vec<_>, _>>()
@@ -433,6 +462,30 @@ fn range_keys_with_to_at_or_after(
         let (key, value) = item.map_err(redb_error)?;
         let manifest: RangeManifestDto = deserialize(value.value())?;
         if manifest.to_block >= block {
+            keys.push(key.value().to_vec());
+        }
+    }
+    Ok(keys)
+}
+
+fn range_keys_with_to_before(
+    table: &redb::Table<'_, &[u8], &[u8]>,
+    stream: StreamId,
+    block: u64,
+) -> RedbTransferLogStoreResult<Vec<Vec<u8>>> {
+    let prefix = range_prefix(stream);
+    let end = prefix_end(&prefix);
+    let mut keys = Vec::new();
+    for item in table
+        .range::<&[u8]>((
+            Bound::Included(prefix.as_slice()),
+            Bound::Excluded(end.as_slice()),
+        ))
+        .map_err(redb_error)?
+    {
+        let (key, value) = item.map_err(redb_error)?;
+        let manifest: RangeManifestDto = deserialize(value.value())?;
+        if manifest.to_block < block {
             keys.push(key.value().to_vec());
         }
     }

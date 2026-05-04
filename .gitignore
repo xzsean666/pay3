@@ -1,1 +1,21 @@
-/target
+/target/
+/out/
+/cache/
+
+# Local/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Temporary files
+tmp/
+temp/
