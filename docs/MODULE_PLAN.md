@@ -125,6 +125,8 @@ Repository 是业务一致性的边界。service 不拼 SQL。
   - `PaymentRepository`
     - `claim_scan_range(worker_id)`
     - `commit_scanned_batch(batch)`，只提交 matched Pay3 payments、订单重算和 PostgreSQL cursor，不提交 raw logs
+    - `observed_payment_confirmation_candidates(chain_id, token_address, max_block_number, limit)`，只返回 observed payments 的候选 block ref，不直接判定 canonical
+    - `confirm_observed_payments(batch)`，只确认 scanner 已通过 canonical block hash 校验的 observed payments，并重算受影响订单
     - `recompute_orders(order_ids)`
     - `handle_kv_reorg_epoch(epoch, last_reorg_from)`
 - `CollectionRepository`

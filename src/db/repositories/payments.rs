@@ -1,17 +1,20 @@
-use std::collections::BTreeSet;
+use std::{collections::BTreeSet, str::FromStr};
 
 use async_trait::async_trait;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::domain::EvmAddress;
+use crate::domain::{BlockHash, ChainBlockRef, EvmAddress};
 
 use super::{
     error::RepositoryError,
     payment_recompute::recompute_orders_in_tx,
-    payment_records::{i64_to_u64, u64_to_i64, upsert_matched_payment_tx},
-    types::{CommitScannedBatch, PaymentRecord, ScanCursorLease},
+    payment_records::{i64_to_u64, payment_record_from_row, u64_to_i64, upsert_matched_payment_tx},
+    types::{
+        CommitScannedBatch, ConfirmObservedPaymentsBatch, PaymentConfirmationCandidate,
+        PaymentRecord, ScanCursorLease,
+    },
 };
 
 #[async_trait]
@@ -27,6 +30,19 @@ pub trait PaymentRepository: Send + Sync {
     async fn commit_scanned_batch(
         &self,
         batch: CommitScannedBatch,
+    ) -> Result<Vec<PaymentRecord>, RepositoryError>;
+
+    async fn observed_payment_confirmation_candidates(
+        &self,
+        chain_id: u64,
+        token_address: EvmAddress,
+        max_block_number: u64,
+        limit: usize,
+    ) -> Result<Vec<PaymentConfirmationCandidate>, RepositoryError>;
+
+    async fn confirm_observed_payments(
+        &self,
+        batch: ConfirmObservedPaymentsBatch,
     ) -> Result<Vec<PaymentRecord>, RepositoryError>;
 
     async fn recompute_orders(&self, order_ids: Vec<Uuid>) -> Result<(), RepositoryError>;
@@ -255,6 +271,130 @@ impl PaymentRepository for PgPaymentRepository {
         tx.commit().await.map_err(RepositoryError::Database)
     }
 
+    async fn observed_payment_confirmation_candidates(
+        &self,
+        chain_id: u64,
+        token_address: EvmAddress,
+        max_block_number: u64,
+        limit: usize,
+    ) -> Result<Vec<PaymentConfirmationCandidate>, RepositoryError> {
+        if limit == 0 {
+            return Err(invalid_argument("limit", "limit must be greater than zero"));
+        }
+
+        let chain_id_i64 = u64_to_i64(chain_id, "chain_id")?;
+        let token_address_hex = token_address.to_lower_hex();
+        let max_block_number_i64 = u64_to_i64(max_block_number, "max_block_number")?;
+        let limit_i64 = i64::try_from(limit)
+            .map_err(|_| invalid_argument("limit", "limit exceeds PostgreSQL bigint range"))?;
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id AS payment_id,
+                order_id,
+                block_number,
+                block_hash,
+                confirmations
+            FROM payments
+            WHERE chain_id = $1
+              AND token_address = $2
+              AND chain_status = 'observed'
+              AND block_number <= $3
+            ORDER BY block_number, log_index, id
+            LIMIT $4
+            "#,
+        )
+        .bind(chain_id_i64)
+        .bind(&token_address_hex)
+        .bind(max_block_number_i64)
+        .bind(limit_i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(RepositoryError::Database)?;
+
+        rows.iter().map(row_to_confirmation_candidate).collect()
+    }
+
+    async fn confirm_observed_payments(
+        &self,
+        batch: ConfirmObservedPaymentsBatch,
+    ) -> Result<Vec<PaymentRecord>, RepositoryError> {
+        if batch.payment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let chain_id_i64 = u64_to_i64(batch.chain_id, "chain_id")?;
+        let token_address_hex = batch.token_address.to_lower_hex();
+        let head_number_i64 = u64_to_i64(batch.canonical_head.number, "canonical_head.number")?;
+
+        let mut tx = self.pool.begin().await.map_err(RepositoryError::Database)?;
+        let rows = sqlx::query(
+            r#"
+            WITH input_ids AS (
+                SELECT unnest($3::uuid[]) AS id
+            ),
+            updated AS (
+                UPDATE payments p
+                SET confirmations = GREATEST(
+                        p.confirmations,
+                        ($4::bigint - p.block_number + 1)
+                    ),
+                    chain_status = 'confirmed',
+                    updated_at = now()
+                FROM input_ids i
+                WHERE p.id = i.id
+                  AND p.chain_id = $1
+                  AND p.token_address = $2
+                  AND p.chain_status = 'observed'
+                  AND p.block_number <= $4
+                RETURNING
+                    p.id,
+                    p.order_id,
+                    p.child_account_id,
+                    p.chain_id,
+                    p.token_address,
+                    p.tx_hash,
+                    p.log_index,
+                    p.from_address,
+                    p.to_address,
+                    p.amount_raw,
+                    p.block_number,
+                    p.block_hash,
+                    p.block_time,
+                    p.confirmations,
+                    p.match_status,
+                    p.chain_status,
+                    p.created_at,
+                    p.updated_at
+            )
+            SELECT *
+            FROM updated
+            ORDER BY block_number, log_index, id
+            "#,
+        )
+        .bind(chain_id_i64)
+        .bind(&token_address_hex)
+        .bind(&batch.payment_ids)
+        .bind(head_number_i64)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(RepositoryError::Database)?;
+
+        let records = rows
+            .iter()
+            .map(payment_record_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        let affected_order_ids = records
+            .iter()
+            .map(|record| record.order_id)
+            .collect::<BTreeSet<_>>();
+        recompute_orders_in_tx(&mut tx, affected_order_ids).await?;
+        tx.commit().await.map_err(RepositoryError::Database)?;
+
+        Ok(records)
+    }
+
     async fn handle_kv_reorg_epoch(
         &self,
         chain_id: u64,
@@ -352,4 +492,38 @@ fn invalid_argument(field: &'static str, message: impl Into<String>) -> Reposito
         field,
         message: message.into(),
     }
+}
+
+fn row_to_confirmation_candidate(
+    row: &sqlx::postgres::PgRow,
+) -> Result<PaymentConfirmationCandidate, RepositoryError> {
+    let block_hash: String = row
+        .try_get("block_hash")
+        .map_err(RepositoryError::Database)?;
+
+    Ok(PaymentConfirmationCandidate {
+        payment_id: row
+            .try_get("payment_id")
+            .map_err(RepositoryError::Database)?,
+        order_id: row.try_get("order_id").map_err(RepositoryError::Database)?,
+        block: ChainBlockRef::new(
+            i64_to_u64(
+                row.try_get("block_number")
+                    .map_err(RepositoryError::Database)?,
+                "block_number",
+            )?,
+            parse_block_hash(&block_hash)?,
+        ),
+        confirmations: i64_to_u64(
+            row.try_get("confirmations")
+                .map_err(RepositoryError::Database)?,
+            "confirmations",
+        )?,
+    })
+}
+
+fn parse_block_hash(value: &str) -> Result<BlockHash, RepositoryError> {
+    BlockHash::from_str(value).map_err(|error| {
+        RepositoryError::invalid_persisted_state(format!("invalid block_hash: {error}"))
+    })
 }

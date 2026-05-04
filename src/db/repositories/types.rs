@@ -152,6 +152,22 @@ pub struct MatchedPaymentInput {
     pub chain_status: PaymentChainStatus,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaymentConfirmationCandidate {
+    pub payment_id: Uuid,
+    pub order_id: Uuid,
+    pub block: ChainBlockRef,
+    pub confirmations: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfirmObservedPaymentsBatch {
+    pub chain_id: u64,
+    pub token_address: EvmAddress,
+    pub payment_ids: Vec<Uuid>,
+    pub canonical_head: ChainBlockRef,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScanBlockRange {
     pub from_block: u64,

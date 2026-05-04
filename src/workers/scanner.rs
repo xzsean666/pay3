@@ -1,5 +1,6 @@
 //! Payment scanner worker tick over persisted KV transfer logs.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration as StdDuration;
 
 use async_trait::async_trait;
@@ -9,10 +10,12 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::{
-    chain::ChainHeaderReader,
+    chain::{ChainError, ChainHeaderReader},
     db::repositories::{
-        CommitScannedBatch, PaymentRecord, PaymentRepository, RepositoryError, ScanCursorLease,
+        CommitScannedBatch, ConfirmObservedPaymentsBatch, PaymentConfirmationCandidate,
+        PaymentRecord, PaymentRepository, RepositoryError, ScanCursorLease,
     },
+    domain::{BlockHash, ChainBlockRef},
     services::{
         orders::Clock,
         payment_windows::PaymentWindowLookup,
@@ -22,6 +25,8 @@ use crate::{
         LogPageToken, StreamId, TransferLogCursor, TransferLogReader, TransferLogStoreError,
     },
 };
+
+const DEFAULT_CONFIRMATION_SWEEP_LIMIT: usize = 1_000;
 
 #[async_trait]
 pub trait PaymentPageMatcher: Send + Sync {
@@ -57,6 +62,7 @@ pub struct PaymentScannerConfig {
     pub worker_id: String,
     pub stream: StreamId,
     pub lease_duration: Duration,
+    pub confirmation_sweep_limit: usize,
 }
 
 impl PaymentScannerConfig {
@@ -65,7 +71,13 @@ impl PaymentScannerConfig {
             worker_id: worker_id.into(),
             stream,
             lease_duration,
+            confirmation_sweep_limit: DEFAULT_CONFIRMATION_SWEEP_LIMIT,
         }
+    }
+
+    pub const fn with_confirmation_sweep_limit(mut self, limit: usize) -> Self {
+        self.confirmation_sweep_limit = limit;
+        self
     }
 
     fn validate(&self, matcher_config: PaymentMatchingConfig) -> Result<(), PaymentScannerError> {
@@ -80,6 +92,13 @@ impl PaymentScannerConfig {
             return Err(PaymentScannerError::InvalidConfig {
                 field: "lease_duration",
                 message: "must be positive".to_string(),
+            });
+        }
+
+        if self.confirmation_sweep_limit == 0 {
+            return Err(PaymentScannerError::InvalidConfig {
+                field: "confirmation_sweep_limit",
+                message: "must be greater than zero".to_string(),
             });
         }
 
@@ -122,6 +141,13 @@ pub enum PaymentScannerTickOutcome {
         recompute_order_ids: Vec<Uuid>,
         records: Vec<PaymentRecord>,
     },
+    ConfirmationsSwept {
+        stream: StreamId,
+        canonical_head: ChainBlockRef,
+        confirmed_payments: usize,
+        recompute_order_ids: Vec<Uuid>,
+        records: Vec<PaymentRecord>,
+    },
 }
 
 #[derive(Debug, Error)]
@@ -139,6 +165,15 @@ pub enum PaymentScannerError {
     MissingKvReorgBlock { epoch: u64 },
 
     #[error(
+        "canonical block hash mismatch for payment block {block_number}: stored {stored_hash}, canonical {canonical_hash}"
+    )]
+    CanonicalBlockHashMismatch {
+        block_number: u64,
+        stored_hash: BlockHash,
+        canonical_hash: BlockHash,
+    },
+
+    #[error(
         "KV reorg epoch regressed for {stream:?}: repository has {seen_epoch}, KVDB has {kv_epoch}"
     )]
     KvReorgEpochRegression {
@@ -154,22 +189,27 @@ pub enum PaymentScannerError {
     PaymentMatching(#[from] PaymentMatchingError),
 
     #[error(transparent)]
+    Chain(#[from] ChainError),
+
+    #[error(transparent)]
     TransferLogStore(#[from] TransferLogStoreError),
 }
 
-pub struct PaymentScannerWorker<R, M, L, C> {
+pub struct PaymentScannerWorker<R, M, L, H, C> {
     repository: R,
     matcher: M,
     log_reader: L,
+    head_reader: H,
     clock: C,
     config: PaymentScannerConfig,
 }
 
-impl<R, M, L, C> PaymentScannerWorker<R, M, L, C> {
+impl<R, M, L, H, C> PaymentScannerWorker<R, M, L, H, C> {
     pub const fn new(
         repository: R,
         matcher: M,
         log_reader: L,
+        head_reader: H,
         clock: C,
         config: PaymentScannerConfig,
     ) -> Self {
@@ -177,17 +217,19 @@ impl<R, M, L, C> PaymentScannerWorker<R, M, L, C> {
             repository,
             matcher,
             log_reader,
+            head_reader,
             clock,
             config,
         }
     }
 }
 
-impl<R, M, L, C> PaymentScannerWorker<R, M, L, C>
+impl<R, M, L, H, C> PaymentScannerWorker<R, M, L, H, C>
 where
     R: PaymentRepository,
     M: PaymentPageMatcher,
     L: TransferLogReader,
+    H: ChainHeaderReader,
     C: Clock,
 {
     pub async fn tick(&self) -> Result<PaymentScannerTickOutcome, PaymentScannerError> {
@@ -241,6 +283,9 @@ where
         };
 
         if complete_to_block <= lease.last_scanned_block {
+            if let Some(outcome) = self.sweep_confirmations(matcher_config).await? {
+                return Ok(outcome);
+            }
             return Ok(PaymentScannerTickOutcome::Idle {
                 stream,
                 last_scanned_block: lease.last_scanned_block,
@@ -312,6 +357,103 @@ where
         })
     }
 
+    async fn sweep_confirmations(
+        &self,
+        matcher_config: PaymentMatchingConfig,
+    ) -> Result<Option<PaymentScannerTickOutcome>, PaymentScannerError> {
+        let stream = self.config.stream;
+        let canonical_head = self.head_reader.latest_head().await?;
+        let Some(max_block_number) =
+            max_confirmable_block(canonical_head, matcher_config.min_confirmations)
+        else {
+            return Ok(None);
+        };
+
+        let candidates = self
+            .repository
+            .observed_payment_confirmation_candidates(
+                stream.chain_id,
+                stream.token_address,
+                max_block_number,
+                self.config.confirmation_sweep_limit,
+            )
+            .await?;
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let payment_ids = self
+            .canonical_confirmable_payment_ids(&candidates, canonical_head, matcher_config)
+            .await?;
+        if payment_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let records = self
+            .repository
+            .confirm_observed_payments(ConfirmObservedPaymentsBatch {
+                chain_id: stream.chain_id,
+                token_address: stream.token_address,
+                payment_ids,
+                canonical_head,
+            })
+            .await?;
+        if records.is_empty() {
+            return Ok(None);
+        }
+
+        let recompute_order_ids = recompute_order_ids_from_records(&records);
+        Ok(Some(PaymentScannerTickOutcome::ConfirmationsSwept {
+            stream,
+            canonical_head,
+            confirmed_payments: records.len(),
+            recompute_order_ids,
+            records,
+        }))
+    }
+
+    async fn canonical_confirmable_payment_ids(
+        &self,
+        candidates: &[PaymentConfirmationCandidate],
+        canonical_head: ChainBlockRef,
+        matcher_config: PaymentMatchingConfig,
+    ) -> Result<Vec<Uuid>, PaymentScannerError> {
+        let mut canonical_blocks = BTreeMap::new();
+        let mut payment_ids = Vec::new();
+
+        for candidate in candidates {
+            let canonical_block = match canonical_blocks.get(&candidate.block.number) {
+                Some(block) => *block,
+                None => {
+                    let block = self
+                        .head_reader
+                        .block_by_number(candidate.block.number)
+                        .await?
+                        .block_ref();
+                    canonical_blocks.insert(candidate.block.number, block);
+                    block
+                }
+            };
+
+            if canonical_block.hash != candidate.block.hash {
+                return Err(PaymentScannerError::CanonicalBlockHashMismatch {
+                    block_number: candidate.block.number,
+                    stored_hash: candidate.block.hash,
+                    canonical_hash: canonical_block.hash,
+                });
+            }
+
+            if candidate
+                .block
+                .has_confirmations(canonical_head, matcher_config.min_confirmations)
+            {
+                payment_ids.push(candidate.payment_id);
+            }
+        }
+
+        Ok(payment_ids)
+    }
+
     async fn run_forever(self, poll_interval: StdDuration) {
         let mut interval = tokio::time::interval(poll_interval);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -335,14 +477,15 @@ where
     }
 }
 
-pub fn spawn_payment_scanner_loop<R, M, L, C>(
-    worker: PaymentScannerWorker<R, M, L, C>,
+pub fn spawn_payment_scanner_loop<R, M, L, H, C>(
+    worker: PaymentScannerWorker<R, M, L, H, C>,
     poll_interval: StdDuration,
 ) -> Result<JoinHandle<()>, PaymentScannerError>
 where
     R: PaymentRepository + 'static,
     M: PaymentPageMatcher + 'static,
     L: TransferLogReader + 'static,
+    H: ChainHeaderReader + 'static,
     C: Clock + 'static,
 {
     if poll_interval.is_zero() {
@@ -421,6 +564,23 @@ fn log_tick_outcome(outcome: &PaymentScannerTickOutcome) {
                 "payment scanner committed batch"
             );
         }
+        PaymentScannerTickOutcome::ConfirmationsSwept {
+            stream,
+            canonical_head,
+            confirmed_payments,
+            recompute_order_ids,
+            records: _,
+        } => {
+            tracing::info!(
+                chain_id = stream.chain_id,
+                token_address = %stream.token_address,
+                canonical_head_number = canonical_head.number,
+                canonical_head_hash = %canonical_head.hash,
+                confirmed_payments,
+                recompute_order_count = recompute_order_ids.len(),
+                "payment scanner swept payment confirmations"
+            );
+        }
     }
 }
 
@@ -465,6 +625,23 @@ fn recompute_order_ids(payments: &[crate::db::repositories::MatchedPaymentInput]
         .collect()
 }
 
+fn recompute_order_ids_from_records(records: &[PaymentRecord]) -> Vec<Uuid> {
+    records
+        .iter()
+        .map(|payment| payment.order_id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn max_confirmable_block(canonical_head: ChainBlockRef, min_confirmations: u64) -> Option<u64> {
+    if min_confirmations == 0 {
+        Some(canonical_head.number)
+    } else {
+        canonical_head.number.checked_sub(min_confirmations - 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -477,6 +654,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        chain::ChainBlock,
         db::repositories::{MatchedPaymentInput, PaymentWindowCandidate},
         domain::{
             BlockHash, ChainBlockRef, EvmAddress, PaymentChainStatus, PaymentMatchStatus,
@@ -610,6 +788,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn idle_tick_sweeps_observed_payment_confirmations() {
+        let payment_id = payment_id(9);
+        let order_id = order_id(9);
+        let repo = FakePaymentRepository::with_lease(lease(10, 7))
+            .with_confirmation_candidates(vec![confirmation_candidate(
+                payment_id,
+                order_id,
+                block_ref(9),
+            )])
+            .with_confirmation_records(vec![payment_record(
+                payment_id,
+                order_id,
+                9,
+                PaymentChainStatus::Confirmed,
+            )]);
+        let reader = FakeLogReader::new(cursor(10, 7, None));
+        let matcher = FakeMatcher::with_pages(vec![Ok(match_page(Vec::new(), Some(10), None, 7))]);
+        let head = FakeHeadReader::new(block_ref(10));
+        let worker = worker_with_head(repo.clone(), matcher, reader, head);
+
+        let outcome = worker.tick().await.unwrap();
+
+        assert_eq!(
+            outcome,
+            PaymentScannerTickOutcome::ConfirmationsSwept {
+                stream: stream(),
+                canonical_head: block_ref(10),
+                confirmed_payments: 1,
+                recompute_order_ids: vec![order_id],
+                records: vec![payment_record(
+                    payment_id,
+                    order_id,
+                    9,
+                    PaymentChainStatus::Confirmed
+                )],
+            }
+        );
+        assert_eq!(
+            repo.confirmation_candidate_calls(),
+            vec![(stream().chain_id, stream().token_address, 9, 1_000)]
+        );
+        assert_eq!(repo.confirmed_payment_ids(), vec![vec![payment_id]]);
+    }
+
+    #[tokio::test]
+    async fn confirmation_sweep_fails_closed_on_canonical_block_hash_mismatch() {
+        let repo =
+            FakePaymentRepository::with_lease(lease(10, 7)).with_confirmation_candidates(vec![
+                confirmation_candidate(payment_id(9), order_id(9), block_ref(9)),
+            ]);
+        let reader = FakeLogReader::new(cursor(10, 7, None));
+        let matcher = FakeMatcher::with_pages(vec![Ok(match_page(Vec::new(), Some(10), None, 7))]);
+        let head = FakeHeadReader::new(block_ref(10)).with_block(9, block_hash(0xee));
+        let worker = worker_with_head(repo.clone(), matcher, reader, head);
+
+        let error = worker.tick().await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            PaymentScannerError::CanonicalBlockHashMismatch {
+                block_number: 9,
+                stored_hash,
+                canonical_hash,
+            } if stored_hash == block_hash(9) && canonical_hash == block_hash(0xee)
+        ));
+        assert!(repo.confirmed_payment_ids().is_empty());
+    }
+
+    #[tokio::test]
     async fn commit_cas_mismatch_bubbles_without_retrying_inside_tick() {
         let repo = FakePaymentRepository::with_lease(lease(10, 7)).with_commit_error(
             RepositoryError::CursorCasMismatch {
@@ -657,11 +904,33 @@ mod tests {
         repo: FakePaymentRepository,
         matcher: FakeMatcher,
         reader: FakeLogReader,
-    ) -> PaymentScannerWorker<FakePaymentRepository, FakeMatcher, FakeLogReader, FixedClock> {
+    ) -> PaymentScannerWorker<
+        FakePaymentRepository,
+        FakeMatcher,
+        FakeLogReader,
+        FakeHeadReader,
+        FixedClock,
+    > {
+        worker_with_head(repo, matcher, reader, FakeHeadReader::new(block_ref(100)))
+    }
+
+    fn worker_with_head(
+        repo: FakePaymentRepository,
+        matcher: FakeMatcher,
+        reader: FakeLogReader,
+        head: FakeHeadReader,
+    ) -> PaymentScannerWorker<
+        FakePaymentRepository,
+        FakeMatcher,
+        FakeLogReader,
+        FakeHeadReader,
+        FixedClock,
+    > {
         PaymentScannerWorker::new(
             repo,
             matcher,
             reader,
+            head,
             FixedClock,
             PaymentScannerConfig::new("scanner-1", stream(), Duration::seconds(30)),
         )
@@ -686,6 +955,10 @@ mod tests {
         claim_result: Option<ScanCursorLease>,
         commit_error: Option<RepositoryError>,
         commits: Vec<CommitScannedBatch>,
+        confirmation_candidates: Vec<PaymentConfirmationCandidate>,
+        confirmation_candidate_calls: Vec<(u64, EvmAddress, u64, usize)>,
+        confirmation_records: Vec<PaymentRecord>,
+        confirmation_batches: Vec<ConfirmObservedPaymentsBatch>,
         reorgs: Vec<(u64, u64)>,
     }
 
@@ -696,6 +969,10 @@ mod tests {
                     claim_result: Some(lease),
                     commit_error: None,
                     commits: Vec::new(),
+                    confirmation_candidates: Vec::new(),
+                    confirmation_candidate_calls: Vec::new(),
+                    confirmation_records: Vec::new(),
+                    confirmation_batches: Vec::new(),
                     reorgs: Vec::new(),
                 })),
             }
@@ -707,6 +984,10 @@ mod tests {
                     claim_result: None,
                     commit_error: None,
                     commits: Vec::new(),
+                    confirmation_candidates: Vec::new(),
+                    confirmation_candidate_calls: Vec::new(),
+                    confirmation_records: Vec::new(),
+                    confirmation_batches: Vec::new(),
                     reorgs: Vec::new(),
                 })),
             }
@@ -717,6 +998,25 @@ mod tests {
                 .lock()
                 .expect("fake repo lock poisoned")
                 .commit_error = Some(error);
+            self
+        }
+
+        fn with_confirmation_candidates(
+            self,
+            candidates: Vec<PaymentConfirmationCandidate>,
+        ) -> Self {
+            self.state
+                .lock()
+                .expect("fake repo lock poisoned")
+                .confirmation_candidates = candidates;
+            self
+        }
+
+        fn with_confirmation_records(self, records: Vec<PaymentRecord>) -> Self {
+            self.state
+                .lock()
+                .expect("fake repo lock poisoned")
+                .confirmation_records = records;
             self
         }
 
@@ -734,6 +1034,24 @@ mod tests {
                 .expect("fake repo lock poisoned")
                 .reorgs
                 .clone()
+        }
+
+        fn confirmation_candidate_calls(&self) -> Vec<(u64, EvmAddress, u64, usize)> {
+            self.state
+                .lock()
+                .expect("fake repo lock poisoned")
+                .confirmation_candidate_calls
+                .clone()
+        }
+
+        fn confirmed_payment_ids(&self) -> Vec<Vec<Uuid>> {
+            self.state
+                .lock()
+                .expect("fake repo lock poisoned")
+                .confirmation_batches
+                .iter()
+                .map(|batch| batch.payment_ids.clone())
+                .collect()
         }
     }
 
@@ -766,6 +1084,32 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn observed_payment_confirmation_candidates(
+            &self,
+            chain_id: u64,
+            token_address: EvmAddress,
+            max_block_number: u64,
+            limit: usize,
+        ) -> Result<Vec<PaymentConfirmationCandidate>, RepositoryError> {
+            let mut state = self.state.lock().expect("fake repo lock poisoned");
+            state.confirmation_candidate_calls.push((
+                chain_id,
+                token_address,
+                max_block_number,
+                limit,
+            ));
+            Ok(state.confirmation_candidates.clone())
+        }
+
+        async fn confirm_observed_payments(
+            &self,
+            batch: ConfirmObservedPaymentsBatch,
+        ) -> Result<Vec<PaymentRecord>, RepositoryError> {
+            let mut state = self.state.lock().expect("fake repo lock poisoned");
+            state.confirmation_batches.push(batch);
+            Ok(state.confirmation_records.clone())
+        }
+
         async fn recompute_orders(&self, _order_ids: Vec<Uuid>) -> Result<(), RepositoryError> {
             Ok(())
         }
@@ -783,6 +1127,62 @@ mod tests {
                 .reorgs
                 .push((epoch, last_reorg_from));
             Ok(())
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FakeHeadReader {
+        latest: ChainBlockRef,
+        blocks: Arc<Mutex<std::collections::BTreeMap<u64, BlockHash>>>,
+    }
+
+    impl FakeHeadReader {
+        fn new(latest: ChainBlockRef) -> Self {
+            let mut blocks = std::collections::BTreeMap::new();
+            blocks.insert(latest.number, latest.hash);
+            Self {
+                latest,
+                blocks: Arc::new(Mutex::new(blocks)),
+            }
+        }
+
+        fn with_block(self, number: u64, hash: BlockHash) -> Self {
+            self.blocks
+                .lock()
+                .expect("fake head lock poisoned")
+                .insert(number, hash);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl ChainHeaderReader for FakeHeadReader {
+        async fn latest_head(&self) -> Result<ChainBlockRef, ChainError> {
+            Ok(self.latest)
+        }
+
+        async fn safe_head(&self) -> Result<ChainBlockRef, ChainError> {
+            Ok(self.latest)
+        }
+
+        async fn finalized_head(&self) -> Result<ChainBlockRef, ChainError> {
+            Ok(self.latest)
+        }
+
+        async fn block_by_number(&self, number: u64) -> Result<ChainBlock, ChainError> {
+            let hash = self
+                .blocks
+                .lock()
+                .expect("fake head lock poisoned")
+                .get(&number)
+                .copied()
+                .unwrap_or_else(|| block_hash(number as u8));
+            Ok(ChainBlock::new(
+                number,
+                hash,
+                block_hash(number.saturating_sub(1) as u8),
+                now(),
+            ))
         }
     }
 
@@ -952,6 +1352,55 @@ mod tests {
             match_status: PaymentMatchStatus::OnTime,
             chain_status: PaymentChainStatus::Confirmed,
         }
+    }
+
+    fn confirmation_candidate(
+        payment_id: Uuid,
+        order_id: Uuid,
+        block: ChainBlockRef,
+    ) -> PaymentConfirmationCandidate {
+        PaymentConfirmationCandidate {
+            payment_id,
+            order_id,
+            block,
+            confirmations: 1,
+        }
+    }
+
+    fn payment_record(
+        id: Uuid,
+        order_id: Uuid,
+        block_number: u64,
+        chain_status: PaymentChainStatus,
+    ) -> PaymentRecord {
+        PaymentRecord {
+            id,
+            order_id,
+            child_account_id: child_account_id(1),
+            chain_id: stream().chain_id,
+            token_address: stream().token_address,
+            tx_hash: tx_hash(block_number),
+            log_index: 0,
+            from_address: address(0x10),
+            to_address: address(0x20),
+            amount_raw: RawAmount::from(100),
+            block_number,
+            block_hash: block_hash(block_number as u8),
+            block_time: now(),
+            confirmations: 2,
+            match_status: PaymentMatchStatus::OnTime,
+            chain_status,
+            created_at: now(),
+            updated_at: now(),
+        }
+    }
+
+    fn block_ref(number: u64) -> ChainBlockRef {
+        ChainBlockRef::new(number, block_hash(number as u8))
+    }
+
+    fn block_hash(byte: u8) -> BlockHash {
+        BlockHash::from_bytes([byte; 32])
     }
 
     fn stream() -> StreamId {

@@ -277,6 +277,7 @@ fn payment_scanner_worker(
         RpcRangeSource,
     >,
     RedbTransferLogIngestor<RpcRangeSource>,
+    RpcRangeSource,
     SystemClock,
 > {
     let stream = StreamId::new(config.chain.chain_id, config.chain.token_address);
@@ -287,7 +288,7 @@ fn payment_scanner_worker(
     let matcher = PaymentMatcher::new(
         log_store.clone(),
         WatchSetPaymentWindowLookup::new(fallback),
-        rpc_source,
+        rpc_source.clone(),
         PaymentMatchingConfig {
             stream,
             min_confirmations: config.chain.min_confirmations,
@@ -300,6 +301,7 @@ fn payment_scanner_worker(
         PgPaymentRepository::new(pool),
         matcher,
         log_store,
+        rpc_source,
         SystemClock,
         PaymentScannerConfig::new(
             format!("payment-scanner-{}", std::process::id()),
