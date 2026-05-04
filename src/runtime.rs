@@ -15,7 +15,7 @@ use crate::{
         },
         repositories::{
             PgAuditRepository, PgCollectionRepository, PgOrderRepository, PgOutboundRepository,
-            PgVerifiedPaymentRecorder,
+            PgPaymentRepository, PgVerifiedPaymentRecorder,
         },
     },
     domain::{CollectionFees, RawAmount},
@@ -23,14 +23,19 @@ use crate::{
     services::{
         collections::{AssumePrefundedGas, CollectionService, CollectionServiceConfig},
         orders::{OrderService, OrderServiceConfig, SystemClock},
+        payment_windows::{RepositoryPaymentWindowLookup, WatchSetPaymentWindowLookup},
+        payments::{PaymentMatcher, PaymentMatchingConfig},
         verify::{ManualOrderVerifyService, ManualVerifyConfig},
     },
     signer::{DeterministicFakeSigner, SignerError, SignerProvider},
     transfer_log_store::{
-        LogSourceKind, RedbTransferLogIngestor, ScanTargetMode, TransferLogIngestor,
+        LogSourceKind, RedbTransferLogIngestor, ScanTargetMode, StreamId, TransferLogIngestor,
         TransferLogStoreError, TransferLogStreamConfig,
     },
     wallet::{DeterministicFakeDeriver, HdWallet, WalletError},
+    workers::scanner::{
+        PaymentScannerConfig, PaymentScannerError, PaymentScannerWorker, spawn_payment_scanner_loop,
+    },
     workers::transfer_log_ingestor::{
         TransferLogIngestorLoopConfig, TransferLogIngestorLoopError,
         spawn_transfer_log_ingestor_loop,
@@ -46,6 +51,8 @@ const TRANSFER_LOG_MAX_UNIQUE_TO_ADDRESSES_PER_BATCH: usize = 1_000;
 const TRANSFER_LOG_MAX_DB_FALLBACK_ADDRESSES: usize = 1_000;
 const TRANSFER_LOG_CAPACITY_PROBE_BLOCKS: u64 = 100;
 const TRANSFER_LOG_RPC_MAX_RETRIES: u32 = 3;
+const PAYMENT_SCANNER_POLL_INTERVAL_MS: u64 = 5_000;
+const PAYMENT_SCANNER_LEASE_SECONDS: i64 = 30;
 const COLLECTION_GAS_LIMIT: u64 = 80_000;
 const COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 50_000_000_000;
 const COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 2_000_000_000;
@@ -75,6 +82,9 @@ pub enum RuntimeError {
 
     #[error(transparent)]
     TransferLogIngestorLoop(#[from] TransferLogIngestorLoopError),
+
+    #[error(transparent)]
+    PaymentScanner(#[from] PaymentScannerError),
 
     #[error(transparent)]
     OrderService(#[from] crate::services::orders::OrderServiceError),
@@ -121,6 +131,10 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
             stream,
             std::time::Duration::from_millis(stream_config.poll_interval_ms),
         ),
+    )?;
+    let _payment_scanner_loop = spawn_payment_scanner_loop(
+        payment_scanner_worker(&config, pool.clone(), log_store.clone(), rpc_source.clone()),
+        std::time::Duration::from_millis(PAYMENT_SCANNER_POLL_INTERVAL_MS),
     )?;
 
     let auth = jwt_verifier(&config)?;
@@ -248,6 +262,51 @@ fn collection_service(
         rpc_source,
         AssumePrefundedGas,
     )?)
+}
+
+fn payment_scanner_worker(
+    config: &AppConfig,
+    pool: PgPool,
+    log_store: RedbTransferLogIngestor<RpcRangeSource>,
+    rpc_source: RpcRangeSource,
+) -> PaymentScannerWorker<
+    PgPaymentRepository,
+    PaymentMatcher<
+        RedbTransferLogIngestor<RpcRangeSource>,
+        WatchSetPaymentWindowLookup<RepositoryPaymentWindowLookup<PgOrderRepository>>,
+        RpcRangeSource,
+    >,
+    RedbTransferLogIngestor<RpcRangeSource>,
+    SystemClock,
+> {
+    let stream = StreamId::new(config.chain.chain_id, config.chain.token_address);
+    let fallback = RepositoryPaymentWindowLookup::new(
+        PgOrderRepository::new(pool.clone()),
+        TRANSFER_LOG_MAX_DB_FALLBACK_ADDRESSES,
+    );
+    let matcher = PaymentMatcher::new(
+        log_store.clone(),
+        WatchSetPaymentWindowLookup::new(fallback),
+        rpc_source,
+        PaymentMatchingConfig {
+            stream,
+            min_confirmations: config.chain.min_confirmations,
+            page_limit: TRANSFER_LOG_MAX_LOGS_PER_PAGE,
+            max_unique_to_addresses_per_batch: TRANSFER_LOG_MAX_UNIQUE_TO_ADDRESSES_PER_BATCH,
+        },
+    );
+
+    PaymentScannerWorker::new(
+        PgPaymentRepository::new(pool),
+        matcher,
+        log_store,
+        SystemClock,
+        PaymentScannerConfig::new(
+            format!("payment-scanner-{}", std::process::id()),
+            stream,
+            time::Duration::seconds(PAYMENT_SCANNER_LEASE_SECONDS),
+        ),
+    )
 }
 
 async fn ensure_runtime_signer_health(config: &AppConfig) -> Result<(), RuntimeError> {

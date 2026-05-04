@@ -17,6 +17,8 @@ fn order_repository_uses_external_id_lock_and_idempotency() {
         "get_order_view",
         "JOIN child_accounts",
         "JOIN payment_windows",
+        "lookup_payment_window_candidates",
+        "pw.receive_address = ANY($3::text[])",
         "FOR UPDATE",
     ] {
         assert!(ORDERS_REPOSITORY.contains(fragment), "missing {fragment}");

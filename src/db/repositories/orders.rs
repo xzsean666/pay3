@@ -1,4 +1,4 @@
-use std::str::FromStr;
+use std::{collections::BTreeSet, str::FromStr};
 
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
@@ -12,7 +12,10 @@ use crate::domain::{
 
 use super::{
     error::RepositoryError,
-    types::{ChildAccountRecord, CreateOrderCommand, OrderRecord, OrderView, PaymentWindowRecord},
+    types::{
+        ChildAccountRecord, CreateOrderCommand, OrderRecord, OrderView, PaymentWindowCandidate,
+        PaymentWindowRecord,
+    },
 };
 
 const ORDER_SELECT: &str = r#"
@@ -111,6 +114,16 @@ pub trait OrderRepository: Send + Sync {
     ) -> Result<Option<OrderRecord>, RepositoryError>;
 }
 
+#[async_trait]
+pub trait PaymentWindowCandidateRepository: Send + Sync {
+    async fn lookup_payment_window_candidates(
+        &self,
+        chain_id: u64,
+        token_address: EvmAddress,
+        to_addresses: &[EvmAddress],
+    ) -> Result<Vec<PaymentWindowCandidate>, RepositoryError>;
+}
+
 #[derive(Clone, Debug)]
 pub struct PgOrderRepository {
     pub pool: PgPool,
@@ -202,6 +215,62 @@ impl OrderRepository for PgOrderRepository {
             .map_err(db_error)?;
 
         row.map(|row| row_to_order_record(&row)).transpose()
+    }
+}
+
+#[async_trait]
+impl PaymentWindowCandidateRepository for PgOrderRepository {
+    async fn lookup_payment_window_candidates(
+        &self,
+        chain_id: u64,
+        token_address: EvmAddress,
+        to_addresses: &[EvmAddress],
+    ) -> Result<Vec<PaymentWindowCandidate>, RepositoryError> {
+        if to_addresses.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let chain_id_i64 = u64_to_i64(chain_id, "chain_id")?;
+        let token_address_hex = token_address.to_lower_hex();
+        let address_hexes = to_addresses
+            .iter()
+            .map(|address| address.to_lower_hex())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                o.id AS order_id,
+                o.child_account_id,
+                pw.receive_address,
+                o.chain_id,
+                o.token_address,
+                o.expected_amount_raw,
+                o.paid_amount_raw,
+                o.status AS order_status,
+                pw.window_from,
+                pw.window_from_block,
+                pw.window_from_block_hash,
+                pw.expires_at,
+                pw.monitor_until
+            FROM payment_windows pw
+            JOIN orders o ON o.id = pw.order_id
+            WHERE o.chain_id = $1
+              AND o.token_address = $2
+              AND pw.receive_address = ANY($3::text[])
+            ORDER BY pw.receive_address, pw.window_from_block, o.id
+            "#,
+        )
+        .bind(chain_id_i64)
+        .bind(&token_address_hex)
+        .bind(&address_hexes)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_error)?;
+
+        rows.iter().map(row_to_payment_window_candidate).collect()
     }
 }
 
@@ -505,6 +574,35 @@ fn row_to_order_view(row: PgRow) -> Result<OrderView, RepositoryError> {
         order,
         child_account,
         payment_window,
+    })
+}
+
+fn row_to_payment_window_candidate(row: &PgRow) -> Result<PaymentWindowCandidate, RepositoryError> {
+    let window_from_block = ChainBlockRef::new(
+        i64_to_u64(
+            row.try_get("window_from_block").map_err(db_error)?,
+            "payment_windows.window_from_block",
+        )?,
+        parse_block_hash(row.try_get("window_from_block_hash").map_err(db_error)?)?,
+    );
+
+    Ok(PaymentWindowCandidate {
+        order_id: row.try_get("order_id").map_err(db_error)?,
+        child_account_id: row.try_get("child_account_id").map_err(db_error)?,
+        receive_address: parse_evm_address(row.try_get("receive_address").map_err(db_error)?)?,
+        chain_id: i64_to_u64(row.try_get("chain_id").map_err(db_error)?, "chain_id")?,
+        token_address: parse_evm_address(row.try_get("token_address").map_err(db_error)?)?,
+        expected_amount_raw: big_decimal_to_raw_amount(
+            row.try_get("expected_amount_raw").map_err(db_error)?,
+        )?,
+        paid_amount_raw: big_decimal_to_raw_amount(
+            row.try_get("paid_amount_raw").map_err(db_error)?,
+        )?,
+        order_status: parse_order_status(row.try_get("order_status").map_err(db_error)?)?,
+        window_from: row.try_get("window_from").map_err(db_error)?,
+        window_from_block,
+        expires_at: row.try_get("expires_at").map_err(db_error)?,
+        monitor_until: row.try_get("monitor_until").map_err(db_error)?,
     })
 }
 

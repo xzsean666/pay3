@@ -6,8 +6,24 @@ use std::{
 };
 
 use async_trait::async_trait;
+use thiserror::Error;
 
-use crate::{db::repositories::PaymentWindowCandidate, domain::EvmAddress};
+use crate::{
+    db::repositories::{PaymentWindowCandidate, PaymentWindowCandidateRepository, RepositoryError},
+    domain::EvmAddress,
+};
+
+#[derive(Debug, Error)]
+pub enum PaymentWindowLookupError {
+    #[error("invalid payment window lookup config {field}: {message}")]
+    InvalidConfig {
+        field: &'static str,
+        message: String,
+    },
+
+    #[error(transparent)]
+    Repository(#[from] RepositoryError),
+}
 
 #[async_trait]
 pub trait PaymentWindowLookup: Send + Sync {
@@ -16,7 +32,7 @@ pub trait PaymentWindowLookup: Send + Sync {
         chain_id: u64,
         token_address: EvmAddress,
         to_addresses: &[EvmAddress],
-    ) -> Vec<PaymentWindowCandidate>;
+    ) -> Result<Vec<PaymentWindowCandidate>, PaymentWindowLookupError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -122,10 +138,10 @@ where
         chain_id: u64,
         token_address: EvmAddress,
         to_addresses: &[EvmAddress],
-    ) -> Vec<PaymentWindowCandidate> {
+    ) -> Result<Vec<PaymentWindowCandidate>, PaymentWindowLookupError> {
         let to_addresses = deduplicate_addresses(to_addresses);
         if to_addresses.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         let mut candidates = Vec::new();
@@ -157,7 +173,7 @@ where
             candidates.extend(
                 self.fallback
                     .lookup_batch(chain_id, token_address, &misses)
-                    .await
+                    .await?
                     .into_iter()
                     .filter(|candidate| {
                         candidate_is_for_lookup(candidate, chain_id, token_address)
@@ -165,7 +181,7 @@ where
             );
         }
 
-        candidates
+        Ok(candidates)
     }
 }
 
@@ -179,8 +195,64 @@ impl PaymentWindowLookup for EmptyPaymentWindowLookup {
         _chain_id: u64,
         _token_address: EvmAddress,
         _to_addresses: &[EvmAddress],
-    ) -> Vec<PaymentWindowCandidate> {
-        Vec::new()
+    ) -> Result<Vec<PaymentWindowCandidate>, PaymentWindowLookupError> {
+        Ok(Vec::new())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RepositoryPaymentWindowLookup<R> {
+    repository: R,
+    max_addresses: usize,
+}
+
+impl<R> RepositoryPaymentWindowLookup<R> {
+    pub const fn new(repository: R, max_addresses: usize) -> Self {
+        Self {
+            repository,
+            max_addresses,
+        }
+    }
+
+    pub const fn max_addresses(&self) -> usize {
+        self.max_addresses
+    }
+}
+
+#[async_trait]
+impl<R> PaymentWindowLookup for RepositoryPaymentWindowLookup<R>
+where
+    R: PaymentWindowCandidateRepository,
+{
+    async fn lookup_batch(
+        &self,
+        chain_id: u64,
+        token_address: EvmAddress,
+        to_addresses: &[EvmAddress],
+    ) -> Result<Vec<PaymentWindowCandidate>, PaymentWindowLookupError> {
+        if self.max_addresses == 0 {
+            return Err(PaymentWindowLookupError::InvalidConfig {
+                field: "max_addresses",
+                message: "must be greater than zero".to_string(),
+            });
+        }
+
+        let to_addresses = deduplicate_addresses(to_addresses);
+        if to_addresses.len() > self.max_addresses {
+            return Err(PaymentWindowLookupError::InvalidConfig {
+                field: "to_addresses",
+                message: format!(
+                    "received {} addresses, max {}",
+                    to_addresses.len(),
+                    self.max_addresses
+                ),
+            });
+        }
+
+        Ok(self
+            .repository
+            .lookup_payment_window_candidates(chain_id, token_address, &to_addresses)
+            .await?)
     }
 }
 
@@ -246,7 +318,7 @@ mod tests {
             chain_id: u64,
             token_address: EvmAddress,
             to_addresses: &[EvmAddress],
-        ) -> Vec<PaymentWindowCandidate> {
+        ) -> Result<Vec<PaymentWindowCandidate>, PaymentWindowLookupError> {
             self.calls.lock().expect("calls lock poisoned").push((
                 chain_id,
                 token_address,
@@ -263,7 +335,7 @@ mod tests {
                     candidates.extend(hits.iter().cloned());
                 }
             }
-            candidates
+            Ok(candidates)
         }
     }
 
@@ -294,7 +366,8 @@ mod tests {
                     address(10),
                 ],
             )
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(candidates, vec![hit, fallback_one, fallback_two]);
         assert_eq!(
@@ -322,7 +395,8 @@ mod tests {
 
         let candidates = lookup
             .lookup_batch(requested_chain, requested_token, &[receive_address])
-            .await;
+            .await
+            .unwrap();
 
         assert_eq!(candidates, vec![fallback_candidate]);
         assert_eq!(
@@ -335,7 +409,8 @@ mod tests {
     async fn empty_lookup_returns_no_candidates() {
         let candidates = EmptyPaymentWindowLookup
             .lookup_batch(1, address(9), &[address(10)])
-            .await;
+            .await
+            .unwrap();
 
         assert!(candidates.is_empty());
     }

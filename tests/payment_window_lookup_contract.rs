@@ -15,7 +15,7 @@ use pay3::{
     db::repositories::PaymentWindowCandidate,
     domain::{BlockHash, ChainBlockRef, EvmAddress, OrderStatus, RawAmount},
 };
-use payment_windows::{PaymentWindowLookup, WatchSetPaymentWindowLookup};
+use payment_windows::{PaymentWindowLookup, PaymentWindowLookupError, WatchSetPaymentWindowLookup};
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -53,14 +53,14 @@ impl PaymentWindowLookup for ContractFallback {
         chain_id: u64,
         token_address: EvmAddress,
         to_addresses: &[EvmAddress],
-    ) -> Vec<PaymentWindowCandidate> {
+    ) -> Result<Vec<PaymentWindowCandidate>, PaymentWindowLookupError> {
         self.calls.lock().expect("calls lock poisoned").push((
             chain_id,
             token_address,
             to_addresses.to_vec(),
         ));
 
-        to_addresses
+        Ok(to_addresses
             .iter()
             .flat_map(|receive_address| {
                 self.candidates
@@ -69,7 +69,7 @@ impl PaymentWindowLookup for ContractFallback {
                     .flatten()
                     .cloned()
             })
-            .collect()
+            .collect())
     }
 }
 
@@ -93,7 +93,8 @@ async fn watch_set_lookup_batches_only_deduplicated_misses() {
             token,
             &[address(10), address(20), address(20), address(10)],
         )
-        .await;
+        .await
+        .unwrap();
 
     assert_eq!(candidates, vec![hit, fallback_candidate]);
     assert_eq!(

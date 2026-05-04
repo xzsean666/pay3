@@ -43,7 +43,7 @@ use pay3::{
         TransferLogCursor, TransferLogReader, TransferLogStoreError,
     },
 };
-use payment_windows::PaymentWindowLookup;
+use payment_windows::{PaymentWindowLookup, PaymentWindowLookupError};
 use payments::{PaymentMatcher, PaymentMatchingConfig, PaymentRejectionReason, RejectedPaymentLog};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
@@ -170,19 +170,20 @@ impl PaymentWindowLookup for FakeWindowLookup {
         chain_id: u64,
         token_address: EvmAddress,
         to_addresses: &[EvmAddress],
-    ) -> Vec<PaymentWindowCandidate> {
+    ) -> Result<Vec<PaymentWindowCandidate>, PaymentWindowLookupError> {
         self.calls
             .lock()
             .expect("lookup calls lock poisoned")
             .push((chain_id, token_address, to_addresses.to_vec()));
 
-        self.candidates
+        Ok(self
+            .candidates
             .lock()
             .expect("candidates lock poisoned")
             .iter()
             .filter(|candidate| to_addresses.contains(&candidate.receive_address))
             .cloned()
-            .collect()
+            .collect())
     }
 }
 

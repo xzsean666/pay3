@@ -9,7 +9,7 @@ use crate::{
     chain::{ChainError, ChainHeaderReader},
     db::repositories::{MatchedPaymentInput, PaymentWindowCandidate},
     domain::{ChainBlockRef, EvmAddress, PaymentChainStatus, PaymentMatchStatus},
-    services::payment_windows::PaymentWindowLookup,
+    services::payment_windows::{PaymentWindowLookup, PaymentWindowLookupError},
     transfer_log_store::{
         LogPageToken, StoredTransferLog, StreamId, TransferLogReader, TransferLogStoreError,
     },
@@ -80,6 +80,9 @@ pub enum PaymentMatchingError {
 
     #[error(transparent)]
     Chain(#[from] ChainError),
+
+    #[error(transparent)]
+    PaymentWindowLookup(#[from] PaymentWindowLookupError),
 }
 
 pub struct PaymentMatcher<L, W, H> {
@@ -143,7 +146,7 @@ where
                 self.config.stream.token_address,
                 &lookup_addresses,
             )
-            .await;
+            .await?;
         Ok(match_stored_transfer_logs(
             self.config.stream,
             self.config.min_confirmations,

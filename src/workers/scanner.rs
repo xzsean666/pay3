@@ -1,8 +1,11 @@
 //! Payment scanner worker tick over persisted KV transfer logs.
 
+use std::time::Duration as StdDuration;
+
 use async_trait::async_trait;
 use thiserror::Error;
 use time::Duration;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::{
@@ -308,6 +311,117 @@ where
             last_reorg_from,
         })
     }
+
+    async fn run_forever(self, poll_interval: StdDuration) {
+        let mut interval = tokio::time::interval(poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+            match self.tick().await {
+                Ok(outcome) => log_tick_outcome(&outcome),
+                Err(error) => {
+                    let stream = self.config.stream;
+                    tracing::error!(
+                        chain_id = stream.chain_id,
+                        token_address = %stream.token_address,
+                        worker_id = %self.config.worker_id,
+                        error = %error,
+                        "payment scanner tick failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn_payment_scanner_loop<R, M, L, C>(
+    worker: PaymentScannerWorker<R, M, L, C>,
+    poll_interval: StdDuration,
+) -> Result<JoinHandle<()>, PaymentScannerError>
+where
+    R: PaymentRepository + 'static,
+    M: PaymentPageMatcher + 'static,
+    L: TransferLogReader + 'static,
+    C: Clock + 'static,
+{
+    if poll_interval.is_zero() {
+        return Err(PaymentScannerError::InvalidConfig {
+            field: "poll_interval",
+            message: "must be greater than zero".to_string(),
+        });
+    }
+
+    Ok(tokio::spawn(worker.run_forever(poll_interval)))
+}
+
+fn log_tick_outcome(outcome: &PaymentScannerTickOutcome) {
+    match outcome {
+        PaymentScannerTickOutcome::LeaseHeld { stream, worker_id } => {
+            tracing::debug!(
+                chain_id = stream.chain_id,
+                token_address = %stream.token_address,
+                worker_id = %worker_id,
+                "payment scanner lease held by another worker"
+            );
+        }
+        PaymentScannerTickOutcome::KvReorgHandled {
+            stream,
+            epoch,
+            last_reorg_from,
+        } => {
+            tracing::warn!(
+                chain_id = stream.chain_id,
+                token_address = %stream.token_address,
+                epoch,
+                last_reorg_from,
+                "payment scanner handled KV reorg"
+            );
+        }
+        PaymentScannerTickOutcome::Idle {
+            stream,
+            last_scanned_block,
+            kv_completed_block,
+        } => {
+            tracing::debug!(
+                chain_id = stream.chain_id,
+                token_address = %stream.token_address,
+                last_scanned_block,
+                kv_completed_block = ?kv_completed_block,
+                "payment scanner idle"
+            );
+        }
+        PaymentScannerTickOutcome::PageIncomplete {
+            stream,
+            last_scanned_block,
+            next_token,
+        } => {
+            tracing::debug!(
+                chain_id = stream.chain_id,
+                token_address = %stream.token_address,
+                last_scanned_block,
+                next_token_block = next_token.map(|token| token.block_number),
+                next_token_log_index = next_token.map(|token| token.log_index),
+                "payment scanner page incomplete"
+            );
+        }
+        PaymentScannerTickOutcome::Committed {
+            stream,
+            complete_to_block,
+            matched_payments,
+            recompute_order_ids,
+            records: _,
+        } => {
+            tracing::info!(
+                chain_id = stream.chain_id,
+                token_address = %stream.token_address,
+                complete_to_block,
+                matched_payments,
+                recompute_order_count = recompute_order_ids.len(),
+                "payment scanner committed batch"
+            );
+        }
+    }
 }
 
 fn after_token(last_scanned_block: u64) -> Option<LogPageToken> {
@@ -518,6 +632,24 @@ mod tests {
         assert!(matches!(
             error,
             PaymentScannerError::Repository(RepositoryError::CursorCasMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn spawn_loop_rejects_zero_poll_interval() {
+        let repo = FakePaymentRepository::without_lease();
+        let reader = FakeLogReader::new(cursor(20, 7, None));
+        let matcher = FakeMatcher::with_pages(Vec::new());
+        let worker = worker(repo, matcher, reader);
+
+        let error = spawn_payment_scanner_loop(worker, StdDuration::ZERO).unwrap_err();
+
+        assert!(matches!(
+            error,
+            PaymentScannerError::InvalidConfig {
+                field: "poll_interval",
+                ..
+            }
         ));
     }
 

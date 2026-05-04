@@ -12,7 +12,10 @@ pub mod verified_payments;
 pub use audit::{AuditRepository, PgAuditRepository};
 pub use collections::{CollectionRepository, PgCollectionRepository};
 pub use error::{RepositoryError, RepositoryResult};
-pub use orders::{AllocatedDerivation, CreateOrderOutcome, OrderRepository, PgOrderRepository};
+pub use orders::{
+    AllocatedDerivation, CreateOrderOutcome, OrderRepository, PaymentWindowCandidateRepository,
+    PgOrderRepository,
+};
 pub use outbound::{OutboundRepository, PgOutboundRepository};
 pub use payments::{PaymentRepository, PgPaymentRepository};
 pub use types::*;
