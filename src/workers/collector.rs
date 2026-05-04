@@ -1,7 +1,10 @@
 //! Collection collector worker tick.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use thiserror::Error;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::{
@@ -293,6 +296,98 @@ where
             }
         }
     }
+
+    async fn run_forever(self, poll_interval: Duration) {
+        let mut interval = tokio::time::interval(poll_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            interval.tick().await;
+            match self.tick().await {
+                Ok(outcome) => log_tick_outcome(&outcome),
+                Err(error) => {
+                    tracing::error!(
+                        worker_id = %self.config.worker_id,
+                        error = %error,
+                        "collection collector tick failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
+pub fn spawn_collection_collector_loop<P, O, B>(
+    worker: CollectionCollectorWorker<P, O, B>,
+    poll_interval: Duration,
+) -> Result<JoinHandle<()>, CollectionCollectorError>
+where
+    P: CollectionJobPreparer + 'static,
+    O: OutboundRepository + 'static,
+    B: SignedTxBroadcaster + TxReceiptReader + 'static,
+{
+    if poll_interval.is_zero() {
+        return Err(CollectionCollectorError::InvalidConfig {
+            field: "poll_interval",
+            message: "must be greater than zero".to_string(),
+        });
+    }
+
+    Ok(tokio::spawn(worker.run_forever(poll_interval)))
+}
+
+fn log_tick_outcome(outcome: &CollectionCollectorTickOutcome) {
+    match outcome {
+        CollectionCollectorTickOutcome::NoJob => {
+            tracing::debug!("collection collector idle");
+        }
+        CollectionCollectorTickOutcome::Broadcast {
+            collection_id,
+            outbound,
+        } => {
+            tracing::info!(
+                collection_id = %collection_id,
+                outbound_tx_id = %outbound.id,
+                tx_hash = %outbound.tx_hash,
+                "collection collector broadcast outbound tx"
+            );
+        }
+        CollectionCollectorTickOutcome::ReceiptPending {
+            collection_id,
+            outbound,
+        } => {
+            tracing::debug!(
+                collection_id = %collection_id,
+                outbound_tx_id = %outbound.id,
+                tx_hash = %outbound.tx_hash,
+                "collection collector receipt pending"
+            );
+        }
+        CollectionCollectorTickOutcome::Confirmed {
+            collection_id,
+            outbound,
+        } => {
+            tracing::info!(
+                collection_id = %collection_id,
+                outbound_tx_id = %outbound.id,
+                tx_hash = %outbound.tx_hash,
+                receipt_block = ?outbound.receipt_block,
+                "collection collector confirmed outbound tx"
+            );
+        }
+        CollectionCollectorTickOutcome::Failed {
+            collection_id,
+            outbound,
+        } => {
+            tracing::warn!(
+                collection_id = %collection_id,
+                outbound_tx_id = %outbound.id,
+                tx_hash = %outbound.tx_hash,
+                error = ?outbound.error,
+                "collection collector failed outbound tx"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -517,6 +612,25 @@ mod tests {
             }
         ));
         assert!(worker.preparer.calls().is_empty());
+    }
+
+    #[test]
+    fn spawn_loop_rejects_zero_poll_interval() {
+        let worker = worker(
+            FakePreparer::with_outcomes(vec![Ok(PrepareCollectionJobOutcome::NoJob)]),
+            FakeOutboundRepository::default(),
+            FakeBroadcaster::returning(tx_hash(0xaa)),
+        );
+
+        let error = spawn_collection_collector_loop(worker, Duration::ZERO).unwrap_err();
+
+        assert!(matches!(
+            error,
+            CollectionCollectorError::InvalidConfig {
+                field: "poll_interval",
+                ..
+            }
+        ));
     }
 
     fn worker(

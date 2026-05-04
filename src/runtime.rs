@@ -33,6 +33,10 @@ use crate::{
         TransferLogStoreError, TransferLogStreamConfig,
     },
     wallet::{DeterministicFakeDeriver, HdWallet, WalletError},
+    workers::collector::{
+        CollectionCollectorConfig, CollectionCollectorError, CollectionCollectorWorker,
+        spawn_collection_collector_loop,
+    },
     workers::scanner::{
         PaymentScannerConfig, PaymentScannerError, PaymentScannerWorker, spawn_payment_scanner_loop,
     },
@@ -53,6 +57,7 @@ const TRANSFER_LOG_CAPACITY_PROBE_BLOCKS: u64 = 100;
 const TRANSFER_LOG_RPC_MAX_RETRIES: u32 = 3;
 const PAYMENT_SCANNER_POLL_INTERVAL_MS: u64 = 5_000;
 const PAYMENT_SCANNER_LEASE_SECONDS: i64 = 30;
+const COLLECTION_COLLECTOR_POLL_INTERVAL_MS: u64 = 5_000;
 const COLLECTION_GAS_LIMIT: u64 = 80_000;
 const COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 50_000_000_000;
 const COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 2_000_000_000;
@@ -85,6 +90,9 @@ pub enum RuntimeError {
 
     #[error(transparent)]
     PaymentScanner(#[from] PaymentScannerError),
+
+    #[error(transparent)]
+    CollectionCollector(#[from] CollectionCollectorError),
 
     #[error(transparent)]
     OrderService(#[from] crate::services::orders::OrderServiceError),
@@ -144,6 +152,15 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
         pool.clone(),
         rpc_source.clone(),
     )?);
+    let _collection_collector_loop = spawn_collection_collector_loop(
+        CollectionCollectorWorker::new(
+            collection_service(&config, pool.clone(), rpc_source.clone())?,
+            PgOutboundRepository::new(pool.clone()),
+            rpc_source.clone(),
+            CollectionCollectorConfig::new(format!("collection-collector-{}", std::process::id())),
+        ),
+        std::time::Duration::from_millis(COLLECTION_COLLECTOR_POLL_INTERVAL_MS),
+    )?;
     let order_verify = Arc::new(ManualOrderVerifyService::new(
         PgOrderRepository::new(pool.clone()),
         PgVerifiedPaymentRecorder::new(pool),
