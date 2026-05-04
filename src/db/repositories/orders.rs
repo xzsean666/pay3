@@ -133,6 +133,63 @@ impl PgOrderRepository {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
+
+    pub async fn retention_floor_block(
+        &self,
+        chain_id: u64,
+        token_address: EvmAddress,
+        reorg_lookback_blocks: u64,
+        manual_rebuild_floor: Option<u64>,
+    ) -> Result<Option<u64>, RepositoryError> {
+        let chain_id_i64 = u64_to_i64(chain_id, "chain_id")?;
+        let token_address_hex = token_address.to_lower_hex();
+
+        let row = sqlx::query(
+            r#"
+            SELECT
+                cc.last_scanned_block,
+                (
+                    SELECT MIN(pw.window_from_block)
+                    FROM payment_windows pw
+                    JOIN orders o ON o.id = pw.order_id
+                    WHERE o.chain_id = $1
+                      AND o.token_address = $2
+                      AND (
+                          o.status IN ('pending', 'partial', 'confirming')
+                          OR pw.monitor_until >= now()
+                      )
+                ) AS active_window_from_block
+            FROM chain_cursors cc
+            WHERE cc.chain_id = $1
+              AND cc.token_address = $2
+            "#,
+        )
+        .bind(chain_id_i64)
+        .bind(&token_address_hex)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_error)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let last_scanned_block = i64_to_u64(
+            row.try_get("last_scanned_block").map_err(db_error)?,
+            "last_scanned_block",
+        )?;
+        let active_window_from_block = row
+            .try_get::<Option<i64>, _>("active_window_from_block")
+            .map_err(db_error)?
+            .map(|value| i64_to_u64(value, "active_window_from_block"))
+            .transpose()?;
+
+        Ok(Some(select_retention_floor(
+            last_scanned_block.saturating_sub(reorg_lookback_blocks),
+            active_window_from_block,
+            manual_rebuild_floor,
+        )))
+    }
 }
 
 impl From<PgPool> for PgOrderRepository {
@@ -718,4 +775,35 @@ fn not_found(entity: &'static str, key: &str) -> RepositoryError {
 
 fn idempotency_conflict(external_id: &str, existing_id: Uuid) -> RepositoryError {
     RepositoryError::idempotency_conflict("orders", external_id, Some(existing_id))
+}
+
+fn select_retention_floor(
+    lookback_floor: u64,
+    active_floor: Option<u64>,
+    manual_rebuild_floor: Option<u64>,
+) -> u64 {
+    let mut floor = lookback_floor;
+
+    if let Some(active_floor) = active_floor {
+        floor = floor.min(active_floor);
+    }
+
+    if let Some(manual_rebuild_floor) = manual_rebuild_floor {
+        floor = floor.min(manual_rebuild_floor);
+    }
+
+    floor
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_retention_floor;
+
+    #[test]
+    fn retention_floor_prefers_the_oldest_safe_block() {
+        assert_eq!(select_retention_floor(936, Some(1000), None), 936);
+        assert_eq!(select_retention_floor(936, Some(100), None), 100);
+        assert_eq!(select_retention_floor(936, None, None), 936);
+        assert_eq!(select_retention_floor(936, Some(1000), Some(120)), 120);
+    }
 }

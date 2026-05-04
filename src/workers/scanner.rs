@@ -763,7 +763,7 @@ mod tests {
     use super::*;
     use crate::{
         chain::ChainBlock,
-        db::repositories::{MatchedPaymentInput, PaymentWindowCandidate},
+        db::repositories::{MatchedPaymentInput, PaymentWindowCandidate, ScanCursorState},
         domain::{
             BlockHash, ChainBlockRef, EvmAddress, PaymentChainStatus, PaymentMatchStatus,
             RawAmount, TxHash,
@@ -1178,6 +1178,23 @@ mod tests {
                 .expect("fake repo lock poisoned")
                 .claim_result
                 .clone())
+        }
+
+        async fn scan_cursor_state(
+            &self,
+            _chain_id: u64,
+            _token_address: EvmAddress,
+        ) -> Result<Option<ScanCursorState>, RepositoryError> {
+            Ok(self
+                .state
+                .lock()
+                .expect("fake repo lock poisoned")
+                .claim_result
+                .as_ref()
+                .map(|lease| ScanCursorState {
+                    last_scanned_block: lease.last_scanned_block,
+                    seen_kv_reorg_epoch: lease.seen_kv_reorg_epoch,
+                }))
         }
 
         async fn commit_scanned_batch(

@@ -6,9 +6,9 @@ Rust ERC20 token 收款平台。MVP 目标是用单一链、单一 token、单�
 创建订单 -> 派生收款地址 -> 用户 ERC20 转账 -> 验证付款成功 -> token collect
 ```
 
-当前仓库已经进入 Rust 实现阶段，已完成基础配置/health/JWT/domain、PostgreSQL migration/repository 初版、HD wallet 地址派生边界、signer contract/fake、订单创建 service 初版、订单 API route contract、chain 纯契约/fake、transfer log store 原型、付款匹配纯 service、手动 verify service/API route contract、scanner worker tick + runtime loop + confirmation sweep + rolling lookback/lag readiness 初版、collector tick + runtime loop 初版、collect replacement 初版、collection fee/collector timeout 配置化初版，以及 worker tick metrics/readyz 初版。
+当前仓库已经进入 Rust 实现阶段，已完成基础配置/health/JWT/domain、PostgreSQL migration/repository 初版、HD wallet 地址派生边界、signer contract/fake、订单创建 service 初版、订单 API route contract、chain 纯契约/fake、transfer log store 原型与 retention cleanup loop、付款匹配纯 service、手动 verify service/API route contract、scanner worker tick + runtime loop + confirmation sweep + rolling lookback/lag readiness 初版、collector tick + runtime loop 初版、collect replacement 初版、collection fee/collector timeout 配置化初版，以及 worker tick metrics/readyz 初版。
 
-生产可用性：当前仓库仍不可用于生产接真实资金。真实 PostgreSQL 集成测试和 Anvil+mock ERC20 e2e 已补，但 collect replacement 的真实 DB/e2e 复测、告警 dry-run、部署工件和 runbook 演练还没有完成。MVP 出口标准已经包含 reorg/finality、collect 崩溃恢复、外部 signer、监控告警、备份恢复、runbook 演练和 e2e 测试；这些不是后续补项。
+生产可用性：当前仓库仍不可用于生产接真实资金。真实 PostgreSQL 集成测试和 Anvil+mock ERC20 e2e 已补，但 collect replacement 的真实 DB/e2e 复测、告警 dry-run、部署工件和 runbook 演练还没有完成，KVDB 维护仍需要继续补手工演练。MVP 出口标准已经包含 reorg/finality、collect 崩溃恢复、外部 signer、监控告警、备份恢复、runbook 演练和 e2e 测试；这些不是后续补项。
 
 生产优先约束：每个订单使用新收款地址且永不复用；归集目标固定为 treasury；production profile 不包含 mnemonic/private key/local signer；RPC provider 至少两个；KVDB raw log store 单写者。
 

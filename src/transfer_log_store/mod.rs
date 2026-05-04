@@ -234,6 +234,15 @@ impl<S> RedbTransferLogIngestor<S> {
             .ok_or(TransferLogStoreError::StreamNotFound { stream })?;
         Ok((config, cursor))
     }
+
+    pub fn prune_before_block(
+        &self,
+        stream: StreamId,
+        floor_block: u64,
+    ) -> TransferLogStoreResult<()> {
+        self.store.prune_before_block(stream, floor_block)?;
+        Ok(())
+    }
 }
 
 fn cursor_scan_lag(cursor: &TransferLogCursor, target: u64) -> u64 {

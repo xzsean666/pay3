@@ -8,19 +8,22 @@ use thiserror::Error;
 use crate::{
     api::{self, OrderResponseConfig},
     auth::JwtVerifier,
-    chain::{ChainError, RpcRangeSource},
+    chain::{ChainError, ChainHeaderReader, RpcRangeSource, TransferLogSource},
     config::{AppConfig, ConfigError, SignerMode},
     db::{
         migrations::{
             MigrationBootstrapError, RuntimeSeedConfig, run_schema_migrations, seed_runtime_config,
         },
         repositories::{
-            PgAuditRepository, PgCollectionRepository, PgOrderRepository, PgOutboundRepository,
-            PgPaymentRepository, PgVerifiedPaymentRecorder,
+            PaymentRepository, PgAuditRepository, PgCollectionRepository, PgOrderRepository,
+            PgOutboundRepository, PgPaymentRepository, PgVerifiedPaymentRecorder, RepositoryError,
         },
     },
     domain::CollectionFees,
-    health::{MetricsRecorder, RuntimeDependencyRegistry, StaticDependencyRegistry},
+    health::{
+        DependencyCheck, DependencyName, MetricsRecorder, RuntimeDependencyRegistry,
+        StaticDependencyRegistry,
+    },
     services::{
         collections::{AssumePrefundedGas, CollectionService, CollectionServiceConfig},
         orders::{OrderService, OrderServiceConfig, SystemClock},
@@ -34,7 +37,7 @@ use crate::{
     },
     transfer_log_store::{
         LogSourceKind, RedbTransferLogIngestor, ScanTargetMode, StreamId, TransferLogIngestor,
-        TransferLogStoreError, TransferLogStreamConfig,
+        TransferLogReader, TransferLogStoreError, TransferLogStreamConfig,
     },
     wallet::{AddressDeriver, DeterministicFakeDeriver, HdWallet, WalletError},
     workers::collector::{
@@ -60,6 +63,7 @@ const TRANSFER_LOG_MAX_UNIQUE_TO_ADDRESSES_PER_BATCH: usize = 1_000;
 const TRANSFER_LOG_MAX_DB_FALLBACK_ADDRESSES: usize = 1_000;
 const TRANSFER_LOG_CAPACITY_PROBE_BLOCKS: u64 = 100;
 const TRANSFER_LOG_RPC_MAX_RETRIES: u32 = 3;
+const TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS: u64 = 60_000;
 const PAYMENT_SCANNER_POLL_INTERVAL_MS: u64 = 5_000;
 const PAYMENT_SCANNER_LEASE_SECONDS: i64 = 30;
 const COLLECTION_COLLECTOR_POLL_INTERVAL_MS: u64 = 5_000;
@@ -161,6 +165,9 @@ pub enum RuntimeError {
     CollectionCollector(#[from] CollectionCollectorError),
 
     #[error(transparent)]
+    Repository(#[from] RepositoryError),
+
+    #[error(transparent)]
     OrderService(#[from] crate::services::orders::OrderServiceError),
 
     #[error(transparent)]
@@ -194,13 +201,28 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
     let signer = runtime_signer(&config)?;
     ensure_runtime_signer_health(&signer).await?;
     let metrics = MetricsRecorder::default();
-    let dependency_registry =
-        RuntimeDependencyRegistry::new(StaticDependencyRegistry::all_healthy(), metrics.clone());
 
     let log_store = RedbTransferLogIngestor::open(rpc_source.clone(), &config.kvdb.path)?;
     let stream_config = transfer_log_stream_config(&config);
     let stream = stream_config.stream_id();
     log_store.ensure_stream(stream_config.clone()).await?;
+    let retention_repository = PgOrderRepository::new(pool.clone());
+    let kvdb_retention_repository = retention_repository.clone();
+    let payment_repository = PgPaymentRepository::new(pool.clone());
+    let static_dependencies = StaticDependencyRegistry::all_healthy();
+    let dependency_registry =
+        RuntimeDependencyRegistry::new(static_dependencies.clone(), metrics.clone());
+    update_kvdb_dependency_status(
+        &static_dependencies,
+        &metrics,
+        &retention_repository,
+        &payment_repository,
+        &log_store,
+        stream,
+        stream_config.reorg_lookback_blocks,
+        config.kvdb.manual_rebuild_floor_block,
+    )
+    .await?;
     let _log_ingestor_loop = spawn_transfer_log_ingestor_loop_with_metrics(
         log_store.clone(),
         TransferLogIngestorLoopConfig::new(
@@ -210,6 +232,26 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
         ),
         metrics.clone(),
     )?;
+    let _transfer_log_retention_loop = tokio::spawn(transfer_log_retention_loop(
+        retention_repository,
+        log_store.clone(),
+        stream,
+        stream_config.start_block,
+        stream_config.reorg_lookback_blocks,
+        config.kvdb.manual_rebuild_floor_block,
+        std::time::Duration::from_millis(TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS),
+    ));
+    let _kvdb_readiness_loop = tokio::spawn(kvdb_readiness_loop(
+        static_dependencies.clone(),
+        metrics.clone(),
+        kvdb_retention_repository,
+        payment_repository,
+        log_store.clone(),
+        stream,
+        stream_config.reorg_lookback_blocks,
+        config.kvdb.manual_rebuild_floor_block,
+        std::time::Duration::from_millis(TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS),
+    ));
     let _payment_scanner_loop = spawn_payment_scanner_loop_with_metrics(
         payment_scanner_worker(&config, pool.clone(), log_store.clone(), rpc_source.clone()),
         std::time::Duration::from_millis(PAYMENT_SCANNER_POLL_INTERVAL_MS),
@@ -441,6 +483,218 @@ where
 {
     signer.health_check().await?;
     Ok(())
+}
+
+async fn update_kvdb_dependency_status(
+    dependencies: &StaticDependencyRegistry,
+    metrics: &MetricsRecorder,
+    retention_repository: &PgOrderRepository,
+    payment_repository: &PgPaymentRepository,
+    log_store: &RedbTransferLogIngestor<RpcRangeSource>,
+    stream: StreamId,
+    reorg_lookback_blocks: u64,
+    manual_rebuild_floor_block: Option<u64>,
+) -> Result<(), RuntimeError> {
+    let scan_cursor_state = payment_repository
+        .scan_cursor_state(stream.chain_id, stream.token_address)
+        .await?;
+    let retention_floor_block = retention_repository
+        .retention_floor_block(
+            stream.chain_id,
+            stream.token_address,
+            reorg_lookback_blocks,
+            manual_rebuild_floor_block,
+        )
+        .await?;
+    let log_cursor = log_store.cursor(stream).await?;
+    metrics.record_kvdb_state(log_cursor.last_completed_block, retention_floor_block);
+
+    let dependency = kvdb_dependency_check(
+        stream,
+        scan_cursor_state.as_ref(),
+        &log_cursor,
+        retention_floor_block,
+    );
+    dependencies.set_status(dependency);
+    Ok(())
+}
+
+async fn kvdb_readiness_loop(
+    dependencies: StaticDependencyRegistry,
+    metrics: MetricsRecorder,
+    retention_repository: PgOrderRepository,
+    payment_repository: PgPaymentRepository,
+    log_store: RedbTransferLogIngestor<RpcRangeSource>,
+    stream: StreamId,
+    reorg_lookback_blocks: u64,
+    manual_rebuild_floor_block: Option<u64>,
+    poll_interval: std::time::Duration,
+) {
+    let mut interval = tokio::time::interval(poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+
+        if let Err(error) = update_kvdb_dependency_status(
+            &dependencies,
+            &metrics,
+            &retention_repository,
+            &payment_repository,
+            &log_store,
+            stream,
+            reorg_lookback_blocks,
+            manual_rebuild_floor_block,
+        )
+        .await
+        {
+            tracing::warn!(
+                chain_id = stream.chain_id,
+                token_address = %stream.token_address,
+                error = %error,
+                "kvdb readiness refresh failed"
+            );
+            dependencies.set_status(DependencyCheck::failed(
+                DependencyName::Kvdb,
+                error.to_string(),
+            ));
+        }
+    }
+}
+
+fn kvdb_dependency_check(
+    stream: StreamId,
+    scan_cursor_state: Option<&crate::db::repositories::ScanCursorState>,
+    log_cursor: &crate::transfer_log_store::TransferLogCursor,
+    retention_floor_block: Option<u64>,
+) -> DependencyCheck {
+    let Some(scan_cursor_state) = scan_cursor_state else {
+        return DependencyCheck::failed(
+            DependencyName::Kvdb,
+            format!(
+                "scan cursor state missing for {} / {}",
+                stream.chain_id, stream.token_address
+            ),
+        );
+    };
+
+    let Some(retention_floor_block) = retention_floor_block else {
+        return DependencyCheck::failed(DependencyName::Kvdb, "retention floor unavailable");
+    };
+
+    let completed_block = log_cursor
+        .last_completed_block
+        .unwrap_or_else(|| log_cursor.start_block.saturating_sub(1));
+    if log_cursor.reorg_epoch != scan_cursor_state.seen_kv_reorg_epoch {
+        return DependencyCheck::failed(
+            DependencyName::Kvdb,
+            format!(
+                "kv reorg epoch mismatch: kv {} scanner {}",
+                log_cursor.reorg_epoch, scan_cursor_state.seen_kv_reorg_epoch
+            ),
+        );
+    }
+
+    if completed_block < retention_floor_block {
+        return DependencyCheck::failed(
+            DependencyName::Kvdb,
+            format!(
+                "kvdb coverage ends at block {}, retention floor requires {}",
+                completed_block, retention_floor_block
+            ),
+        );
+    }
+
+    DependencyCheck::healthy(DependencyName::Kvdb)
+}
+
+async fn transfer_log_retention_loop<S>(
+    repository: PgOrderRepository,
+    log_store: RedbTransferLogIngestor<S>,
+    stream: StreamId,
+    start_block: u64,
+    reorg_lookback_blocks: u64,
+    manual_rebuild_floor_block: Option<u64>,
+    poll_interval: std::time::Duration,
+) where
+    S: ChainHeaderReader + TransferLogSource + Send + Sync + 'static,
+{
+    let mut interval = tokio::time::interval(poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_pruned_floor = start_block;
+
+    loop {
+        interval.tick().await;
+
+        match repository
+            .retention_floor_block(
+                stream.chain_id,
+                stream.token_address,
+                reorg_lookback_blocks,
+                manual_rebuild_floor_block,
+            )
+            .await
+        {
+            Ok(Some(floor_block)) if floor_block > last_pruned_floor => {
+                if floor_block <= start_block {
+                    tracing::debug!(
+                        chain_id = stream.chain_id,
+                        token_address = %stream.token_address,
+                        floor_block,
+                        start_block,
+                        "transfer log retention floor is at or before the stream start block"
+                    );
+                    continue;
+                }
+
+                match log_store.prune_before_block(stream, floor_block) {
+                    Ok(()) => {
+                        last_pruned_floor = floor_block;
+                        tracing::info!(
+                            chain_id = stream.chain_id,
+                            token_address = %stream.token_address,
+                            floor_block,
+                            start_block,
+                            "transfer log retention pruned"
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            chain_id = stream.chain_id,
+                            token_address = %stream.token_address,
+                            floor_block,
+                            error = %error,
+                            "transfer log retention prune failed"
+                        );
+                    }
+                }
+            }
+            Ok(Some(floor_block)) => {
+                tracing::debug!(
+                    chain_id = stream.chain_id,
+                    token_address = %stream.token_address,
+                    floor_block,
+                    last_pruned_floor,
+                    "transfer log retention floor unchanged"
+                );
+            }
+            Ok(None) => {
+                tracing::debug!(
+                    chain_id = stream.chain_id,
+                    token_address = %stream.token_address,
+                    "transfer log retention floor unavailable"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    chain_id = stream.chain_id,
+                    token_address = %stream.token_address,
+                    error = %error,
+                    "transfer log retention floor lookup failed"
+                );
+            }
+        }
+    }
 }
 
 fn transfer_log_stream_config(config: &AppConfig) -> TransferLogStreamConfig {

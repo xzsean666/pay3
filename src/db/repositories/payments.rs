@@ -13,7 +13,7 @@ use super::{
     payment_records::{i64_to_u64, payment_record_from_row, u64_to_i64, upsert_matched_payment_tx},
     types::{
         CommitScannedBatch, ConfirmObservedPaymentsBatch, PaymentConfirmationCandidate,
-        PaymentRecord, ScanCursorLease,
+        PaymentRecord, ScanCursorLease, ScanCursorState,
     },
 };
 
@@ -26,6 +26,12 @@ pub trait PaymentRepository: Send + Sync {
         token_address: EvmAddress,
         lease_until: OffsetDateTime,
     ) -> Result<Option<ScanCursorLease>, RepositoryError>;
+
+    async fn scan_cursor_state(
+        &self,
+        chain_id: u64,
+        token_address: EvmAddress,
+    ) -> Result<Option<ScanCursorState>, RepositoryError>;
 
     async fn commit_scanned_batch(
         &self,
@@ -151,6 +157,45 @@ impl PaymentRepository for PgPaymentRepository {
             lease_until,
             last_scanned_block,
             seen_kv_reorg_epoch,
+        }))
+    }
+
+    async fn scan_cursor_state(
+        &self,
+        chain_id: u64,
+        token_address: EvmAddress,
+    ) -> Result<Option<ScanCursorState>, RepositoryError> {
+        let chain_id_i64 = u64_to_i64(chain_id, "chain_id")?;
+        let token_address_hex = token_address.to_lower_hex();
+
+        let row = sqlx::query(
+            r#"
+            SELECT last_scanned_block, seen_kv_reorg_epoch
+            FROM chain_cursors
+            WHERE chain_id = $1 AND token_address = $2
+            "#,
+        )
+        .bind(chain_id_i64)
+        .bind(&token_address_hex)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(RepositoryError::Database)?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(ScanCursorState {
+            last_scanned_block: i64_to_u64(
+                row.try_get("last_scanned_block")
+                    .map_err(RepositoryError::Database)?,
+                "last_scanned_block",
+            )?,
+            seen_kv_reorg_epoch: i64_to_u64(
+                row.try_get("seen_kv_reorg_epoch")
+                    .map_err(RepositoryError::Database)?,
+                "seen_kv_reorg_epoch",
+            )?,
         }))
     }
 

@@ -185,6 +185,12 @@ pub struct ScanCursorLease {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanCursorState {
+    pub last_scanned_block: u64,
+    pub seen_kv_reorg_epoch: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitScannedBatch {
     pub chain_id: u64,
     pub token_address: EvmAddress,

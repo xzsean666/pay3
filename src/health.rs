@@ -341,6 +341,8 @@ struct MetricsInner {
     request_count: AtomicU64,
     request_latency_micros_total: AtomicU64,
     request_latency_micros_max: AtomicU64,
+    kvdb_last_completed_block: RwLock<Option<u64>>,
+    kvdb_retention_floor_block: RwLock<Option<u64>>,
     worker_metrics: RwLock<BTreeMap<WorkerName, WorkerMetricState>>,
 }
 
@@ -402,6 +404,23 @@ impl MetricsRecorder {
         state.lag_blocks = Some(lag_blocks);
         state.lag_threshold_blocks = Some(lag_threshold_blocks);
         state.last_lag_unix_seconds = Some(unix_now_seconds());
+    }
+
+    pub fn record_kvdb_state(
+        &self,
+        last_completed_block: Option<u64>,
+        retention_floor_block: Option<u64>,
+    ) {
+        *self
+            .inner
+            .kvdb_last_completed_block
+            .write()
+            .expect("kvdb last completed block lock poisoned") = last_completed_block;
+        *self
+            .inner
+            .kvdb_retention_floor_block
+            .write()
+            .expect("kvdb retention floor block lock poisoned") = retention_floor_block;
     }
 
     pub fn worker_snapshots(&self) -> Vec<WorkerMetricSnapshot> {
@@ -512,6 +531,34 @@ impl MetricsRecorder {
         output.push_str(&format!(
             "pay3_http_request_latency_seconds_max {:.6}\n",
             max_seconds
+        ));
+        let kvdb_last_completed_block = self
+            .inner
+            .kvdb_last_completed_block
+            .read()
+            .expect("kvdb last completed block lock poisoned")
+            .unwrap_or(0);
+        let kvdb_retention_floor_block = self
+            .inner
+            .kvdb_retention_floor_block
+            .read()
+            .expect("kvdb retention floor block lock poisoned")
+            .unwrap_or(0);
+        output.push_str(
+            "# HELP pay3_kvdb_last_completed_block Highest completed block currently retained in KVDB.\n",
+        );
+        output.push_str("# TYPE pay3_kvdb_last_completed_block gauge\n");
+        output.push_str(&format!(
+            "pay3_kvdb_last_completed_block {}\n",
+            kvdb_last_completed_block
+        ));
+        output.push_str(
+            "# HELP pay3_kvdb_retention_floor_block Lowest block KVDB retention may prune.\n",
+        );
+        output.push_str("# TYPE pay3_kvdb_retention_floor_block gauge\n");
+        output.push_str(&format!(
+            "pay3_kvdb_retention_floor_block {}\n",
+            kvdb_retention_floor_block
         ));
         output.push_str(
             "# HELP pay3_readyz_status Overall readiness status (1=ready, 0=not ready).\n",
@@ -687,6 +734,7 @@ mod tests {
             Duration::from_millis(2),
             "rpc timeout",
         );
+        metrics.record_kvdb_state(Some(42), Some(40));
 
         let checks = metrics.worker_dependency_checks();
         assert!(checks.iter().any(|dependency| {
@@ -718,6 +766,8 @@ mod tests {
         );
         assert!(body.contains("pay3_log_ingestor_lag_blocks 0"));
         assert!(body.contains("pay3_payment_scanner_lag_blocks 7"));
+        assert!(body.contains("pay3_kvdb_last_completed_block 42"));
+        assert!(body.contains("pay3_kvdb_retention_floor_block 40"));
         assert!(
             body.contains("pay3_readyz_dependency_status{dependency=\"collection_collector\"} 0")
         );

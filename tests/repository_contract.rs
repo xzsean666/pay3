@@ -20,6 +20,9 @@ fn order_repository_uses_external_id_lock_and_idempotency() {
         "lookup_payment_window_candidates",
         "pw.receive_address = ANY($3::text[])",
         "FOR UPDATE",
+        "retention_floor_block",
+        "MIN(pw.window_from_block)",
+        "monitor_until >= now()",
     ] {
         assert!(ORDERS_REPOSITORY.contains(fragment), "missing {fragment}");
     }

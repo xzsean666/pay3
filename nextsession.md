@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，已完成 Phase 5 `workers/scanner` tick contract、常驻 loop、confirmation sweep、rolling lookback rescan 和 lag/readiness 初版，已完成 `services/collections` prefunded 初版、collector broadcast tick 初版、collector 常驻 loop 初版、collector broadcast 前/后崩溃恢复与 receipt sweep tick 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版和 collection create/read API route contract 初版，并新增真实 API 启动路径的 runtime composition 初版、真实 PostgreSQL 集成测试 `tests/collection_db_integration.rs` 和 Anvil+mock ERC20 e2e `tests/anvil_e2e.rs`，其中补了 collect replacement 回归。
+仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，已完成 Phase 5 `workers/scanner` tick contract、常驻 loop、confirmation sweep、rolling lookback rescan 和 lag/readiness 初版，已完成 `services/collections` prefunded 初版、collector broadcast tick 初版、collector 常驻 loop 初版、collector broadcast 前/后崩溃恢复与 receipt sweep tick 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版和 collection create/read API route contract 初版，并新增真实 API 启动路径的 runtime composition 初版、transfer log retention cleanup loop / KVDB readiness metrics wiring、真实 PostgreSQL 集成测试 `tests/collection_db_integration.rs` 和 Anvil+mock ERC20 e2e `tests/anvil_e2e.rs`，其中补了 collect replacement 回归。
 
 已完成：
 
@@ -96,7 +96,7 @@
   - 返回 collection id/order/chain/token/status/from/to/amount/outbound/attempt/error/时间字段，`Created` -> `201`、`Existing` -> `200`。
   - 已接入真实 runtime composition 初版；仍缺 collector recovery loop、receipt/retry/replacement 和 e2e。
 - `src/transfer_log_store/types.rs`: transfer log stream/cursor/log/header/page token canonical primitives。
-- `src/transfer_log_store/mod.rs`: in-memory `TransferLogIngestor`/`TransferLogReader`，以及 redb-backed `RedbTransferLogIngestor` runtime 初版；覆盖连续扫描、空块 header、exclusive page token、reorg rewind、capacity gate 和持久化读路径。
+- `src/transfer_log_store/mod.rs`: in-memory `TransferLogIngestor`/`TransferLogReader`，以及 redb-backed `RedbTransferLogIngestor` runtime 初版；覆盖连续扫描、空块 header、exclusive page token、reorg rewind、capacity gate、保留清理和持久化读路径。
 - `src/transfer_log_store/redb_store.rs`: redb persistence layer，支持 config/cursor/header/log/range manifest 持久化、stream config + cursor 原子初始化、atomic batch write、bounded `logs_in_range`、exclusive `logs_page`、rewind delete。
 - `tests/migration_contract.rs`: migration contract 测试；有 `PAY3_TEST_DATABASE_URL`/`TEST_DATABASE_URL` 时会实际 apply 到临时 schema，否则跳过 DB apply 分支。
 - `tests/collection_db_integration.rs`: 真实 PostgreSQL 集成测试，临时 schema + migrations 之后直接用 SQL 验证 collection/outbound trigger、collect-only purpose check 和 outbound active nonce replacement trajectory；无数据库 URL 时自动跳过。
@@ -236,7 +236,7 @@
    - redb runtime poll 前运行 `TransferLogSource::capacity_probe`；可缩小 batch，单块超阈值时返回 not ready 且不推进 cursor。
    - redb runtime reorg 检测会 rewind KV cursor 并删除分叉块及之后的 headers/logs/range manifest，不触碰 PostgreSQL。
    - redb-backed ingestor poll loop 已接入 API runtime 启动路径，启动后周期执行 `poll_once`。
-   - 仍需 retention floor cleanup、readiness/metrics wiring、KVDB coverage/retention 对外状态和真实生产 readiness 回归。
+   - retention floor cleanup loop 已接入 runtime；manual rebuild floor 和 readiness/metrics wiring 已接入，KVDB coverage/retention 对外状态已通过 readyz/metrics 暴露，仍需真实生产 readiness 回归和演练。
 13. 实现 `PaymentWindowLookup`。已完成：
    - memory watch set + 批量 fallback trait。
    - fallback miss 去重并一次批量查询；不做 per-address fallback。
@@ -316,7 +316,7 @@
 | 创建订单 API | 完成 route + runtime 初版 | `POST /v1/orders` / `GET /v1/orders/{id}` / by-external-id，scope 和错误映射测试通过；真实启动路径已接 Pg/RPC/JWT/redb，真实 DB/Anvil e2e 未做 |
 | chain 纯契约/fake | 完成初版 | traits + normalized logs/headers/receipt + fake range/reorg/failure/capacity 测试；真实 RPC provider manager 初版已完成，Anvil ERC20 测试未做 |
 | PaymentWindowLookup | 完成 | watch set + 批量 fallback contract；新增 PostgreSQL `payment_windows JOIN orders` fallback adapter，lookup 错误会 fail closed；禁止逐地址 fallback |
-| transfer_log_store | 完成 M9 runtime 初版 | canonical types + in-memory ingestor/reader + redb-backed ingestor/reader + runtime poll loop + redb persistence contract；retention cleanup、readiness/metrics wiring、Anvil 测试未做 |
+| transfer_log_store | 完成 M9 runtime 初版 | canonical types + in-memory ingestor/reader + redb-backed ingestor/reader + runtime poll loop + retention cleanup loop + redb persistence contract；KVDB readiness/metrics wiring 已接入，Anvil 测试未做 |
 | services/payments | 完成纯 service contract | `TransferLogReader::logs_page` -> candidate lookup -> `MatchedPaymentInput`；`match_stored_transfer_logs` 已供 verify/scanner 复用 |
 | RPC provider manager / LogSource | 完成初版 | `HttpJsonRpcProvider` + `RpcProviderManager` + `RpcRangeSource`，含 chain_id 校验、hash mismatch fail-closed、capacity gate、failover；已接 API runtime 初版，metrics/Anvil 测试未做 |
 | API runtime composition | 完成初版 | `runtime::build_api_router` 连接 Pg、跑 migration/seed、打开 redb、启动 transfer log poll loop、payment scanner loop 和 collector loop、校验 RPC chain id、挂订单、verify 和 collection create/read；fake/remote signer 路径已接入；worker tick metrics/readyz 和 scanner lag/readiness 初版已接入 |

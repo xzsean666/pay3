@@ -78,6 +78,7 @@ impl fmt::Debug for DatabaseConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KvdbConfig {
     pub path: PathBuf,
+    pub manual_rebuild_floor_block: Option<u64>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -269,6 +270,13 @@ impl AppConfig {
             },
             kvdb: KvdbConfig {
                 path: PathBuf::from(values.required(&["KVDB_PATH", "REDB_PATH"])?),
+                manual_rebuild_floor_block: parse_optional_u64_value(
+                    &values,
+                    &[
+                        "KVDB_MANUAL_REBUILD_FLOOR_BLOCK",
+                        "KVDB_REBUILD_FLOOR_BLOCK",
+                    ],
+                )?,
             },
             jwt: JwtConfig {
                 issuer: values.required(&["JWT_ISSUER"])?,
@@ -478,6 +486,20 @@ fn parse_optional_u64(
         .map_err(|_| ConfigError::invalid(keys[0], value, "expected unsigned integer"))
 }
 
+fn parse_optional_u64_value(
+    values: &EnvPairs,
+    keys: &[&'static str],
+) -> Result<Option<u64>, ConfigError> {
+    let Some(value) = values.optional(keys) else {
+        return Ok(None);
+    };
+
+    value
+        .parse::<u64>()
+        .map(Some)
+        .map_err(|_| ConfigError::invalid(keys[0], value, "expected unsigned integer"))
+}
+
 fn parse_required_u8(values: &EnvPairs, keys: &[&'static str]) -> Result<u8, ConfigError> {
     let value = values.required_ref(keys)?;
     value
@@ -671,6 +693,7 @@ mod tests {
         assert_eq!(config.jwt.issuer, "pay3");
         assert_eq!(config.jwt.audience, "pay3-api");
         assert_eq!(config.jwt.key_id.as_deref(), Some("pay3-key-1"));
+        assert_eq!(config.kvdb.manual_rebuild_floor_block, None);
         assert_eq!(config.chain.chain_id, 31337);
         assert_eq!(config.chain.token_decimals, 6);
         assert_eq!(config.chain.token_symbol, "USDT");
@@ -718,6 +741,13 @@ mod tests {
             config.collector.replacement_stuck_after,
             Duration::from_secs(120)
         );
+    }
+
+    #[test]
+    fn kvdb_manual_rebuild_floor_can_be_overridden_from_pairs() {
+        let config = config_with(&[("KVDB_MANUAL_REBUILD_FLOOR_BLOCK", "4242")]);
+
+        assert_eq!(config.kvdb.manual_rebuild_floor_block, Some(4242));
     }
 
     #[test]
