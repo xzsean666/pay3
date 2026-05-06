@@ -2,7 +2,7 @@
 
 ## 结论
 
-当前仓库不能用于生产环境，因为虽然 Rust 实现、migration 和大部分测试已经有了，但部署工件、告警 dry-run 和演练记录还没有闭环。
+当前仓库不能用于生产环境，因为虽然 Rust 实现、migration、大部分测试和 Docker/Compose dry-run 工件已经有了，但 production signer 服务、远程 JWKS 拉取、告警 dry-run、备份恢复和 runbook 演练记录还没有闭环。
 
 但本文列出的内容不再是“生产前再补”的后续项。它们全部是 MVP 出口验收标准：只有实现、测试、部署演练全部通过后，Pay3 MVP 才能作为单链、单 token、单默认账号的生产候选版本接真实资金。
 
@@ -119,7 +119,7 @@ MVP 必须：
 - 所有 `/v1/*` endpoint 强制 endpoint scope。
 - `collections:create` 不给普通业务 JWT。
 - 401/403/409/422/429/503 typed error 测试通过。
-- production profile 使用 RS256/EdDSA + JWKS + `kid`；HS256 只允许 dev/test profile。
+- production profile 使用 RS256/EdDSA + `kid`；当前支持 `JWT_JWKS_JSON`/`JWT_LOCAL_JWKS_JSON` 或 `JWT_PUBLIC_KEY_PEM`，`JWT_JWKS_URL` 远程拉取仍是保留项，HS256/`JWT_SECRET` 只允许 dev/test profile。
 
 ## DB 强约束
 
@@ -181,4 +181,4 @@ MVP 必须具备：
 
 ## 当前建议
 
-下一步做 Rust MVP 代码时，必须按本文验收项实现和测试。不要先做多商户、多链、多 token、后台或前端；先把单链单币真实资金闭环做成可恢复、可观测、可审计。
+下一步继续补齐未闭环的 MVP 阻塞项：production remote signer 服务/部署演练、远程 JWKS 拉取、告警 dry-run、DB PITR/migration rollback/RPC 切换/KVDB rebuild 演练，以及 collect finality/reorg 完整复测。不要先做多商户、多链、多 token、后台或前端；先把单链单币真实资金闭环做成可恢复、可观测、可审计。

@@ -32,10 +32,10 @@ pub enum ChainError {
         "RPC provider hash mismatch for {context}: {left_provider} returned {left_hash}, {right_provider} returned {right_hash}"
     )]
     ProviderHashMismatch {
-        context: String,
-        left_provider: String,
+        context: Box<str>,
+        left_provider: Box<str>,
         left_hash: BlockHash,
-        right_provider: String,
+        right_provider: Box<str>,
         right_hash: BlockHash,
     },
 
@@ -237,6 +237,15 @@ pub trait TransferLogSource: Send + Sync {
 }
 
 #[async_trait]
+pub trait NativeBalanceReader: Send + Sync {
+    async fn native_balance(
+        &self,
+        chain_id: u64,
+        owner: EvmAddress,
+    ) -> Result<RawAmount, ChainError>;
+}
+
+#[async_trait]
 pub trait Erc20ChainClient: ChainHeaderReader + TransferLogSource {
     async fn token_balance(
         &self,
@@ -314,6 +323,15 @@ impl FakeErc20ChainClient {
         self.clone()
     }
 
+    pub fn set_native_balance(&self, owner: EvmAddress, balance: RawAmount) -> Self {
+        self.state
+            .lock()
+            .expect("fake chain mutex poisoned")
+            .native_balances
+            .insert(owner, balance);
+        self.clone()
+    }
+
     pub fn set_receipt(&self, receipt: TxReceipt) -> Self {
         self.state
             .lock()
@@ -362,6 +380,10 @@ pub enum FakeChainCall {
     BlockByNumber(u64),
     TransferLogs(TransferLogRange),
     CapacityProbe(TransferLogRange),
+    NativeBalance {
+        chain_id: u64,
+        owner: EvmAddress,
+    },
     TokenBalance {
         token: EvmAddress,
         owner: EvmAddress,
@@ -378,6 +400,7 @@ struct FakeChainState {
     head: Option<ChainBlockRef>,
     safe_head: Option<ChainBlockRef>,
     finalized_head: Option<ChainBlockRef>,
+    native_balances: BTreeMap<EvmAddress, RawAmount>,
     balances: BTreeMap<(EvmAddress, EvmAddress), RawAmount>,
     receipts: BTreeMap<TxHash, TxReceipt>,
     next_error: Option<String>,
@@ -497,6 +520,31 @@ impl TransferLogSource for FakeErc20ChainClient {
             max_logs_in_single_block: block_counts.values().copied().max().unwrap_or_default(),
             limits,
         })
+    }
+}
+
+#[async_trait]
+impl NativeBalanceReader for FakeErc20ChainClient {
+    async fn native_balance(
+        &self,
+        chain_id: u64,
+        owner: EvmAddress,
+    ) -> Result<RawAmount, ChainError> {
+        let mut state = self.state.lock().expect("fake chain mutex poisoned");
+        state
+            .calls
+            .push(FakeChainCall::NativeBalance { chain_id, owner });
+        state.take_error()?;
+        if chain_id != state.chain_id {
+            return Err(ChainError::ChainIdMismatch {
+                expected: chain_id,
+                actual: state.chain_id,
+            });
+        }
+        Ok(*state
+            .native_balances
+            .get(&owner)
+            .unwrap_or(&RawAmount::ZERO))
     }
 }
 

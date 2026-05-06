@@ -2,9 +2,48 @@
 
 ## 当前状态
 
-本文是 MVP 生产候选部署要求，不代表当前项目已经可生产。当前仓库已经进入 Rust 实现阶段，但部署工件和演练仍未闭环。
+本文是 MVP 生产候选部署要求，不代表当前项目已经可生产。当前仓库已经进入 Rust 实现阶段，并已提供 Docker/Compose dry-run 工件；生产级部署、告警 dry-run、备份恢复和 runbook 演练仍未闭环。
 
-## 组件拓扑
+本地 dry-run 入口：
+
+- `Dockerfile`: 多阶段 Rust release build，runtime 非 root 用户，挂载 `/var/lib/pay3` 保存 redb KVDB，默认 healthcheck 调 `/readyz`。
+- `docker-compose.yml`: 默认只启动 `pay3` 并要求传入 `DATABASE_URL`；内置 PostgreSQL 只在 `local-db` profile 下启用；暴露 `3000`。
+- `.env.example`: 本地开发/staging dry-run 示例；production 必须改用真实 RPC、外部 signer、RS256/EdDSA JWT key source 和 secret manager。
+- `deploy/prometheus/pay3-alerts.example.yml`: Prometheus 告警 dry-run 示例规则。
+
+使用外部数据库的默认 dry-run：
+
+```bash
+DATABASE_URL=postgres://user:pass@db.example:5432/pay3 docker compose up --build pay3
+```
+
+该默认配置要求宿主机 `8545` 已有 chain id `31337` 的 Anvil/local JSON-RPC；否则 runtime 会在 RPC chain id/readiness 校验处失败。只验证服务启动可以先用占位 `TOKEN_ADDRESS`，要跑 ERC20 转账和归集流程必须先部署 mock ERC20 并更新 `TOKEN_ADDRESS`。
+
+`pay3` 必须显式传入 `DATABASE_URL`，可以来自 shell、项目根 `.env` 或 Compose `--env-file`。`.env.example` 里的默认值只配合 `local-db` profile 使用。
+
+需要本地覆盖配置时，复制 `.env.example` 为 `.env`，然后显式选择 env file：
+
+```bash
+PAY3_ENV_FILE=.env docker compose up --build
+```
+
+如果使用 compose 内置本地 Postgres：
+
+```bash
+PAY3_ENV_FILE=.env.example docker compose --env-file .env.example --profile local-db up --build
+```
+
+如果使用非 `.env` 文件，必须同时传给 Compose 插值和 `pay3` service 的 `env_file`：
+
+```bash
+PAY3_ENV_FILE=staging.env docker compose --env-file staging.env up --build
+```
+
+Compose/Dockerfile healthcheck 使用 `/readyz`，用于暴露 DB、RPC、signer、KVDB 和 worker readiness；`/healthz` 只代表进程存活。
+
+## 生产目标组件拓扑
+
+当前 Docker/Compose dry-run 是单个 `pay3` 进程同时启动 API、log ingestor、scanner 和 collector loop；下面是生产候选拆分部署的目标边界。
 
 - `pay3-api`: HTTP API，只处理鉴权、DTO、service 调用。
 - `pay3-log-ingestor`: 独立 ERC20 Transfer log KVDB 采集 worker，按 `(chain_id, token_address)` 从配置的 `start_block` 开始轮询并写本地 KVDB；每个 stream 只能一个 writer。

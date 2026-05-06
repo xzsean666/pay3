@@ -184,16 +184,40 @@ pub enum PaymentScannerError {
     },
 
     #[error(transparent)]
-    Repository(#[from] RepositoryError),
+    Repository(Box<RepositoryError>),
 
     #[error(transparent)]
-    PaymentMatching(#[from] PaymentMatchingError),
+    PaymentMatching(Box<PaymentMatchingError>),
 
     #[error(transparent)]
-    Chain(#[from] ChainError),
+    Chain(Box<ChainError>),
 
     #[error(transparent)]
-    TransferLogStore(#[from] TransferLogStoreError),
+    TransferLogStore(Box<TransferLogStoreError>),
+}
+
+impl From<RepositoryError> for PaymentScannerError {
+    fn from(error: RepositoryError) -> Self {
+        Self::Repository(Box::new(error))
+    }
+}
+
+impl From<PaymentMatchingError> for PaymentScannerError {
+    fn from(error: PaymentMatchingError) -> Self {
+        Self::PaymentMatching(Box::new(error))
+    }
+}
+
+impl From<ChainError> for PaymentScannerError {
+    fn from(error: ChainError) -> Self {
+        Self::Chain(Box::new(error))
+    }
+}
+
+impl From<TransferLogStoreError> for PaymentScannerError {
+    fn from(error: TransferLogStoreError) -> Self {
+        Self::TransferLogStore(Box::new(error))
+    }
 }
 
 pub struct PaymentScannerWorker<R, M, L, H, C> {
@@ -986,7 +1010,8 @@ mod tests {
 
         assert!(matches!(
             error,
-            PaymentScannerError::Repository(RepositoryError::CursorCasMismatch { .. })
+            PaymentScannerError::Repository(error)
+                if matches!(error.as_ref(), RepositoryError::CursorCasMismatch { .. })
         ));
     }
 

@@ -8,15 +8,19 @@ use thiserror::Error;
 use crate::{
     api::{self, OrderResponseConfig},
     auth::JwtVerifier,
-    chain::{ChainError, ChainHeaderReader, RpcRangeSource, TransferLogSource},
-    config::{AppConfig, ConfigError, SignerMode},
+    chain::{
+        ChainError, ChainHeaderReader, RpcRangeSource, TransferLogCapacityLimits, TransferLogRange,
+        TransferLogSource,
+    },
+    config::{AppConfig, ConfigError, JwtAlgorithm, JwtKeySource, SignerMode},
     db::{
         migrations::{
             MigrationBootstrapError, RuntimeSeedConfig, run_schema_migrations, seed_runtime_config,
         },
         repositories::{
-            PaymentRepository, PgAuditRepository, PgCollectionRepository, PgOrderRepository,
-            PgOutboundRepository, PgPaymentRepository, PgVerifiedPaymentRecorder, RepositoryError,
+            ExpiredOrderRepository, PaymentRepository, PgAuditRepository, PgCollectionRepository,
+            PgOrderRepository, PgOutboundRepository, PgPaymentRepository,
+            PgVerifiedPaymentRecorder, RepositoryError,
         },
     },
     domain::CollectionFees,
@@ -25,7 +29,7 @@ use crate::{
         StaticDependencyRegistry,
     },
     services::{
-        collections::{AssumePrefundedGas, CollectionService, CollectionServiceConfig},
+        collections::{CollectionService, CollectionServiceConfig, NativeBalanceGasChecker},
         orders::{OrderService, OrderServiceConfig, SystemClock},
         payment_windows::{RepositoryPaymentWindowLookup, WatchSetPaymentWindowLookup},
         payments::{PaymentMatcher, PaymentMatchingConfig},
@@ -67,6 +71,9 @@ const TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS: u64 = 60_000;
 const PAYMENT_SCANNER_POLL_INTERVAL_MS: u64 = 5_000;
 const PAYMENT_SCANNER_LEASE_SECONDS: i64 = 30;
 const COLLECTION_COLLECTOR_POLL_INTERVAL_MS: u64 = 5_000;
+const RUNTIME_READINESS_POLL_INTERVAL_MS: u64 = 30_000;
+const ORDER_EXPIRY_POLL_INTERVAL_MS: u64 = 5_000;
+const ORDER_EXPIRY_BATCH_LIMIT: u32 = 1_000;
 
 #[derive(Clone, Debug)]
 enum RuntimeSigner {
@@ -76,6 +83,30 @@ enum RuntimeSigner {
     },
     Remote(RemoteHttpSigner),
 }
+
+type RuntimeCollectionService<S> = CollectionService<
+    PgOrderRepository,
+    PgCollectionRepository,
+    PgOutboundRepository,
+    PgAuditRepository,
+    S,
+    RpcRangeSource,
+    NativeBalanceGasChecker<RpcRangeSource>,
+>;
+type RuntimePaymentWindowLookup =
+    WatchSetPaymentWindowLookup<RepositoryPaymentWindowLookup<PgOrderRepository>>;
+type RuntimePaymentMatcher = PaymentMatcher<
+    RedbTransferLogIngestor<RpcRangeSource>,
+    RuntimePaymentWindowLookup,
+    RpcRangeSource,
+>;
+type RuntimePaymentScannerWorker = PaymentScannerWorker<
+    PgPaymentRepository,
+    RuntimePaymentMatcher,
+    RedbTransferLogIngestor<RpcRangeSource>,
+    RpcRangeSource,
+    SystemClock,
+>;
 
 #[async_trait]
 impl AddressDeriver for RuntimeSigner {
@@ -150,37 +181,97 @@ pub enum RuntimeError {
     Auth(#[from] crate::auth::AuthError),
 
     #[error(transparent)]
-    Chain(#[from] ChainError),
+    Chain(Box<ChainError>),
 
     #[error(transparent)]
-    TransferLogStore(#[from] TransferLogStoreError),
+    TransferLogStore(Box<TransferLogStoreError>),
 
     #[error(transparent)]
-    TransferLogIngestorLoop(#[from] TransferLogIngestorLoopError),
+    TransferLogIngestorLoop(Box<TransferLogIngestorLoopError>),
 
     #[error(transparent)]
-    PaymentScanner(#[from] PaymentScannerError),
+    PaymentScanner(Box<PaymentScannerError>),
 
     #[error(transparent)]
-    CollectionCollector(#[from] CollectionCollectorError),
+    CollectionCollector(Box<CollectionCollectorError>),
 
     #[error(transparent)]
-    Repository(#[from] RepositoryError),
+    Repository(Box<RepositoryError>),
 
     #[error(transparent)]
-    OrderService(#[from] crate::services::orders::OrderServiceError),
+    OrderService(Box<crate::services::orders::OrderServiceError>),
 
     #[error(transparent)]
-    CollectionService(#[from] crate::services::collections::CollectionServiceError),
+    CollectionService(Box<crate::services::collections::CollectionServiceError>),
 
     #[error(transparent)]
-    Wallet(#[from] WalletError),
+    Wallet(Box<WalletError>),
 
     #[error(transparent)]
-    Signer(#[from] SignerError),
+    Signer(Box<SignerError>),
 
     #[error("runtime signer mode {mode:?} is not supported; SIGNER_MODE=local remains disabled")]
     UnsupportedSignerMode { mode: SignerMode },
+}
+
+impl From<ChainError> for RuntimeError {
+    fn from(error: ChainError) -> Self {
+        Self::Chain(Box::new(error))
+    }
+}
+
+impl From<TransferLogStoreError> for RuntimeError {
+    fn from(error: TransferLogStoreError) -> Self {
+        Self::TransferLogStore(Box::new(error))
+    }
+}
+
+impl From<TransferLogIngestorLoopError> for RuntimeError {
+    fn from(error: TransferLogIngestorLoopError) -> Self {
+        Self::TransferLogIngestorLoop(Box::new(error))
+    }
+}
+
+impl From<PaymentScannerError> for RuntimeError {
+    fn from(error: PaymentScannerError) -> Self {
+        Self::PaymentScanner(Box::new(error))
+    }
+}
+
+impl From<CollectionCollectorError> for RuntimeError {
+    fn from(error: CollectionCollectorError) -> Self {
+        Self::CollectionCollector(Box::new(error))
+    }
+}
+
+impl From<RepositoryError> for RuntimeError {
+    fn from(error: RepositoryError) -> Self {
+        Self::Repository(Box::new(error))
+    }
+}
+
+impl From<crate::services::orders::OrderServiceError> for RuntimeError {
+    fn from(error: crate::services::orders::OrderServiceError) -> Self {
+        Self::OrderService(Box::new(error))
+    }
+}
+
+impl From<crate::services::collections::CollectionServiceError> for RuntimeError {
+    fn from(error: crate::services::collections::CollectionServiceError) -> Self {
+        Self::CollectionService(Box::new(error))
+    }
+}
+
+impl From<WalletError> for RuntimeError {
+    fn from(error: WalletError) -> Self {
+        Self::Wallet(Box::new(error))
+    }
+}
+
+impl From<SignerError> for RuntimeError {
+    fn from(error: SignerError) -> Self {
+        Self::Signer(Box::new(error))
+    }
 }
 
 pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError> {
@@ -212,17 +303,24 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
     let static_dependencies = StaticDependencyRegistry::all_healthy();
     let dependency_registry =
         RuntimeDependencyRegistry::new(static_dependencies.clone(), metrics.clone());
-    update_kvdb_dependency_status(
-        &static_dependencies,
-        &metrics,
-        &retention_repository,
-        &payment_repository,
-        &log_store,
+    let kvdb_readiness = KvdbReadinessResources {
+        dependencies: static_dependencies.clone(),
+        metrics: metrics.clone(),
+        retention_repository: kvdb_retention_repository,
+        payment_repository,
+        log_store: log_store.clone(),
         stream,
-        stream_config.reorg_lookback_blocks,
-        config.kvdb.manual_rebuild_floor_block,
-    )
-    .await?;
+        reorg_lookback_blocks: stream_config.reorg_lookback_blocks,
+        manual_rebuild_floor_block: config.kvdb.manual_rebuild_floor_block,
+    };
+    update_kvdb_dependency_status(&kvdb_readiness).await?;
+    let readiness = RuntimeReadinessResources {
+        kvdb: kvdb_readiness,
+        pool: pool.clone(),
+        rpc_source: rpc_source.clone(),
+        signer: signer.clone(),
+    };
+    refresh_runtime_dependency_status(&readiness).await;
     let _log_ingestor_loop = spawn_transfer_log_ingestor_loop_with_metrics(
         log_store.clone(),
         TransferLogIngestorLoopConfig::new(
@@ -241,16 +339,14 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
         config.kvdb.manual_rebuild_floor_block,
         std::time::Duration::from_millis(TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS),
     ));
-    let _kvdb_readiness_loop = tokio::spawn(kvdb_readiness_loop(
-        static_dependencies.clone(),
-        metrics.clone(),
-        kvdb_retention_repository,
-        payment_repository,
-        log_store.clone(),
-        stream,
-        stream_config.reorg_lookback_blocks,
-        config.kvdb.manual_rebuild_floor_block,
-        std::time::Duration::from_millis(TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS),
+    let _runtime_readiness_loop = tokio::spawn(runtime_readiness_loop(
+        readiness,
+        std::time::Duration::from_millis(RUNTIME_READINESS_POLL_INTERVAL_MS),
+    ));
+    let _order_expiry_loop = tokio::spawn(order_expiry_loop(
+        PgOrderRepository::new(pool.clone()),
+        std::time::Duration::from_millis(ORDER_EXPIRY_POLL_INTERVAL_MS),
+        ORDER_EXPIRY_BATCH_LIMIT,
     ));
     let _payment_scanner_loop = spawn_payment_scanner_loop_with_metrics(
         payment_scanner_worker(&config, pool.clone(), log_store.clone(), rpc_source.clone()),
@@ -315,16 +411,43 @@ fn runtime_seed_config(config: &AppConfig) -> RuntimeSeedConfig {
 }
 
 fn jwt_verifier(config: &AppConfig) -> Result<JwtVerifier, RuntimeError> {
-    let key_id = config
-        .jwt
-        .key_id
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
-    Ok(JwtVerifier::new_hs256(
-        config.jwt.issuer.clone(),
-        config.jwt.audience.clone(),
-        [(key_id, config.jwt.secret.clone())],
-    )?)
+    let issuer = config.jwt.issuer.clone();
+    let audience = config.jwt.audience.clone();
+
+    Ok(match &config.jwt.key_source {
+        JwtKeySource::Hs256 { secret, key_id } => {
+            let key_id = key_id.clone().unwrap_or_else(|| "default".to_string());
+            JwtVerifier::new_hs256(issuer, audience, [(key_id, secret.clone())])?
+        }
+        JwtKeySource::LocalJwks { json } => JwtVerifier::from_jwks_json(issuer, audience, json)?,
+        JwtKeySource::PublicKeyPem {
+            algorithm,
+            key_id,
+            public_key_pem,
+        } => JwtVerifier::new_asymmetric_pem(
+            issuer,
+            audience,
+            key_id.clone(),
+            jwt_algorithm(*algorithm),
+            public_key_pem,
+        )?,
+        JwtKeySource::RemoteJwks { .. } => {
+            return Err(RuntimeError::Config(ConfigError::Validation {
+                errors: vec![
+                    "JWT_JWKS_URL is reserved for remote JWKS fetch; set JWT_JWKS_JSON for now"
+                        .to_string(),
+                ],
+            }));
+        }
+    })
+}
+
+fn jwt_algorithm(algorithm: JwtAlgorithm) -> jsonwebtoken::Algorithm {
+    match algorithm {
+        JwtAlgorithm::Hs256 => jsonwebtoken::Algorithm::HS256,
+        JwtAlgorithm::Rs256 => jsonwebtoken::Algorithm::RS256,
+        JwtAlgorithm::EdDsa => jsonwebtoken::Algorithm::EdDSA,
+    }
 }
 
 fn runtime_signer(config: &AppConfig) -> Result<RuntimeSigner, RuntimeError> {
@@ -385,18 +508,7 @@ fn collection_service<S>(
     pool: PgPool,
     rpc_source: RpcRangeSource,
     signer: S,
-) -> Result<
-    CollectionService<
-        PgOrderRepository,
-        PgCollectionRepository,
-        PgOutboundRepository,
-        PgAuditRepository,
-        S,
-        RpcRangeSource,
-        AssumePrefundedGas,
-    >,
-    RuntimeError,
->
+) -> Result<RuntimeCollectionService<S>, RuntimeError>
 where
     S: SignerProvider,
 {
@@ -407,8 +519,8 @@ where
         PgOutboundRepository::new(pool.clone()),
         PgAuditRepository::new(pool),
         signer,
-        rpc_source,
-        AssumePrefundedGas,
+        rpc_source.clone(),
+        NativeBalanceGasChecker::new(rpc_source),
     )?)
 }
 
@@ -435,17 +547,7 @@ fn payment_scanner_worker(
     pool: PgPool,
     log_store: RedbTransferLogIngestor<RpcRangeSource>,
     rpc_source: RpcRangeSource,
-) -> PaymentScannerWorker<
-    PgPaymentRepository,
-    PaymentMatcher<
-        RedbTransferLogIngestor<RpcRangeSource>,
-        WatchSetPaymentWindowLookup<RepositoryPaymentWindowLookup<PgOrderRepository>>,
-        RpcRangeSource,
-    >,
-    RedbTransferLogIngestor<RpcRangeSource>,
-    RpcRangeSource,
-    SystemClock,
-> {
+) -> RuntimePaymentScannerWorker {
     let stream = StreamId::new(config.chain.chain_id, config.chain.token_address);
     let fallback = RepositoryPaymentWindowLookup::new(
         PgOrderRepository::new(pool.clone()),
@@ -485,41 +587,8 @@ where
     Ok(())
 }
 
-async fn update_kvdb_dependency_status(
-    dependencies: &StaticDependencyRegistry,
-    metrics: &MetricsRecorder,
-    retention_repository: &PgOrderRepository,
-    payment_repository: &PgPaymentRepository,
-    log_store: &RedbTransferLogIngestor<RpcRangeSource>,
-    stream: StreamId,
-    reorg_lookback_blocks: u64,
-    manual_rebuild_floor_block: Option<u64>,
-) -> Result<(), RuntimeError> {
-    let scan_cursor_state = payment_repository
-        .scan_cursor_state(stream.chain_id, stream.token_address)
-        .await?;
-    let retention_floor_block = retention_repository
-        .retention_floor_block(
-            stream.chain_id,
-            stream.token_address,
-            reorg_lookback_blocks,
-            manual_rebuild_floor_block,
-        )
-        .await?;
-    let log_cursor = log_store.cursor(stream).await?;
-    metrics.record_kvdb_state(log_cursor.last_completed_block, retention_floor_block);
-
-    let dependency = kvdb_dependency_check(
-        stream,
-        scan_cursor_state.as_ref(),
-        &log_cursor,
-        retention_floor_block,
-    );
-    dependencies.set_status(dependency);
-    Ok(())
-}
-
-async fn kvdb_readiness_loop(
+#[derive(Clone)]
+struct KvdbReadinessResources {
     dependencies: StaticDependencyRegistry,
     metrics: MetricsRecorder,
     retention_repository: PgOrderRepository,
@@ -528,7 +597,160 @@ async fn kvdb_readiness_loop(
     stream: StreamId,
     reorg_lookback_blocks: u64,
     manual_rebuild_floor_block: Option<u64>,
+}
+
+#[derive(Clone)]
+struct RuntimeReadinessResources<S> {
+    kvdb: KvdbReadinessResources,
+    pool: PgPool,
+    rpc_source: RpcRangeSource,
+    signer: S,
+}
+
+async fn update_kvdb_dependency_status(
+    resources: &KvdbReadinessResources,
+) -> Result<(), RuntimeError> {
+    let stream = resources.stream;
+    let scan_cursor_state = resources
+        .payment_repository
+        .scan_cursor_state(stream.chain_id, stream.token_address)
+        .await?;
+    let retention_floor_block = resources
+        .retention_repository
+        .retention_floor_block(
+            stream.chain_id,
+            stream.token_address,
+            resources.reorg_lookback_blocks,
+            resources.manual_rebuild_floor_block,
+        )
+        .await?;
+    let log_cursor = resources.log_store.cursor(stream).await?;
+    resources
+        .metrics
+        .record_kvdb_state(log_cursor.last_completed_block, retention_floor_block);
+
+    let dependency = kvdb_dependency_check(
+        stream,
+        scan_cursor_state.as_ref(),
+        &log_cursor,
+        retention_floor_block,
+    );
+    resources.dependencies.set_status(dependency);
+    Ok(())
+}
+
+async fn refresh_runtime_dependency_status<S>(resources: &RuntimeReadinessResources<S>)
+where
+    S: SignerProvider,
+{
+    refresh_db_dependency_status(&resources.kvdb.dependencies, &resources.pool).await;
+    refresh_rpc_dependency_status(
+        &resources.kvdb.dependencies,
+        &resources.rpc_source,
+        resources.kvdb.stream,
+    )
+    .await;
+    refresh_signer_dependency_status(&resources.kvdb.dependencies, &resources.signer).await;
+
+    if let Err(error) = update_kvdb_dependency_status(&resources.kvdb).await {
+        tracing::warn!(
+            chain_id = resources.kvdb.stream.chain_id,
+            token_address = %resources.kvdb.stream.token_address,
+            error = %error,
+            "kvdb readiness refresh failed"
+        );
+        resources
+            .kvdb
+            .dependencies
+            .set_status(DependencyCheck::failed(
+                DependencyName::Kvdb,
+                error.to_string(),
+            ));
+    }
+}
+
+async fn refresh_db_dependency_status(dependencies: &StaticDependencyRegistry, pool: &PgPool) {
+    match sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(1) => dependencies.set_status(DependencyCheck::healthy(DependencyName::Db)),
+        Ok(value) => dependencies.set_status(DependencyCheck::failed(
+            DependencyName::Db,
+            format!("database health query returned {value}"),
+        )),
+        Err(error) => dependencies.set_status(DependencyCheck::failed(
+            DependencyName::Db,
+            error.to_string(),
+        )),
+    }
+}
+
+async fn refresh_rpc_dependency_status(
+    dependencies: &StaticDependencyRegistry,
+    rpc_source: &RpcRangeSource,
+    stream: StreamId,
+) {
+    let readiness = match rpc_source.readiness_probe().await {
+        Ok(readiness) => readiness,
+        Err(error) => {
+            dependencies.set_status(DependencyCheck::failed(
+                DependencyName::RpcChainId,
+                error.to_string(),
+            ));
+            return;
+        }
+    };
+
+    let to_block = readiness.latest_head.number;
+    let from_block = to_block.saturating_sub(TRANSFER_LOG_CAPACITY_PROBE_BLOCKS.saturating_sub(1));
+    let range = TransferLogRange::new(stream.chain_id, stream.token_address, from_block, to_block);
+    let limits = TransferLogCapacityLimits {
+        max_logs: TRANSFER_LOG_MAX_LOGS_PER_PAGE,
+        max_logs_per_block: TRANSFER_LOG_MAX_LOGS_PER_PAGE,
+    };
+    match rpc_source.ensure_capacity(range, limits).await {
+        Ok(_) => dependencies.set_status(DependencyCheck::healthy(DependencyName::RpcChainId)),
+        Err(error) => dependencies.set_status(DependencyCheck::failed(
+            DependencyName::RpcChainId,
+            error.to_string(),
+        )),
+    }
+}
+
+async fn refresh_signer_dependency_status<S>(dependencies: &StaticDependencyRegistry, signer: &S)
+where
+    S: SignerProvider,
+{
+    match signer.health_check().await {
+        Ok(()) => dependencies.set_status(DependencyCheck::healthy(DependencyName::Signer)),
+        Err(error) => dependencies.set_status(DependencyCheck::failed(
+            DependencyName::Signer,
+            error.to_string(),
+        )),
+    }
+}
+
+async fn runtime_readiness_loop<S>(
+    resources: RuntimeReadinessResources<S>,
     poll_interval: std::time::Duration,
+) where
+    S: SignerProvider + 'static,
+{
+    let mut interval = tokio::time::interval(poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+
+        refresh_runtime_dependency_status(&resources).await;
+    }
+}
+
+async fn order_expiry_loop(
+    repository: PgOrderRepository,
+    poll_interval: std::time::Duration,
+    batch_limit: u32,
 ) {
     let mut interval = tokio::time::interval(poll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -536,28 +758,14 @@ async fn kvdb_readiness_loop(
     loop {
         interval.tick().await;
 
-        if let Err(error) = update_kvdb_dependency_status(
-            &dependencies,
-            &metrics,
-            &retention_repository,
-            &payment_repository,
-            &log_store,
-            stream,
-            reorg_lookback_blocks,
-            manual_rebuild_floor_block,
-        )
-        .await
-        {
-            tracing::warn!(
-                chain_id = stream.chain_id,
-                token_address = %stream.token_address,
-                error = %error,
-                "kvdb readiness refresh failed"
-            );
-            dependencies.set_status(DependencyCheck::failed(
-                DependencyName::Kvdb,
-                error.to_string(),
-            ));
+        match repository.recompute_expired_open_orders(batch_limit).await {
+            Ok(0) => {}
+            Ok(count) => {
+                tracing::info!(count, "expired open orders recomputed");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "expired open order recompute failed");
+            }
         }
     }
 }
@@ -737,21 +945,33 @@ fn ensure_kvdb_parent(path: &Path) -> Result<(), RuntimeError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use axum::{
         Router,
         extract::{Json, State},
         routing::{get, post},
     };
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
     use serde::Deserialize;
     use serde_json::json;
     use tokio::net::TcpListener;
 
     use super::*;
+    use crate::auth::{Audience, Claims};
     use crate::config::AppConfig;
     use crate::domain::{DerivationSegment, EvmAddress, RawAmount, TxHash};
     use crate::wallet::DeriveAddressRequest;
+
+    const ED_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIGrD/e7uKYqSY4twDEsRfMMuLSrODf14dpTiTK6K1YI0
+-----END PRIVATE KEY-----"#;
+    const ED_PUBLIC_KEY_PEM: &str = r#"-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
+-----END PUBLIC KEY-----"#;
 
     #[test]
     fn transfer_log_stream_config_uses_confirmed_target() {
@@ -799,6 +1019,40 @@ mod tests {
             service_config.fees.max_priority_fee_per_gas,
             RawAmount::from(3_000_000_000)
         );
+    }
+
+    #[test]
+    fn jwt_verifier_uses_development_hs256_source() {
+        let config = test_config(&[]);
+        let verifier = jwt_verifier(&config).expect("jwt verifier");
+        let token = signed_token(
+            Algorithm::HS256,
+            "pay3-key-1",
+            &EncodingKey::from_secret(b"0123456789abcdef0123456789abcdef"),
+        );
+
+        let principal = verifier.verify_token(&token).expect("token should verify");
+
+        assert_eq!(principal.subject, "merchant-default");
+    }
+
+    #[test]
+    fn jwt_verifier_uses_pem_public_key_source() {
+        let config = test_config_owned(vec![
+            ("JWT_PUBLIC_KEY_PEM", ED_PUBLIC_KEY_PEM.to_string()),
+            ("JWT_ALGORITHM", "EdDSA".to_string()),
+            ("JWT_KEY_ID", "ed-key".to_string()),
+        ]);
+        let verifier = jwt_verifier(&config).expect("jwt verifier");
+        let token = signed_token(
+            Algorithm::EdDSA,
+            "ed-key",
+            &EncodingKey::from_ed_pem(ED_PRIVATE_KEY_PEM.as_bytes()).expect("ed key"),
+        );
+
+        let principal = verifier.verify_token(&token).expect("token should verify");
+
+        assert_eq!(principal.subject, "merchant-default");
     }
 
     #[test]
@@ -1097,6 +1351,31 @@ mod tests {
         }
 
         AppConfig::from_pairs(pairs).expect("test config should parse")
+    }
+
+    fn signed_token(alg: Algorithm, kid: &str, key: &EncodingKey) -> String {
+        let mut header = Header::new(alg);
+        header.kid = Some(kid.to_string());
+        encode(&header, &default_claims(), key).expect("token should encode")
+    }
+
+    fn default_claims() -> Claims {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        Claims {
+            exp: now + 3600,
+            nbf: now.saturating_sub(1),
+            iat: now.saturating_sub(1),
+            iss: "pay3".to_string(),
+            aud: Audience::One("pay3-api".to_string()),
+            sub: "merchant-default".to_string(),
+            scope: None,
+            scopes: None,
+            scp: None,
+        }
     }
 
     #[test]

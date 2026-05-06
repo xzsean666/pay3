@@ -23,6 +23,10 @@ fn order_repository_uses_external_id_lock_and_idempotency() {
         "retention_floor_block",
         "MIN(pw.window_from_block)",
         "monitor_until >= now()",
+        "recompute_expired_open_orders",
+        "expires_at <= now()",
+        "status IN ('pending', 'partial')",
+        "recompute_orders_in_tx",
     ] {
         assert!(ORDERS_REPOSITORY.contains(fragment), "missing {fragment}");
     }

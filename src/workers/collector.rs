@@ -100,13 +100,31 @@ pub enum CollectionCollectorError {
     },
 
     #[error(transparent)]
-    CollectionService(#[from] CollectionServiceError),
+    CollectionService(Box<CollectionServiceError>),
 
     #[error(transparent)]
-    Repository(#[from] RepositoryError),
+    Repository(Box<RepositoryError>),
 
     #[error(transparent)]
-    Chain(#[from] ChainError),
+    Chain(Box<ChainError>),
+}
+
+impl From<CollectionServiceError> for CollectionCollectorError {
+    fn from(error: CollectionServiceError) -> Self {
+        Self::CollectionService(Box::new(error))
+    }
+}
+
+impl From<RepositoryError> for CollectionCollectorError {
+    fn from(error: RepositoryError) -> Self {
+        Self::Repository(Box::new(error))
+    }
+}
+
+impl From<ChainError> for CollectionCollectorError {
+    fn from(error: ChainError) -> Self {
+        Self::Chain(Box::new(error))
+    }
 }
 
 #[async_trait]
@@ -262,7 +280,7 @@ where
 
         self.broadcast_outbound(BroadcastableOutboundTx {
             collection_id: collection.id,
-            outbound,
+            outbound: *outbound,
         })
         .await
     }
@@ -326,7 +344,7 @@ where
                     } => {
                         self.broadcast_outbound(BroadcastableOutboundTx {
                             collection_id: collection.id,
-                            outbound,
+                            outbound: *outbound,
                         })
                         .await
                     }
@@ -1146,9 +1164,9 @@ mod tests {
 
     fn prepared_outcome(outbound: OutboundTxRecord) -> PrepareCollectionJobOutcome {
         PrepareCollectionJobOutcome::Prepared {
-            collection: collection_record(Some(outbound.id)),
-            outbound,
-            signed_tx: signed_tx(),
+            collection: Box::new(collection_record(Some(outbound.id))),
+            outbound: Box::new(outbound),
+            signed_tx: Box::new(signed_tx()),
         }
     }
 

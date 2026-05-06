@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use jsonwebtoken::errors::ErrorKind;
+use jsonwebtoken::jwk::{JwkSet, KeyAlgorithm};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 
@@ -82,11 +83,52 @@ impl Principal {
 pub struct JwtVerifier {
     issuer: String,
     audience: String,
-    keys: HashMap<String, DecodingKey>,
+    keys: HashMap<String, VerificationKey>,
     leeway_seconds: u64,
 }
 
+struct VerificationKey {
+    algorithm: Algorithm,
+    key: DecodingKey,
+}
+
 impl JwtVerifier {
+    pub fn new<I, K>(
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+        keys: I,
+    ) -> Result<Self, AuthError>
+    where
+        I: IntoIterator<Item = (K, Algorithm, DecodingKey)>,
+        K: Into<String>,
+    {
+        let mut verification_keys = HashMap::new();
+
+        for (kid, algorithm, key) in keys {
+            let kid = kid.into();
+            if kid.trim().is_empty() {
+                return Err(AuthError::MissingKeyId);
+            }
+            if verification_keys
+                .insert(kid.clone(), VerificationKey { algorithm, key })
+                .is_some()
+            {
+                return Err(AuthError::DuplicateKeyId(kid));
+            }
+        }
+
+        if verification_keys.is_empty() {
+            return Err(AuthError::MissingKeyId);
+        }
+
+        Ok(Self {
+            issuer: issuer.into(),
+            audience: audience.into(),
+            keys: verification_keys,
+            leeway_seconds: 0,
+        })
+    }
+
     pub fn new_hs256<I, K, S>(
         issuer: impl Into<String>,
         audience: impl Into<String>,
@@ -97,26 +139,61 @@ impl JwtVerifier {
         K: Into<String>,
         S: AsRef<str>,
     {
-        let keys = keys
-            .into_iter()
-            .map(|(kid, secret)| {
+        Self::new(
+            issuer,
+            audience,
+            keys.into_iter().map(|(kid, secret)| {
                 (
-                    kid.into(),
+                    kid,
+                    Algorithm::HS256,
                     DecodingKey::from_secret(secret.as_ref().as_bytes()),
                 )
-            })
-            .collect::<HashMap<_, _>>();
+            }),
+        )
+    }
 
-        if keys.is_empty() {
-            return Err(AuthError::MissingKeyId);
+    pub fn new_asymmetric_pem(
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+        kid: impl Into<String>,
+        algorithm: Algorithm,
+        public_key_pem: impl AsRef<str>,
+    ) -> Result<Self, AuthError> {
+        let key = match algorithm {
+            Algorithm::RS256 => DecodingKey::from_rsa_pem(public_key_pem.as_ref().as_bytes()),
+            Algorithm::EdDSA => DecodingKey::from_ed_pem(public_key_pem.as_ref().as_bytes()),
+            _ => return Err(AuthError::UnsupportedAlgorithm),
         }
+        .map_err(|_| AuthError::InvalidKey)?;
 
-        Ok(Self {
-            issuer: issuer.into(),
-            audience: audience.into(),
-            keys,
-            leeway_seconds: 0,
-        })
+        Self::new(issuer, audience, [(kid, algorithm, key)])
+    }
+
+    pub fn from_jwks_json(
+        issuer: impl Into<String>,
+        audience: impl Into<String>,
+        jwks_json: impl AsRef<str>,
+    ) -> Result<Self, AuthError> {
+        let jwks = serde_json::from_str::<JwkSet>(jwks_json.as_ref())
+            .map_err(|_| AuthError::InvalidJwks)?;
+        let keys = jwks
+            .keys
+            .iter()
+            .map(|jwk| {
+                let kid = jwk
+                    .common
+                    .key_id
+                    .as_deref()
+                    .filter(|kid| !kid.trim().is_empty())
+                    .ok_or(AuthError::MissingKeyId)?;
+                let algorithm = jwk_algorithm(jwk.common.key_algorithm)?;
+                let key = DecodingKey::from_jwk(jwk).map_err(|_| AuthError::InvalidKey)?;
+
+                Ok((kid.to_owned(), algorithm, key))
+            })
+            .collect::<Result<Vec<_>, AuthError>>()?;
+
+        Self::new(issuer, audience, keys)
     }
 
     pub fn with_leeway_seconds(mut self, leeway_seconds: u64) -> Self {
@@ -142,14 +219,13 @@ impl JwtVerifier {
     pub fn verify_token(&self, token: &str) -> Result<Principal, AuthError> {
         let header = decode_header(token).map_err(|_| AuthError::InvalidToken)?;
 
-        if header.alg != Algorithm::HS256 {
+        let kid = header.kid.ok_or(AuthError::MissingKeyId)?;
+        let key = self.keys.get(&kid).ok_or(AuthError::UnknownKeyId)?;
+        if header.alg != key.algorithm {
             return Err(AuthError::UnsupportedAlgorithm);
         }
 
-        let kid = header.kid.ok_or(AuthError::MissingKeyId)?;
-        let key = self.keys.get(&kid).ok_or(AuthError::UnknownKeyId)?;
-
-        let claims = decode::<Claims>(token, key, &self.validation())
+        let claims = decode::<Claims>(token, &key.key, &self.validation(key.algorithm))
             .map_err(map_jwt_error)?
             .claims;
 
@@ -176,8 +252,8 @@ impl JwtVerifier {
         Ok(principal)
     }
 
-    fn validation(&self) -> Validation {
-        let mut validation = Validation::new(Algorithm::HS256);
+    fn validation(&self, algorithm: Algorithm) -> Validation {
+        let mut validation = Validation::new(algorithm);
         validation.leeway = self.leeway_seconds;
         validation.validate_exp = true;
         validation.validate_nbf = true;
@@ -210,6 +286,14 @@ impl JwtVerifier {
         }
 
         Ok(())
+    }
+}
+
+fn jwk_algorithm(algorithm: Option<KeyAlgorithm>) -> Result<Algorithm, AuthError> {
+    match algorithm {
+        Some(KeyAlgorithm::RS256) => Ok(Algorithm::RS256),
+        Some(KeyAlgorithm::EdDSA) => Ok(Algorithm::EdDSA),
+        _ => Err(AuthError::UnsupportedAlgorithm),
     }
 }
 
@@ -268,6 +352,41 @@ mod tests {
     const AUDIENCE: &str = "pay3-api";
     const KID: &str = "test-key";
     const SECRET: &str = "test-secret-with-enough-entropy";
+    const RSA_KID: &str = "rsa-key";
+    const ED_KID: &str = "ed-key";
+    const RSA_PRIVATE_KEY_PEM: &str = r#"-----BEGIN RSA PRIVATE KEY-----
+MIIEpAIBAAKCAQEAyRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTL
+UTv4l4sggh5/CYYi/cvI+SXVT9kPWSKXxJXBXd/4LkvcPuUakBoAkfh+eiFVMh2V
+rUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8H
+oGfG/AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBI
+Mc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi+yUod+j8MtvIj812dkS4QMiRVN/
+by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQIDAQABAoIBAHREk0I0O9DvECKd
+WUpAmF3mY7oY9PNQiu44Yaf+AoSuyRpRUGTMIgc3u3eivOE8ALX0BmYUO5JtuRNZ
+Dpvt4SAwqCnVUinIf6C+eH/wSurCpapSM0BAHp4aOA7igptyOMgMPYBHNA1e9A7j
+E0dCxKWMl3DSWNyjQTk4zeRGEAEfbNjHrq6YCtjHSZSLmWiG80hnfnYos9hOr5Jn
+LnyS7ZmFE/5P3XVrxLc/tQ5zum0R4cbrgzHiQP5RgfxGJaEi7XcgherCCOgurJSS
+bYH29Gz8u5fFbS+Yg8s+OiCss3cs1rSgJ9/eHZuzGEdUZVARH6hVMjSuwvqVTFaE
+8AgtleECgYEA+uLMn4kNqHlJS2A5uAnCkj90ZxEtNm3E8hAxUrhssktY5XSOAPBl
+xyf5RuRGIImGtUVIr4HuJSa5TX48n3Vdt9MYCprO/iYl6moNRSPt5qowIIOJmIjY
+2mqPDfDt/zw+fcDD3lmCJrFlzcnh0uea1CohxEbQnL3cypeLt+WbU6kCgYEAzSp1
+9m1ajieFkqgoB0YTpt/OroDx38vvI5unInJlEeOjQ+oIAQdN2wpxBvTrRorMU6P0
+7mFUbt1j+Co6CbNiw+X8HcCaqYLR5clbJOOWNR36PuzOpQLkfK8woupBxzW9B8gZ
+mY8rB1mbJ+/WTPrEJy6YGmIEBkWylQ2VpW8O4O0CgYEApdbvvfFBlwD9YxbrcGz7
+MeNCFbMz+MucqQntIKoKJ91ImPxvtc0y6e/Rhnv0oyNlaUOwJVu0yNgNG117w0g4
+t/+Q38mvVC5xV7/cn7x9UMFk6MkqVir3dYGEqIl/OP1grY2Tq9HtB5iyG9L8NIam
+QOLMyUqqMUILxdthHyFmiGkCgYEAn9+PjpjGMPHxL0gj8Q8VbzsFtou6b1deIRRA
+2CHmSltltR1gYVTMwXxQeUhPMmgkMqUXzs4/WijgpthY44hK1TaZEKIuoxrS70nJ
+4WQLf5a9k1065fDsFZD6yGjdGxvwEmlGMZgTwqV7t1I4X0Ilqhav5hcs5apYL7gn
+PYPeRz0CgYALHCj/Ji8XSsDoF/MhVhnGdIs2P99NNdmo3R2Pv0CuZbDKMU559LJH
+UvrKS8WkuWRDuKrz1W/EQKApFjDGpdqToZqriUFQzwy7mR3ayIiogzNtHcvbDHx8
+oFnGY0OFksX/ye0/XGpy2SFxYRwGU98HPYeBvAQQrVjdkzfy7BmXQQ==
+-----END RSA PRIVATE KEY-----"#;
+    const ED_PRIVATE_KEY_PEM: &str = r#"-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIGrD/e7uKYqSY4twDEsRfMMuLSrODf14dpTiTK6K1YI0
+-----END PRIVATE KEY-----"#;
+    const ED_PUBLIC_KEY_PEM: &str = r#"-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
+-----END PUBLIC KEY-----"#;
 
     #[test]
     fn valid_token_builds_principal() {
@@ -490,6 +609,67 @@ mod tests {
         assert_eq!(err, AuthError::UnsupportedAlgorithm);
     }
 
+    #[test]
+    fn rs256_jwks_token_verifies() {
+        let verifier =
+            JwtVerifier::from_jwks_json(ISSUER, AUDIENCE, rsa_jwks_json()).expect("jwks verifier");
+        let token = signed_asymmetric_token(
+            default_claims(),
+            RSA_KID,
+            Algorithm::RS256,
+            EncodingKey::from_rsa_pem(RSA_PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
+        );
+
+        let principal = verifier.verify_token(&token).expect("token should verify");
+
+        assert_eq!(principal.subject, "merchant-default");
+    }
+
+    #[test]
+    fn eddsa_pem_token_verifies() {
+        let verifier = JwtVerifier::new_asymmetric_pem(
+            ISSUER,
+            AUDIENCE,
+            ED_KID,
+            Algorithm::EdDSA,
+            ED_PUBLIC_KEY_PEM,
+        )
+        .expect("eddsa verifier");
+        let token = signed_asymmetric_token(
+            default_claims(),
+            ED_KID,
+            Algorithm::EdDSA,
+            EncodingKey::from_ed_pem(ED_PRIVATE_KEY_PEM.as_bytes()).expect("ed key"),
+        );
+
+        let principal = verifier.verify_token(&token).expect("token should verify");
+
+        assert_eq!(principal.subject, "merchant-default");
+    }
+
+    #[test]
+    fn asymmetric_wrong_kid_and_alg_are_rejected() {
+        let verifier =
+            JwtVerifier::from_jwks_json(ISSUER, AUDIENCE, rsa_jwks_json()).expect("jwks verifier");
+
+        let wrong_kid = signed_asymmetric_token(
+            default_claims(),
+            "unknown-rsa-key",
+            Algorithm::RS256,
+            EncodingKey::from_rsa_pem(RSA_PRIVATE_KEY_PEM.as_bytes()).expect("rsa key"),
+        );
+        assert_eq!(
+            verifier.verify_token(&wrong_kid),
+            Err(AuthError::UnknownKeyId)
+        );
+
+        let wrong_alg = signed_token(default_claims(), RSA_KID, Algorithm::HS256, SECRET);
+        assert_eq!(
+            verifier.verify_token(&wrong_alg),
+            Err(AuthError::UnsupportedAlgorithm)
+        );
+    }
+
     fn verifier() -> JwtVerifier {
         JwtVerifier::new_hs256(ISSUER, AUDIENCE, [(KID, SECRET)]).expect("verifier")
     }
@@ -524,5 +704,33 @@ mod tests {
             &EncodingKey::from_secret(secret.as_bytes()),
         )
         .expect("token should encode")
+    }
+
+    fn signed_asymmetric_token(
+        claims: Claims,
+        kid: &str,
+        alg: Algorithm,
+        key: EncodingKey,
+    ) -> String {
+        let mut header = Header::new(alg);
+        header.kid = Some(kid.to_owned());
+        encode(&header, &claims, &key).expect("token should encode")
+    }
+
+    fn rsa_jwks_json() -> String {
+        format!(
+            r#"{{
+                "keys": [
+                    {{
+                        "kty": "RSA",
+                        "n": "yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ",
+                        "e": "AQAB",
+                        "kid": "{RSA_KID}",
+                        "alg": "RS256",
+                        "use": "sig"
+                    }}
+                ]
+            }}"#
+        )
     }
 }

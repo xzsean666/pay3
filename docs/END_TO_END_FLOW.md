@@ -333,4 +333,4 @@ KVDB 保存：
 
 ## 10. 当前实现状态
 
-当前仓库仍是文档阶段，没有 Rust 代码、migration、worker、测试和部署工件，所以不能用于真实资金。MVP 实现必须按本文跑通全流程，并通过 `docs/PRODUCTION_READINESS.md`、`docs/DEPLOYMENT.md`、`docs/RUNBOOK.md` 的验收。
+当前仓库已经进入 Rust 实现阶段，并具备 migration、runtime worker 初版、Docker/Compose dry-run、真实 PostgreSQL 集成测试和 Anvil+mock ERC20 e2e。它仍不能用于真实资金；production signer 服务、远程 JWKS 拉取、告警 dry-run、备份恢复/runbook 演练和 collect finality/reorg 完整复测必须通过 `docs/PRODUCTION_READINESS.md`、`docs/DEPLOYMENT.md`、`docs/RUNBOOK.md` 的验收后才可评估生产候选。

@@ -48,13 +48,16 @@ use payments::{PaymentMatcher, PaymentMatchingConfig, PaymentRejectionReason, Re
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
+type LogReaderCall = (Option<LogPageToken>, usize);
+type LookupCall = (u64, EvmAddress, Vec<EvmAddress>);
+
 #[derive(Clone, Debug)]
 struct FakeLogReader {
     stream: StreamId,
     logs: Arc<Vec<StoredTransferLog>>,
     complete_to_block: Option<u64>,
     reorg_epoch: u64,
-    calls: Arc<Mutex<Vec<(Option<LogPageToken>, usize)>>>,
+    calls: Arc<Mutex<Vec<LogReaderCall>>>,
 }
 
 impl FakeLogReader {
@@ -68,7 +71,7 @@ impl FakeLogReader {
         }
     }
 
-    fn calls(&self) -> Vec<(Option<LogPageToken>, usize)> {
+    fn calls(&self) -> Vec<LogReaderCall> {
         self.calls
             .lock()
             .expect("reader calls lock poisoned")
@@ -144,7 +147,7 @@ impl TransferLogReader for FakeLogReader {
 #[derive(Clone, Debug, Default)]
 struct FakeWindowLookup {
     candidates: Arc<Mutex<Vec<PaymentWindowCandidate>>>,
-    calls: Arc<Mutex<Vec<(u64, EvmAddress, Vec<EvmAddress>)>>>,
+    calls: Arc<Mutex<Vec<LookupCall>>>,
 }
 
 impl FakeWindowLookup {
@@ -155,7 +158,7 @@ impl FakeWindowLookup {
         }
     }
 
-    fn calls(&self) -> Vec<(u64, EvmAddress, Vec<EvmAddress>)> {
+    fn calls(&self) -> Vec<LookupCall> {
         self.calls
             .lock()
             .expect("lookup calls lock poisoned")

@@ -11,7 +11,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    chain::{ChainError, Erc20ChainClient},
+    chain::{ChainError, Erc20ChainClient, NativeBalanceReader},
     db::repositories::{
         AuditEventInput, AuditRepository, CollectionJob, CollectionRecord, CollectionRecordStatus,
         CollectionRepository, CreateCollectionCommand, NewSignedOutboundTx, OrderRepository,
@@ -172,9 +172,9 @@ pub struct CreateCollectionResult {
 pub enum PrepareCollectionJobOutcome {
     NoJob,
     Prepared {
-        collection: CollectionRecord,
-        outbound: OutboundTxRecord,
-        signed_tx: SignedTx,
+        collection: Box<CollectionRecord>,
+        outbound: Box<OutboundTxRecord>,
+        signed_tx: Box<SignedTx>,
     },
 }
 
@@ -211,6 +211,45 @@ pub struct AssumePrefundedGas;
 #[async_trait]
 impl PrefundedGasChecker for AssumePrefundedGas {
     async fn ensure_prefunded_gas(&self, _check: PrefundedGasCheck) -> Result<(), GasFundingError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeBalanceGasChecker<C> {
+    chain: C,
+}
+
+impl<C> NativeBalanceGasChecker<C> {
+    pub const fn new(chain: C) -> Self {
+        Self { chain }
+    }
+}
+
+#[async_trait]
+impl<C> PrefundedGasChecker for NativeBalanceGasChecker<C>
+where
+    C: NativeBalanceReader,
+{
+    async fn ensure_prefunded_gas(&self, check: PrefundedGasCheck) -> Result<(), GasFundingError> {
+        let required = required_native_gas(check)?;
+        let balance = self
+            .chain
+            .native_balance(check.chain_id, check.from_address)
+            .await
+            .map_err(|error| GasFundingError::Unavailable {
+                chain_id: check.chain_id,
+                address: check.from_address,
+                message: error.to_string(),
+            })?;
+
+        if balance < required {
+            return Err(GasFundingError::Insufficient {
+                chain_id: check.chain_id,
+                address: check.from_address,
+            });
+        }
+
         Ok(())
     }
 }
@@ -272,19 +311,49 @@ pub enum CollectionServiceError {
     ReplacementAmountUnavailable { collection_id: Uuid },
 
     #[error(transparent)]
-    Repository(#[from] RepositoryError),
+    Repository(Box<RepositoryError>),
 
     #[error(transparent)]
-    Chain(#[from] ChainError),
+    Chain(Box<ChainError>),
 
     #[error(transparent)]
-    Signer(#[from] SignerError),
+    Signer(Box<SignerError>),
 
     #[error(transparent)]
-    GasFunding(#[from] GasFundingError),
+    GasFunding(Box<GasFundingError>),
 
     #[error("canonical request serialization failed: {0}")]
-    Serialization(#[from] serde_json::Error),
+    Serialization(Box<serde_json::Error>),
+}
+
+impl From<RepositoryError> for CollectionServiceError {
+    fn from(error: RepositoryError) -> Self {
+        Self::Repository(Box::new(error))
+    }
+}
+
+impl From<ChainError> for CollectionServiceError {
+    fn from(error: ChainError) -> Self {
+        Self::Chain(Box::new(error))
+    }
+}
+
+impl From<SignerError> for CollectionServiceError {
+    fn from(error: SignerError) -> Self {
+        Self::Signer(Box::new(error))
+    }
+}
+
+impl From<GasFundingError> for CollectionServiceError {
+    fn from(error: GasFundingError) -> Self {
+        Self::GasFunding(Box::new(error))
+    }
+}
+
+impl From<serde_json::Error> for CollectionServiceError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Serialization(Box::new(error))
+    }
 }
 
 impl CollectionServiceError {
@@ -309,6 +378,7 @@ pub struct CollectionService<O, C, B, A, S, H, G, I = RandomIdGenerator> {
 }
 
 impl<O, C, B, A, S, H, G> CollectionService<O, C, B, A, S, H, G, RandomIdGenerator> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: CollectionServiceConfig,
         orders: O,
@@ -524,9 +594,9 @@ where
         .await?;
 
         Ok(PrepareCollectionJobOutcome::Prepared {
-            collection,
-            outbound,
-            signed_tx: signed,
+            collection: Box::new(collection),
+            outbound: Box::new(outbound),
+            signed_tx: Box::new(signed),
         })
     }
 
@@ -700,9 +770,9 @@ where
         .await?;
 
         Ok(PrepareCollectionJobOutcome::Prepared {
-            collection,
-            outbound,
-            signed_tx: signed,
+            collection: Box::new(collection),
+            outbound: Box::new(outbound),
+            signed_tx: Box::new(signed),
         })
     }
 
@@ -900,6 +970,19 @@ fn bump_raw_amount(amount: RawAmount) -> Result<RawAmount, CollectionServiceErro
     Ok(RawAmount::new(bumped))
 }
 
+fn required_native_gas(check: PrefundedGasCheck) -> Result<RawAmount, GasFundingError> {
+    check
+        .max_fee_per_gas
+        .value()
+        .checked_mul(U256::from(check.gas_limit))
+        .map(RawAmount::new)
+        .ok_or_else(|| GasFundingError::Unavailable {
+            chain_id: check.chain_id,
+            address: check.from_address,
+            message: "required native gas overflows uint256".to_string(),
+        })
+}
+
 fn signed_invariant(message: impl Into<String>) -> CollectionServiceError {
     CollectionServiceError::SignedTxInvariant {
         message: message.into(),
@@ -920,7 +1003,7 @@ mod tests {
     use super::*;
     use crate::{
         chain::{
-            ChainBlock, ChainHeaderReader, TransactionStatus, TransferLog,
+            ChainBlock, ChainHeaderReader, FakeErc20ChainClient, TransactionStatus, TransferLog,
             TransferLogCapacityLimits, TransferLogCapacityReport, TransferLogRange,
             TransferLogSource, TxReceipt,
         },
@@ -1121,11 +1204,37 @@ mod tests {
 
         assert!(matches!(
             error,
-            CollectionServiceError::GasFunding(GasFundingError::Insufficient { .. })
+            CollectionServiceError::GasFunding(error)
+                if matches!(error.as_ref(), GasFundingError::Insufficient { .. })
         ));
         assert!(service.outbound.reserved().is_empty());
         assert!(service.signer.signed_requests().is_empty());
         assert!(service.collections.attached().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_balance_gas_checker_requires_max_fee_budget() {
+        let chain = FakeErc20ChainClient::new(1)
+            .set_native_balance(child_address(), RawAmount::from(2_099_999));
+        let checker = NativeBalanceGasChecker::new(chain.clone());
+        let check = PrefundedGasCheck {
+            chain_id: 1,
+            from_address: child_address(),
+            gas_limit: 21_000,
+            max_fee_per_gas: RawAmount::from(100),
+            max_priority_fee_per_gas: RawAmount::from(2),
+        };
+
+        assert!(matches!(
+            checker.ensure_prefunded_gas(check).await,
+            Err(GasFundingError::Insufficient { .. })
+        ));
+
+        chain.set_native_balance(child_address(), RawAmount::from(2_100_000));
+        checker
+            .ensure_prefunded_gas(check)
+            .await
+            .expect("exact native gas budget should pass");
     }
 
     #[tokio::test]

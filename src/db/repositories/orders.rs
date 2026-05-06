@@ -12,6 +12,7 @@ use crate::domain::{
 
 use super::{
     error::RepositoryError,
+    payment_recompute::recompute_orders_in_tx,
     types::{
         ChildAccountRecord, CreateOrderCommand, OrderRecord, OrderView, PaymentWindowCandidate,
         PaymentWindowRecord,
@@ -124,6 +125,11 @@ pub trait PaymentWindowCandidateRepository: Send + Sync {
     ) -> Result<Vec<PaymentWindowCandidate>, RepositoryError>;
 }
 
+#[async_trait]
+pub trait ExpiredOrderRepository: Send + Sync {
+    async fn recompute_expired_open_orders(&self, limit: u32) -> Result<usize, RepositoryError>;
+}
+
 #[derive(Clone, Debug)]
 pub struct PgOrderRepository {
     pub pool: PgPool,
@@ -195,6 +201,41 @@ impl PgOrderRepository {
 impl From<PgPool> for PgOrderRepository {
     fn from(pool: PgPool) -> Self {
         Self::new(pool)
+    }
+}
+
+#[async_trait]
+impl ExpiredOrderRepository for PgOrderRepository {
+    async fn recompute_expired_open_orders(&self, limit: u32) -> Result<usize, RepositoryError> {
+        if limit == 0 {
+            return Ok(0);
+        }
+
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let rows = sqlx::query(
+            r#"
+            SELECT id
+            FROM orders
+            WHERE status IN ('pending', 'partial')
+              AND expires_at <= now()
+            ORDER BY expires_at, id
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
+        let order_ids = rows
+            .iter()
+            .map(|row| row.try_get("id").map_err(db_error))
+            .collect::<Result<BTreeSet<Uuid>, RepositoryError>>()?;
+        let count = order_ids.len();
+        recompute_orders_in_tx(&mut tx, order_ids).await?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(count)
     }
 }
 

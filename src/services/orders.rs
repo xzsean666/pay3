@@ -775,10 +775,11 @@ mod tests {
 
     impl FakeOrderRepository {
         fn new(allocations: Vec<AllocatedDerivation>) -> Self {
-            let mut state = FakeOrderRepositoryState::default();
-            state.allocations = VecDeque::from(allocations);
             Self {
-                state: std::sync::Arc::new(Mutex::new(state)),
+                state: std::sync::Arc::new(Mutex::new(FakeOrderRepositoryState {
+                    allocations: VecDeque::from(allocations),
+                    ..FakeOrderRepositoryState::default()
+                })),
             }
         }
 

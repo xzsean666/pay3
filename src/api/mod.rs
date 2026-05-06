@@ -1,7 +1,11 @@
 pub mod verify;
 mod verify_service;
 
-use std::{sync::Arc, time::Instant};
+use std::{
+    env,
+    sync::{Arc, Mutex},
+    time::{Duration as StdDuration, Instant},
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -51,6 +55,7 @@ struct ApiState {
     order_verify: Option<Arc<dyn verify::OrderVerifyApiService>>,
     collections: Option<Arc<dyn CollectionApiService>>,
     order_response_config: Option<OrderResponseConfig>,
+    rate_limiter: Option<Arc<FixedWindowRateLimiter>>,
 }
 
 impl ApiState {
@@ -67,6 +72,7 @@ impl ApiState {
             order_verify: None,
             collections: None,
             order_response_config: None,
+            rate_limiter: FixedWindowRateLimiter::from_env().map(Arc::new),
         }
     }
 
@@ -106,6 +112,12 @@ impl ApiState {
         self
     }
 
+    #[cfg(test)]
+    fn with_rate_limit_per_minute(mut self, limit: Option<u32>) -> Self {
+        self.rate_limiter = limit.map(FixedWindowRateLimiter::per_minute).map(Arc::new);
+        self
+    }
+
     fn auth(&self) -> Result<&JwtVerifier, ApiError> {
         self.auth
             .as_deref()
@@ -140,6 +152,61 @@ impl ApiState {
                 "collections service is not configured",
             )
         })
+    }
+}
+
+#[derive(Debug)]
+struct FixedWindowRateLimiter {
+    limit_per_minute: u32,
+    state: Mutex<FixedWindowState>,
+}
+
+#[derive(Debug)]
+struct FixedWindowState {
+    window_started_at: Instant,
+    used: u32,
+}
+
+impl FixedWindowRateLimiter {
+    fn per_minute(limit_per_minute: u32) -> Self {
+        Self {
+            limit_per_minute,
+            state: Mutex::new(FixedWindowState {
+                window_started_at: Instant::now(),
+                used: 0,
+            }),
+        }
+    }
+
+    fn from_env() -> Option<Self> {
+        let value = env::var("API_RATE_LIMIT_PER_MINUTE")
+            .ok()
+            .or_else(|| env::var("PAY3_API_RATE_LIMIT_PER_MINUTE").ok())?;
+        let limit = value.trim().parse::<u32>().ok()?;
+        (limit > 0).then(|| Self::per_minute(limit))
+    }
+
+    fn allow(&self) -> bool {
+        if self.limit_per_minute == 0 {
+            return false;
+        }
+
+        let mut state = self.state.lock().expect("api rate limiter mutex poisoned");
+        if state.window_started_at.elapsed() >= StdDuration::from_secs(60) {
+            state.window_started_at = Instant::now();
+            state.used = 0;
+        }
+
+        if state.used >= self.limit_per_minute {
+            return false;
+        }
+
+        state.used = state.used.saturating_add(1);
+        true
+    }
+
+    fn limit_per_minute(&self) -> u32 {
+        self.limit_per_minute
     }
 }
 
@@ -396,6 +463,10 @@ fn router_from_state(state: ApiState) -> Router {
     router
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            enforce_api_rate_limit,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             record_request_latency,
         ))
         .with_state(state)
@@ -575,7 +646,7 @@ async fn create_collection(
     let order_id = parse_order_id(&payload.order_id)?;
     let amount = parse_collection_amount(&payload.amount)?;
     let audit = AuditContext {
-        request_id: None,
+        request_id: request_id_from_headers(&headers),
         principal_sub: Some(principal.subject),
         scopes: principal
             .scopes
@@ -723,11 +794,15 @@ fn collection_service_error_to_api(error: CollectionServiceError) -> ApiError {
         CollectionServiceError::InvalidArgument { field, message } => {
             ApiError::bad_request("invalid_collection", format!("{field}: {message}"))
         }
-        CollectionServiceError::OrderNotFound { .. }
-        | CollectionServiceError::Repository(RepositoryError::NotFound { .. }) => {
+        CollectionServiceError::OrderNotFound { .. } => ApiError::not_found("order not found"),
+        CollectionServiceError::Repository(error)
+            if matches!(error.as_ref(), RepositoryError::NotFound { .. }) =>
+        {
             ApiError::not_found("order not found")
         }
-        CollectionServiceError::Repository(RepositoryError::IdempotencyConflict { .. }) => {
+        CollectionServiceError::Repository(error)
+            if matches!(error.as_ref(), RepositoryError::IdempotencyConflict { .. }) =>
+        {
             ApiError::conflict("idempotency_conflict", message)
         }
         CollectionServiceError::OrderNotCollectable { .. }
@@ -747,6 +822,15 @@ fn collection_service_error_to_api(error: CollectionServiceError) -> ApiError {
 
 fn json_rejection(rejection: JsonRejection) -> ApiError {
     ApiError::bad_request("invalid_json", rejection.to_string())
+}
+
+fn request_id_from_headers(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 pub(super) fn parse_order_id(value: &str) -> Result<Uuid, ApiError> {
@@ -772,6 +856,32 @@ async fn record_request_latency(
     response
 }
 
+async fn enforce_api_rate_limit(
+    State(state): State<ApiState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path().to_string();
+    if !path.starts_with("/v1/") {
+        return next.run(request).await;
+    }
+
+    let Some(limiter) = &state.rate_limiter else {
+        return next.run(request).await;
+    };
+
+    if limiter.allow() {
+        return next.run(request).await;
+    }
+
+    let mut error = ApiError::too_many_requests("rate_limited", "API rate limit exceeded")
+        .with_detail("limit_per_minute", u64::from(limiter.limit_per_minute()));
+    if let Some(request_id) = request_id_from_headers(request.headers()) {
+        error = error.with_request_id(request_id);
+    }
+    error.into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -792,8 +902,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        CollectionApiService, OrderApiService, OrderResponseConfig, router_with_collection_service,
-        router_with_order_service, router_with_registry,
+        ApiState, CollectionApiService, OrderApiService, OrderResponseConfig, router_from_state,
+        router_with_collection_service, router_with_order_service, router_with_registry,
     };
     use crate::{
         auth::{
@@ -911,7 +1021,53 @@ mod tests {
         assert_eq!(response.status, StatusCode::NOT_FOUND);
         assert_eq!(response.body["error"]["code"], "not_found");
         assert_eq!(response.body["error"]["message"], "route not found");
-        assert!(response.body["error"].get("request_id").is_none());
+        assert!(response.body["error"]["request_id"].as_str().is_some());
+        assert_eq!(response.body["error"]["retryable"], false);
+        assert_eq!(response.body["error"]["details"], json!({}));
+    }
+
+    #[tokio::test]
+    async fn rate_limit_returns_429_for_v1_routes() {
+        let service = Arc::new(FakeOrderApiService::with_order(order_view(
+            Uuid::from_u128(3),
+            "merchant-order-3",
+            RawAmount::from(1_000_000),
+        )));
+        let state = ApiState::new(Arc::new(StaticDependencyRegistry::all_healthy()))
+            .with_orders(
+                Arc::new(verifier()),
+                service,
+                OrderResponseConfig {
+                    token_decimals: 6,
+                    token_symbol: "USDT".to_string(),
+                },
+            )
+            .with_rate_limit_per_minute(Some(1));
+        let app = router_from_state(state);
+
+        let first = request_json_with_app(
+            app.clone(),
+            Method::GET,
+            "/v1/orders/00000000-0000-0000-0000-000000000003",
+            Value::Null,
+            Some(token(ORDERS_READ_SCOPE)),
+        )
+        .await;
+        assert_eq!(first.status, StatusCode::OK);
+
+        let second = request_json_with_app(
+            app,
+            Method::GET,
+            "/v1/orders/00000000-0000-0000-0000-000000000003",
+            Value::Null,
+            Some(token(ORDERS_READ_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(second.status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(second.body["error"]["code"], "rate_limited");
+        assert_eq!(second.body["error"]["retryable"], true);
+        assert_eq!(second.body["error"]["details"]["limit_per_minute"], 1);
     }
 
     #[tokio::test]
@@ -1157,9 +1313,57 @@ mod tests {
             calls.create_inputs[0].audit.principal_sub.as_deref(),
             Some("merchant-1")
         );
+        assert_eq!(calls.create_inputs[0].audit.request_id, None);
         assert_eq!(
             calls.create_inputs[0].audit.scopes,
             vec![COLLECTIONS_CREATE_SCOPE]
+        );
+    }
+
+    #[tokio::test]
+    async fn post_collections_passes_request_id_to_audit_context() {
+        let record = collection_record(
+            Uuid::from_u128(11),
+            Uuid::from_u128(10),
+            CollectionRecordStatus::Queued,
+        );
+        let service = Arc::new(FakeCollectionApiService::with_create(
+            CreateCollectionResult {
+                outcome: CreateCollectionOutcome::Created,
+                collection: record,
+            },
+        ));
+        let app = collections_app(service.clone());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/v1/collections")
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", token(COLLECTIONS_CREATE_SCOPE)),
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-request-id", "req-collection-1")
+                    .body(Body::from(
+                        serde_json::to_vec(&json!({
+                            "order_id": Uuid::from_u128(10).to_string(),
+                            "amount": "max",
+                            "idempotency_key": "collect-1"
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            service.calls.lock().unwrap().create_inputs[0]
+                .audit
+                .request_id,
+            Some("req-collection-1".to_string())
         );
     }
 

@@ -21,6 +21,12 @@ pub enum AuthError {
     UnknownKeyId,
     #[error("unsupported jwt algorithm")]
     UnsupportedAlgorithm,
+    #[error("invalid jwt key")]
+    InvalidKey,
+    #[error("invalid jwt jwks")]
+    InvalidJwks,
+    #[error("duplicate jwt key id: {0}")]
+    DuplicateKeyId(String),
     #[error("invalid token")]
     InvalidToken,
     #[error("token expired")]

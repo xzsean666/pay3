@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    ChainBlock, ChainError, ChainHeaderReader, Erc20ChainClient, TransactionStatus, TransferLog,
-    TransferLogCapacityLimits, TransferLogCapacityReport, TransferLogRange, TransferLogSource,
-    TxReceipt,
+    ChainBlock, ChainError, ChainHeaderReader, Erc20ChainClient, NativeBalanceReader,
+    TransactionStatus, TransferLog, TransferLogCapacityLimits, TransferLogCapacityReport,
+    TransferLogRange, TransferLogSource, TxReceipt,
 };
 use crate::domain::{BlockHash, ChainBlockRef, EvmAddress, RawAmount, TxHash};
 
@@ -521,10 +521,10 @@ impl TransferLogSource for RpcRangeSource {
             })?;
             if header.hash != parsed.block_hash {
                 return Err(ChainError::ProviderHashMismatch {
-                    context: format!("eth_getLogs block {}", parsed.block_number),
-                    left_provider: provider_id.clone(),
+                    context: format!("eth_getLogs block {}", parsed.block_number).into(),
+                    left_provider: provider_id.clone().into(),
                     left_hash: parsed.block_hash,
-                    right_provider: "header_quorum".to_string(),
+                    right_provider: "header_quorum".into(),
                     right_hash: header.hash,
                 });
             }
@@ -561,6 +561,31 @@ impl TransferLogSource for RpcRangeSource {
             max_logs_in_single_block: block_counts.values().copied().max().unwrap_or_default(),
             limits,
         })
+    }
+}
+
+#[async_trait]
+impl NativeBalanceReader for RpcRangeSource {
+    async fn native_balance(
+        &self,
+        chain_id: u64,
+        owner: EvmAddress,
+    ) -> Result<RawAmount, ChainError> {
+        if chain_id != self.manager.expected_chain_id() {
+            return Err(ChainError::ChainIdMismatch {
+                expected: chain_id,
+                actual: self.manager.expected_chain_id(),
+            });
+        }
+
+        let ProviderValue { value, .. } = self
+            .manager
+            .request_first_success("eth_getBalance", json!([owner.to_string(), "latest"]))
+            .await?;
+        let value = value.as_str().ok_or_else(|| {
+            ChainError::malformed_rpc_response("eth_getBalance result must be a hex string")
+        })?;
+        parse_hex_u256(value, "eth_getBalance result").map(RawAmount::new)
     }
 }
 
@@ -640,10 +665,10 @@ fn ensure_consistent_block_hashes(
         if let Some(existing) = hashes.get(&block.block.number) {
             if existing.block.hash != block.block.hash {
                 return Err(ChainError::ProviderHashMismatch {
-                    context: context.to_string(),
-                    left_provider: existing.provider_id.clone(),
+                    context: context.into(),
+                    left_provider: existing.provider_id.clone().into(),
                     left_hash: existing.block.hash,
-                    right_provider: block.provider_id.clone(),
+                    right_provider: block.provider_id.clone().into(),
                     right_hash: block.block.hash,
                 });
             }
@@ -1067,6 +1092,7 @@ mod tests {
         let tx = tx_hash(7);
         let p1 = Arc::new(
             FakeRpcProvider::new("provider-1", 1)
+                .with_native_balance(1_000_000)
                 .with_balance(99)
                 .with_receipt(receipt_json(tx, 10, 0xaa, "0x1", 21_000))
                 .with_broadcast(tx_hash(8)),
@@ -1074,6 +1100,10 @@ mod tests {
         let p2 = Arc::new(FakeRpcProvider::new("provider-2", 1));
         let source = source(vec![p1, p2]);
 
+        assert_eq!(
+            source.native_balance(1, owner).await.unwrap(),
+            RawAmount::from(1_000_000)
+        );
         assert_eq!(
             source.token_balance(token, owner).await.unwrap(),
             RawAmount::from(99)
@@ -1107,6 +1137,7 @@ mod tests {
         chain_id: u64,
         blocks: BTreeMap<u64, ChainBlock>,
         logs: Vec<Value>,
+        native_balance: Option<Value>,
         balance: Option<Value>,
         receipt: Option<Value>,
         broadcast: Option<Value>,
@@ -1121,6 +1152,7 @@ mod tests {
                 chain_id,
                 blocks: BTreeMap::new(),
                 logs: Vec::new(),
+                native_balance: None,
                 balance: None,
                 receipt: None,
                 broadcast: None,
@@ -1141,6 +1173,11 @@ mod tests {
 
         fn with_balance(mut self, balance: u64) -> Self {
             self.balance = Some(Value::String(uint256_hex(balance)));
+            self
+        }
+
+        fn with_native_balance(mut self, balance: u64) -> Self {
+            self.native_balance = Some(Value::String(uint256_hex(balance)));
             self
         }
 
@@ -1200,6 +1237,10 @@ mod tests {
                     Ok(block.map(block_json).unwrap_or(Value::Null))
                 }
                 "eth_getLogs" => Ok(Value::Array(self.logs.clone())),
+                "eth_getBalance" => Ok(self
+                    .native_balance
+                    .clone()
+                    .unwrap_or_else(|| Value::String("0x0".to_string()))),
                 "eth_call" => Ok(self
                     .balance
                     .clone()

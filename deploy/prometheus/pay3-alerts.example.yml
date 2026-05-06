@@ -1,0 +1,29 @@
+groups:
+  - name: pay3-dry-run
+    rules:
+      - alert: Pay3NotReady
+        expr: pay3_readyz_status == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: Pay3 readiness is failing
+          description: "Check /readyz for DB, KVDB, RPC, signer, and worker dependency details."
+
+      - alert: Pay3DependencyUnhealthy
+        expr: pay3_readyz_dependency_status == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pay3 dependency {{ $labels.dependency }} is unhealthy"
+          description: "Dry-run alert sample only; tune thresholds and routing before production."
+
+      - alert: Pay3WorkerTickFailures
+        expr: increase(pay3_worker_ticks_total{result="error"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pay3 worker {{ $labels.worker }} reported tick failures"
+          description: "Inspect structured logs and runbook before allowing cursor or collection progress."

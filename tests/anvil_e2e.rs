@@ -59,7 +59,7 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
     let anvil = AnvilHarness::start().await?;
     let chain_id = anvil.chain_id();
     let rpc_url = anvil.rpc_url().to_string();
-    let rpc_source = RpcRangeSource::from_http_urls(chain_id, &[rpc_url.clone()], 1)?;
+    let rpc_source = RpcRangeSource::from_http_urls(chain_id, std::slice::from_ref(&rpc_url), 1)?;
 
     let child_address = anvil.derive_address(CHILD_PATH).await?;
     let deployer_address = anvil.derive_address(DEPLOYER_PATH).await?;
@@ -312,7 +312,7 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
             .await?
             .expect("collection must be readable after confirmation");
         assert_eq!(final_collection.status, CollectionRecordStatus::Confirmed);
-        assert_eq!(final_collection.outbound_tx_id.is_some(), true);
+        assert!(final_collection.outbound_tx_id.is_some());
 
         let outbound_tx_id = final_collection
             .outbound_tx_id
@@ -348,7 +348,7 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
     let anvil = AnvilHarness::start().await?;
     let chain_id = anvil.chain_id();
     let rpc_url = anvil.rpc_url().to_string();
-    let rpc_source = RpcRangeSource::from_http_urls(chain_id, &[rpc_url.clone()], 1)?;
+    let rpc_source = RpcRangeSource::from_http_urls(chain_id, std::slice::from_ref(&rpc_url), 1)?;
 
     let child_address = anvil.derive_address(CHILD_PATH).await?;
     let deployer_address = anvil.derive_address(DEPLOYER_PATH).await?;

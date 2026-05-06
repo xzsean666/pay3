@@ -85,8 +85,55 @@ pub struct KvdbConfig {
 pub struct JwtConfig {
     pub issuer: String,
     pub audience: String,
-    pub secret: String,
     pub key_id: Option<String>,
+    pub key_source: JwtKeySource,
+    pub legacy_secret_present: bool,
+    pub jwks_url: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum JwtKeySource {
+    Hs256 {
+        secret: String,
+        key_id: Option<String>,
+    },
+    LocalJwks {
+        json: String,
+    },
+    PublicKeyPem {
+        algorithm: JwtAlgorithm,
+        key_id: String,
+        public_key_pem: String,
+    },
+    RemoteJwks {
+        url: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JwtAlgorithm {
+    Hs256,
+    Rs256,
+    EdDsa,
+}
+
+impl JwtAlgorithm {
+    fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value.trim() {
+            "HS256" => Ok(Self::Hs256),
+            "RS256" => Ok(Self::Rs256),
+            "EdDSA" | "EDDSA" => Ok(Self::EdDsa),
+            _ => Err(ConfigError::invalid(
+                "JWT_ALGORITHM",
+                value,
+                "expected one of HS256, RS256, EdDSA",
+            )),
+        }
+    }
+
+    fn is_asymmetric(&self) -> bool {
+        matches!(self, Self::Rs256 | Self::EdDsa)
+    }
 }
 
 impl fmt::Debug for JwtConfig {
@@ -94,9 +141,20 @@ impl fmt::Debug for JwtConfig {
         f.debug_struct("JwtConfig")
             .field("issuer", &self.issuer)
             .field("audience", &self.audience)
-            .field("secret", &"<redacted>")
             .field("key_id", &self.key_id)
+            .field("key_source", &redacted_jwt_key_source(&self.key_source))
+            .field("legacy_secret_present", &self.legacy_secret_present)
+            .field("jwks_url", &self.jwks_url)
             .finish()
+    }
+}
+
+fn redacted_jwt_key_source(key_source: &JwtKeySource) -> &'static str {
+    match key_source {
+        JwtKeySource::Hs256 { .. } => "hs256",
+        JwtKeySource::LocalJwks { .. } => "local_jwks",
+        JwtKeySource::PublicKeyPem { .. } => "public_key_pem",
+        JwtKeySource::RemoteJwks { .. } => "remote_jwks",
     }
 }
 
@@ -281,8 +339,10 @@ impl AppConfig {
             jwt: JwtConfig {
                 issuer: values.required(&["JWT_ISSUER"])?,
                 audience: values.required(&["JWT_AUDIENCE"])?,
-                secret: values.required(&["JWT_SECRET"])?,
                 key_id: values.optional_owned(&["JWT_KEY_ID", "JWT_KID"]),
+                key_source: parse_jwt_key_source(&values)?,
+                legacy_secret_present: values.optional(&["JWT_SECRET"]).is_some(),
+                jwks_url: values.optional_owned(&["JWT_JWKS_URL"]),
             },
             chain: ChainConfig {
                 chain_id: parse_required_u64(&values, &["CHAIN_ID"])?,
@@ -400,19 +460,39 @@ impl AppConfig {
             );
         }
 
-        if self
-            .jwt
-            .key_id
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-        {
-            errors.push("production profile requires JWT_KEY_ID".to_string());
+        if self.jwt.legacy_secret_present {
+            errors.push(
+                "production profile forbids JWT_SECRET; configure JWT_JWKS_JSON or JWT_PUBLIC_KEY_PEM"
+                    .to_string(),
+            );
         }
 
-        if is_weak_jwt_secret(&self.jwt.secret) {
-            errors.push("production profile requires a strong JWT_SECRET".to_string());
+        match &self.jwt.key_source {
+            JwtKeySource::Hs256 { .. } => {
+                errors.push(
+                    "production profile forbids HS256; configure RS256 or EdDSA public keys"
+                        .to_string(),
+                );
+            }
+            JwtKeySource::LocalJwks { json } => {
+                errors.extend(validate_production_jwks_json(json));
+            }
+            JwtKeySource::PublicKeyPem {
+                algorithm, key_id, ..
+            } => {
+                if !algorithm.is_asymmetric() {
+                    errors.push("production JWT public key requires RS256 or EdDSA".to_string());
+                }
+                if key_id.trim().is_empty() {
+                    errors.push("production JWT public key requires JWT_KEY_ID".to_string());
+                }
+            }
+            JwtKeySource::RemoteJwks { .. } => {
+                errors.push(
+                    "JWT_JWKS_URL is reserved for remote JWKS fetch; set JWT_JWKS_JSON for now"
+                        .to_string(),
+                );
+            }
         }
 
         if errors.is_empty() {
@@ -583,41 +663,115 @@ fn parse_optional_bool(
     }
 }
 
-fn is_weak_jwt_secret(secret: &str) -> bool {
-    let trimmed = secret.trim();
-    if trimmed.len() < 32 {
-        return true;
+fn parse_jwt_key_source(values: &EnvPairs) -> Result<JwtKeySource, ConfigError> {
+    if let Some(json) = values.optional(&["JWT_JWKS_JSON", "JWT_LOCAL_JWKS_JSON"]) {
+        return Ok(JwtKeySource::LocalJwks {
+            json: json.to_owned(),
+        });
     }
 
-    let lower = trimmed.to_ascii_lowercase();
-    let placeholder = matches!(
-        lower.as_str(),
-        "secret"
-            | "jwt_secret"
-            | "jwt-secret"
-            | "password"
-            | "changeme"
-            | "change-me"
-            | "please-change-me"
-            | "development"
-            | "production"
-            | "test"
-            | "local"
-    ) || lower.contains("changeme")
-        || lower.contains("please-change");
+    if let Some(public_key_pem) = values.optional(&["JWT_PUBLIC_KEY_PEM", "JWT_PUBLIC_KEY"]) {
+        let algorithm = JwtAlgorithm::parse(values.required_ref(&["JWT_ALGORITHM", "JWT_ALG"])?)?;
+        if !algorithm.is_asymmetric() {
+            return Err(ConfigError::invalid(
+                "JWT_ALGORITHM",
+                values
+                    .optional(&["JWT_ALGORITHM", "JWT_ALG"])
+                    .unwrap_or_default(),
+                "PEM public keys require RS256 or EdDSA",
+            ));
+        }
 
-    placeholder
-        || trimmed
-            .chars()
-            .all(|ch| ch == trimmed.chars().next().unwrap_or_default())
+        let key_id = values.required(&["JWT_KEY_ID", "JWT_KID"])?;
+        if key_id.trim().is_empty() {
+            return Err(ConfigError::invalid(
+                "JWT_KEY_ID",
+                key_id,
+                "PEM public keys require a non-empty key id",
+            ));
+        }
+
+        return Ok(JwtKeySource::PublicKeyPem {
+            algorithm,
+            key_id,
+            public_key_pem: public_key_pem.to_owned(),
+        });
+    }
+
+    if let Some(url) = values.optional(&["JWT_JWKS_URL"]) {
+        return Ok(JwtKeySource::RemoteJwks {
+            url: url.to_owned(),
+        });
+    }
+
+    let secret = values.required(&["JWT_SECRET"])?;
+    Ok(JwtKeySource::Hs256 {
+        secret,
+        key_id: values.optional_owned(&["JWT_KEY_ID", "JWT_KID"]),
+    })
+}
+
+fn validate_production_jwks_json(json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return vec!["production JWT_JWKS_JSON must be valid JWKS JSON".to_string()];
+    };
+
+    let Some(keys) = value.get("keys").and_then(serde_json::Value::as_array) else {
+        return vec!["production JWT_JWKS_JSON must contain a keys array".to_string()];
+    };
+    if keys.is_empty() {
+        return vec!["production JWT_JWKS_JSON must contain at least one key".to_string()];
+    }
+
+    let mut errors = Vec::new();
+    let mut key_ids = BTreeSet::new();
+
+    for key in keys {
+        let kid = key
+            .get("kid")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if kid.is_empty() {
+            errors.push("production JWT_JWKS_JSON keys require kid".to_string());
+        } else if !key_ids.insert(kid.to_string()) {
+            errors.push(format!("production JWT_JWKS_JSON has duplicate kid {kid}"));
+        }
+
+        let alg = key
+            .get("alg")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let kty = key
+            .get("kty")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        match (alg, kty) {
+            ("RS256", "RSA") | ("EdDSA", "OKP") => {}
+            ("RS256", _) => {
+                errors.push("production JWT_JWKS_JSON RS256 keys require kty=RSA".to_string())
+            }
+            ("EdDSA", _) => {
+                errors.push("production JWT_JWKS_JSON EdDSA keys require kty=OKP".to_string())
+            }
+            _ => {
+                errors.push("production JWT_JWKS_JSON keys require alg RS256 or EdDSA".to_string())
+            }
+        }
+    }
+
+    errors
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const RSA_JWKS_JSON: &str = r#"{"keys":[{"kty":"RSA","n":"yRE6rHuNR0QbHO3H3Kt2pOKGVhQqGZXInOduQNxXzuKlvQTLUTv4l4sggh5_CYYi_cvI-SXVT9kPWSKXxJXBXd_4LkvcPuUakBoAkfh-eiFVMh2VrUyWyj3MFl0HTVF9KwRXLAcwkREiS3npThHRyIxuy0ZMeZfxVL5arMhw1SRELB8HoGfG_AtH89BIE9jDBHZ9dLelK9a184zAf8LwoPLxvJb3Il5nncqPcSfKDDodMFBIMc4lQzDKL5gvmiXLXB1AGLm8KBjfE8s3L5xqi-yUod-j8MtvIj812dkS4QMiRVN_by2h3ZY8LYVGrqZXZTcgn2ujn8uKjXLZVD5TdQ","e":"AQAB","kid":"pay3-key-1","alg":"RS256","use":"sig"}]}"#;
+
     fn valid_pairs(profile: &str) -> Vec<(&'static str, String)> {
-        vec![
+        let mut pairs = vec![
             ("APP_PROFILE", profile.to_string()),
             ("APP_BIND", "127.0.0.1:8080".to_string()),
             (
@@ -627,8 +781,6 @@ mod tests {
             ("KVDB_PATH", "./data/pay3.redb".to_string()),
             ("JWT_ISSUER", "pay3".to_string()),
             ("JWT_AUDIENCE", "pay3-api".to_string()),
-            ("JWT_SECRET", "0123456789abcdef0123456789abcdef".to_string()),
-            ("JWT_KEY_ID", "pay3-key-1".to_string()),
             ("CHAIN_ID", "31337".to_string()),
             (
                 "TOKEN_ADDRESS",
@@ -653,7 +805,16 @@ mod tests {
                 "http://localhost:8081".to_string(),
             ),
             ("SIGNER_REMOTE_REQUEST_TIMEOUT_SECS", "15".to_string()),
-        ]
+        ];
+
+        if profile.eq_ignore_ascii_case("production") || profile.eq_ignore_ascii_case("prod") {
+            pairs.push(("JWT_JWKS_JSON", RSA_JWKS_JSON.to_string()));
+        } else {
+            pairs.push(("JWT_SECRET", "0123456789abcdef0123456789abcdef".to_string()));
+            pairs.push(("JWT_KEY_ID", "pay3-key-1".to_string()));
+        }
+
+        pairs
     }
 
     fn config_with(overrides: &[(&'static str, &str)]) -> AppConfig {
@@ -693,6 +854,7 @@ mod tests {
         assert_eq!(config.jwt.issuer, "pay3");
         assert_eq!(config.jwt.audience, "pay3-api");
         assert_eq!(config.jwt.key_id.as_deref(), Some("pay3-key-1"));
+        assert!(matches!(config.jwt.key_source, JwtKeySource::Hs256 { .. }));
         assert_eq!(config.kvdb.manual_rebuild_floor_block, None);
         assert_eq!(config.chain.chain_id, 31337);
         assert_eq!(config.chain.token_decimals, 6);
@@ -821,16 +983,48 @@ mod tests {
     }
 
     #[test]
-    fn production_rejects_weak_jwt_secret() {
+    fn production_allows_eddsa_pem_public_key_with_kid() {
+        let config = config_with(&[
+            ("JWT_JWKS_JSON", ""),
+            (
+                "JWT_PUBLIC_KEY_PEM",
+                "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=\n-----END PUBLIC KEY-----",
+            ),
+            ("JWT_ALGORITHM", "EdDSA"),
+            ("JWT_KEY_ID", "ed-key"),
+        ]);
+
+        assert!(config.validate_profile().is_ok());
+    }
+
+    #[test]
+    fn production_rejects_legacy_jwt_secret_even_with_jwks() {
         let config = config_with(&[("JWT_SECRET", "dev-secret")]);
         let errors = validation_errors(&config);
         assert!(errors.iter().any(|error| error.contains("JWT_SECRET")));
     }
 
     #[test]
-    fn production_rejects_missing_jwt_key_id() {
-        let config = config_with(&[("JWT_KEY_ID", "")]);
+    fn production_rejects_hs256_jwt_source() {
+        let config = config_with(&[
+            ("JWT_JWKS_JSON", ""),
+            ("JWT_SECRET", "0123456789abcdef0123456789abcdef"),
+            ("JWT_KEY_ID", "pay3-key-1"),
+        ]);
         let errors = validation_errors(&config);
-        assert!(errors.iter().any(|error| error.contains("JWT_KEY_ID")));
+        assert!(errors.iter().any(|error| error.contains("HS256")));
+    }
+
+    #[test]
+    fn production_rejects_jwks_without_kid_or_supported_alg() {
+        let config = config_with(&[(
+            "JWT_JWKS_JSON",
+            r#"{"keys":[{"kty":"oct","alg":"HS256","k":"abc"}]}"#,
+        )]);
+
+        let errors = validation_errors(&config);
+
+        assert!(errors.iter().any(|error| error.contains("kid")));
+        assert!(errors.iter().any(|error| error.contains("RS256 or EdDSA")));
     }
 }

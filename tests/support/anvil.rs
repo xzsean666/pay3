@@ -165,14 +165,14 @@ impl AnvilHarness {
                 .send()
                 .await;
 
-            if let Ok(response) = result {
-                if response.status().is_success() {
-                    let payload = response.json::<Value>().await;
-                    if let Ok(payload) = payload {
-                        if payload.get("result").and_then(Value::as_str).is_some() {
-                            return Ok(());
-                        }
-                    }
+            if let Ok(response) = result
+                && response.status().is_success()
+            {
+                let payload = response.json::<Value>().await;
+                if let Ok(payload) = payload
+                    && payload.get("result").and_then(Value::as_str).is_some()
+                {
+                    return Ok(());
                 }
             }
 
@@ -379,6 +379,7 @@ pub async fn deploy_mock_erc20(
         .map_err(|error| helper_error(format!("invalid deployed address {deployed_to}: {error}")))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn send_erc20_transfer(
     rpc_url: &str,
     mnemonic: &str,
@@ -453,6 +454,7 @@ fn decode_erc20_transfer_call(data: &[u8]) -> Result<DecodedTransferCall, AnyErr
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sign_erc20_transfer_with_cast(
     private_key: &str,
     chain_id: u64,

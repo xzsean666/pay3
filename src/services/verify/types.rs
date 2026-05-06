@@ -66,17 +66,47 @@ pub enum ManualVerifyError {
     LogLimitExceeded { order_id: Uuid, limit: usize },
 
     #[error(transparent)]
-    Repository(#[from] RepositoryError),
+    Repository(Box<RepositoryError>),
 
     #[error(transparent)]
-    TransferLogStore(#[from] TransferLogStoreError),
+    TransferLogStore(Box<TransferLogStoreError>),
 
     #[error(transparent)]
-    Chain(#[from] ChainError),
+    Chain(Box<ChainError>),
 
     #[error(transparent)]
-    PaymentMatching(#[from] PaymentMatchingError),
+    PaymentMatching(Box<PaymentMatchingError>),
 
     #[error(transparent)]
-    OrderStatus(#[from] OrderStatusError),
+    OrderStatus(Box<OrderStatusError>),
+}
+
+impl From<RepositoryError> for ManualVerifyError {
+    fn from(error: RepositoryError) -> Self {
+        Self::Repository(Box::new(error))
+    }
+}
+
+impl From<TransferLogStoreError> for ManualVerifyError {
+    fn from(error: TransferLogStoreError) -> Self {
+        Self::TransferLogStore(Box::new(error))
+    }
+}
+
+impl From<ChainError> for ManualVerifyError {
+    fn from(error: ChainError) -> Self {
+        Self::Chain(Box::new(error))
+    }
+}
+
+impl From<PaymentMatchingError> for ManualVerifyError {
+    fn from(error: PaymentMatchingError) -> Self {
+        Self::PaymentMatching(Box::new(error))
+    }
+}
+
+impl From<OrderStatusError> for ManualVerifyError {
+    fn from(error: OrderStatusError) -> Self {
+        Self::OrderStatus(Box::new(error))
+    }
 }

@@ -23,10 +23,12 @@ use std::{
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
+type LookupCall = (u64, EvmAddress, Vec<EvmAddress>);
+
 #[derive(Clone, Debug, Default)]
 struct ContractFallback {
     candidates: BTreeMap<(u64, EvmAddress, EvmAddress), Vec<PaymentWindowCandidate>>,
-    calls: Arc<Mutex<Vec<(u64, EvmAddress, Vec<EvmAddress>)>>>,
+    calls: Arc<Mutex<Vec<LookupCall>>>,
 }
 
 impl ContractFallback {
@@ -41,7 +43,7 @@ impl ContractFallback {
             .push(candidate);
     }
 
-    fn calls(&self) -> Vec<(u64, EvmAddress, Vec<EvmAddress>)> {
+    fn calls(&self) -> Vec<LookupCall> {
         self.calls.lock().expect("calls lock poisoned").clone()
     }
 }

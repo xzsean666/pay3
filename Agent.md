@@ -190,7 +190,7 @@ cache -> domain snapshots only
 
 ## MVP 出口判断
 
-当前项目处于文档规划阶段，没有实现、migration、测试和部署工件，不可用于生产接真实资金。
+当前项目已经进入 Rust 实现阶段，并具备 migration、runtime worker 初版、Docker/Compose dry-run、真实 PostgreSQL 集成测试和 Anvil+mock ERC20 e2e；但 production signer 服务、远程 JWKS 拉取、告警 dry-run、备份恢复/runbook 演练和 collect finality/reorg 完整复测还没有闭环，不可用于生产接真实资金。
 
 MVP 完成并进入生产候选至少需要：
 

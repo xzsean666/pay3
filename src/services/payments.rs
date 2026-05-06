@@ -76,13 +76,31 @@ pub enum PaymentMatchingError {
     UniqueAddressLimitExceeded { actual: usize, max: usize },
 
     #[error(transparent)]
-    TransferLogStore(#[from] TransferLogStoreError),
+    TransferLogStore(Box<TransferLogStoreError>),
 
     #[error(transparent)]
-    Chain(#[from] ChainError),
+    Chain(Box<ChainError>),
 
     #[error(transparent)]
-    PaymentWindowLookup(#[from] PaymentWindowLookupError),
+    PaymentWindowLookup(Box<PaymentWindowLookupError>),
+}
+
+impl From<TransferLogStoreError> for PaymentMatchingError {
+    fn from(error: TransferLogStoreError) -> Self {
+        Self::TransferLogStore(Box::new(error))
+    }
+}
+
+impl From<ChainError> for PaymentMatchingError {
+    fn from(error: ChainError) -> Self {
+        Self::Chain(Box::new(error))
+    }
+}
+
+impl From<PaymentWindowLookupError> for PaymentMatchingError {
+    fn from(error: PaymentWindowLookupError) -> Self {
+        Self::PaymentWindowLookup(Box::new(error))
+    }
 }
 
 pub struct PaymentMatcher<L, W, H> {

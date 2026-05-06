@@ -1,0 +1,14 @@
+.git
+.gitignore
+target
+cache
+out
+data
+tmp
+*.redb
+*.log
+.env
+.env.*
+!.env.example
+Dockerfile
+docker-compose.yml

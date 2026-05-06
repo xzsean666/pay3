@@ -13,7 +13,7 @@ MVP 只做单一默认账号、单一链、单一 ERC20 token。账号体系、�
 
 ## 当前生产可用性结论
 
-当前仓库只有文档，没有 Rust 实现、migration、测试和部署工件，所以不能接真实资金。
+当前仓库已经进入 Rust 实现阶段，并具备 Docker/Compose dry-run、migration、runtime worker 初版、真实 PostgreSQL 集成测试和 Anvil+mock ERC20 e2e。它仍不能接真实资金，因为 production signer 服务、远程 JWKS 拉取、告警 dry-run、备份恢复/runbook 演练和 collect finality/reorg 完整复测还没有闭环。
 
 本文定义的是生产优先 MVP：所有会导致真实资金丢失、误判、不可恢复或不可观测的能力都属于 MVP 出口标准，不再作为“上线前再补”的后续项。MVP 代码完成时必须同时具备：
 

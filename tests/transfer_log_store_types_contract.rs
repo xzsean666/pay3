@@ -85,7 +85,7 @@ fn page_tokens_order_and_serialize_as_exclusive_log_positions() {
 
 #[test]
 fn stored_logs_have_position_ordering_helpers() {
-    let mut logs = vec![stored_log(12, 0), stored_log(10, 8), stored_log(10, 7)];
+    let mut logs = [stored_log(12, 0), stored_log(10, 8), stored_log(10, 7)];
     logs.sort_by(|left, right| left.cmp_position(right));
 
     assert_eq!(
