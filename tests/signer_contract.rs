@@ -18,7 +18,10 @@ use pay3::{
     wallet::{AddressDeriver, DeterministicFakeDeriver},
 };
 use serde::{Deserialize, Serialize};
-use signer::{DeterministicFakeSigner, RemoteHttpSigner, SignerError, SignerProvider, UnsignedTx};
+use signer::{
+    DeterministicFakeSigner, LocalMnemonicSigner, RemoteHttpSigner, SignerError, SignerProvider,
+    UnsignedTx,
+};
 use std::time::Duration;
 use tokio::net::TcpListener;
 
@@ -118,6 +121,101 @@ async fn fake_signer_can_simulate_health_failure_and_recovery() {
 }
 
 #[tokio::test]
+async fn local_mnemonic_signer_derives_and_signs_eip1559_transactions() {
+    let signer = LocalMnemonicSigner::new(
+        TEST_KEY_REF,
+        "test test test test test test test test test test test junk",
+    )
+    .unwrap();
+
+    assert_eq!(signer.key_ref(), TEST_KEY_REF);
+    signer.health_check().await.unwrap();
+
+    let address = signer
+        .derive_address(TEST_KEY_REF, TEST_PATH)
+        .await
+        .unwrap();
+    let next_address = signer
+        .derive_address(TEST_KEY_REF, "m/44'/60'/7'/0/43")
+        .await
+        .unwrap();
+    let signed = signer
+        .sign_transaction(TEST_KEY_REF, TEST_PATH, unsigned_tx(12))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        address.to_lower_hex(),
+        "0x50330afc91b0457036a17efef9da963ce9477a5a"
+    );
+    assert_eq!(
+        next_address.to_lower_hex(),
+        "0xd5d191d7a552e683e26afb2b6d64a5cb88a2aea4"
+    );
+    assert_ne!(address, next_address);
+    assert_eq!(signed.from, address);
+    assert_eq!(signed.raw_tx.first(), Some(&0x02));
+    assert_eq!(signed.tx_hash, hash_raw_tx(&signed.raw_tx));
+    assert_ne!(signed.tx_hash, TxHash::ZERO);
+}
+
+#[tokio::test]
+async fn local_mnemonic_signer_rejects_invalid_inputs() {
+    let signer = LocalMnemonicSigner::new(
+        TEST_KEY_REF,
+        "test test test test test test test test test test test junk",
+    )
+    .unwrap();
+
+    assert!(matches!(
+        signer
+            .derive_address("rotated-key", TEST_PATH)
+            .await
+            .unwrap_err(),
+        SignerError::UnknownSignerKeyRef { key_ref } if key_ref == "rotated-key"
+    ));
+    assert!(matches!(
+        signer
+            .derive_address(TEST_KEY_REF, "m/44'/60'/0'/0")
+            .await
+            .unwrap_err(),
+        SignerError::InvalidDerivationPath { .. }
+    ));
+    let mut empty_request_id_tx = unsigned_tx(12);
+    empty_request_id_tx.request_id.clear();
+    assert!(matches!(
+        signer
+            .sign_transaction(TEST_KEY_REF, TEST_PATH, empty_request_id_tx)
+            .await
+            .unwrap_err(),
+        SignerError::EmptyRequestId
+    ));
+    assert!(matches!(
+        signer
+            .sign_transaction(
+                TEST_KEY_REF,
+                TEST_PATH,
+                unsigned_tx_with_fees(1_500_000_000, 1_500_000_001),
+            )
+            .await
+            .unwrap_err(),
+        SignerError::LocalSigner {
+            operation: "sign_transaction",
+            ..
+        }
+    ));
+
+    let invalid_mnemonic = LocalMnemonicSigner::new(TEST_KEY_REF, "not a valid mnemonic").unwrap();
+    assert!(matches!(
+        invalid_mnemonic.health_check().await.unwrap_err(),
+        SignerError::LocalSigner {
+            operation: "derive_address",
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn remote_http_signer_round_trip_is_deterministic() {
     let signer =
         DeterministicFakeSigner::with_allowed_key_refs(TEST_NAMESPACE, [TEST_KEY_REF]).unwrap();
@@ -212,15 +310,38 @@ async fn remote_http_signer_reports_malformed_json_payloads() {
 }
 
 fn unsigned_tx(nonce: u64) -> UnsignedTx {
-    UnsignedTx::new(
+    unsigned_tx_with_request_id_and_fees(
         format!("collection-job-{nonce}"),
+        nonce,
+        30_000_000_000,
+        1_500_000_000,
+    )
+}
+
+fn unsigned_tx_with_fees(max_fee_per_gas: u64, max_priority_fee_per_gas: u64) -> UnsignedTx {
+    unsigned_tx_with_request_id_and_fees(
+        "collection-job-12",
+        12,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    )
+}
+
+fn unsigned_tx_with_request_id_and_fees(
+    request_id: impl Into<String>,
+    nonce: u64,
+    max_fee_per_gas: u64,
+    max_priority_fee_per_gas: u64,
+) -> UnsignedTx {
+    UnsignedTx::new(
+        request_id,
         1,
         nonce,
         EvmAddress::from_bytes([0x22; 20]),
         RawAmount::ZERO,
         65_000,
-        RawAmount::from(30_000_000_000),
-        RawAmount::from(1_500_000_000),
+        RawAmount::from(max_fee_per_gas),
+        RawAmount::from(max_priority_fee_per_gas),
         erc20_transfer_data(EvmAddress::from_bytes([0x33; 20]), RawAmount::from(1_000)),
     )
     .unwrap()

@@ -13,8 +13,10 @@ use thiserror::Error;
 use crate::domain::{EvmAddress, MAX_DERIVATION_INDEX, RawAmount, TxHash};
 
 mod external;
+mod local;
 
 pub use external::RemoteHttpSigner;
+pub use local::LocalMnemonicSigner;
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum SignerError {
@@ -29,6 +31,9 @@ pub enum SignerError {
 
     #[error("remote signer endpoint must not be empty")]
     EmptyRemoteSignerEndpoint,
+
+    #[error("local signer mnemonic must not be empty")]
+    EmptyLocalSignerMnemonic,
 
     #[error("signer key ref not found: {key_ref}")]
     UnknownSignerKeyRef { key_ref: String },
@@ -59,6 +64,12 @@ pub enum SignerError {
 
     #[error("transaction request id must not be empty")]
     EmptyRequestId,
+
+    #[error("local signer failed during {operation}: {message}")]
+    LocalSigner {
+        operation: &'static str,
+        message: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

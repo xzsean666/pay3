@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::domain::{DerivationSegment, EvmAddress, MAX_DERIVATION_INDEX};
-use crate::signer::{RemoteHttpSigner, SignerError, SignerProvider};
+use crate::signer::{LocalMnemonicSigner, RemoteHttpSigner, SignerError, SignerProvider};
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WalletError {
@@ -120,19 +120,31 @@ impl AddressDeriver for RemoteHttpSigner {
     async fn derive_address(&self, key_ref: &str, path: &str) -> Result<EvmAddress, WalletError> {
         SignerProvider::derive_address(self, key_ref, path)
             .await
-            .map_err(map_remote_signer_error)
+            .map_err(map_signer_error)
     }
 }
 
-fn map_remote_signer_error(error: SignerError) -> WalletError {
+#[async_trait]
+impl AddressDeriver for LocalMnemonicSigner {
+    async fn derive_address(&self, key_ref: &str, path: &str) -> Result<EvmAddress, WalletError> {
+        SignerProvider::derive_address(self, key_ref, path)
+            .await
+            .map_err(map_signer_error)
+    }
+}
+
+fn map_signer_error(error: SignerError) -> WalletError {
     match error {
         SignerError::EmptySignerKeyRef => WalletError::EmptySignerKeyRef,
         SignerError::InvalidDerivationPath { path } => WalletError::InvalidDerivationPath { path },
         SignerError::InvalidFakeNamespace => WalletError::RemoteSignerCallFailed {
-            message: "remote signer reported invalid fake namespace".to_string(),
+            message: "signer reported invalid fake namespace".to_string(),
         },
         SignerError::EmptyRemoteSignerEndpoint => WalletError::RemoteSignerCallFailed {
             message: "remote signer endpoint must not be empty".to_string(),
+        },
+        SignerError::EmptyLocalSignerMnemonic => WalletError::RemoteSignerCallFailed {
+            message: "local signer mnemonic must not be empty".to_string(),
         },
         SignerError::UnknownSignerKeyRef { key_ref } => {
             WalletError::UnknownSignerKeyRef { key_ref }
@@ -156,7 +168,10 @@ fn map_remote_signer_error(error: SignerError) -> WalletError {
             message: format!("{operation} returned invalid json: {message}"),
         },
         SignerError::EmptyRequestId => WalletError::RemoteSignerCallFailed {
-            message: "remote signer rejected empty request id".to_string(),
+            message: "signer rejected empty request id".to_string(),
+        },
+        SignerError::LocalSigner { operation, message } => WalletError::RemoteSignerCallFailed {
+            message: format!("{operation} local signer error: {message}"),
         },
     }
 }

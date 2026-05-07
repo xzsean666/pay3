@@ -11,7 +11,9 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::{
-    chain::{ChainError, Erc20ChainClient, NativeBalanceReader},
+    chain::{
+        ChainError, Eip1559FeeEstimate, Eip1559FeeEstimator, Erc20ChainClient, NativeBalanceReader,
+    },
     db::repositories::{
         AuditEventInput, AuditRepository, CollectionJob, CollectionRecord, CollectionRecordStatus,
         CollectionRepository, CreateCollectionCommand, NewSignedOutboundTx, OrderRepository,
@@ -438,7 +440,7 @@ where
     B: OutboundRepository,
     A: AuditRepository,
     S: SignerProvider,
-    H: Erc20ChainClient,
+    H: Erc20ChainClient + Eip1559FeeEstimator,
     G: PrefundedGasChecker,
     I: IdGenerator,
 {
@@ -523,13 +525,14 @@ where
         };
 
         let amount = self.resolve_collection_amount(&job).await?;
+        let fees = self.current_collection_fees().await?;
         self.gas_checker
             .ensure_prefunded_gas(PrefundedGasCheck {
                 chain_id: job.collection.chain_id,
                 from_address: job.collection.from_address,
-                gas_limit: self.config.fees.gas_limit,
-                max_fee_per_gas: self.config.fees.max_fee_per_gas,
-                max_priority_fee_per_gas: self.config.fees.max_priority_fee_per_gas,
+                gas_limit: fees.gas_limit,
+                max_fee_per_gas: fees.max_fee_per_gas,
+                max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
             })
             .await?;
         self.signer.health_check().await?;
@@ -545,9 +548,9 @@ where
             nonce,
             job.collection.token_address,
             RawAmount::ZERO,
-            self.config.fees.gas_limit,
-            self.config.fees.max_fee_per_gas,
-            self.config.fees.max_priority_fee_per_gas,
+            fees.gas_limit,
+            fees.max_fee_per_gas,
+            fees.max_priority_fee_per_gas,
             erc20_transfer_data(job.collection.to_address, amount),
         )?;
         let signed = self
@@ -669,7 +672,8 @@ where
                     collection_id: collection.id,
                 })?;
         let nonce = raw_amount_to_u64(job.outbound.nonce)?;
-        let bumped_fees = bump_collection_fees(self.config.fees)?;
+        let fees = self.current_collection_fees().await?;
+        let bumped_fees = bump_collection_fees(fees)?;
         let original_plan = CollectionTxPlan::new(
             collection.chain_id,
             nonce,
@@ -677,7 +681,7 @@ where
             collection.to_address,
             amount,
             CollectionPurpose::TreasurySweep,
-            self.config.fees,
+            fees,
         );
         let replacement_plan = CollectionTxPlan {
             fees: bumped_fees,
@@ -801,6 +805,11 @@ where
             });
         }
         Ok(amount)
+    }
+
+    async fn current_collection_fees(&self) -> Result<CollectionFees, CollectionServiceError> {
+        let estimate = self.chain.estimate_eip1559_fees().await?;
+        Ok(collection_fees_from_estimate(self.config.fees, estimate))
     }
 
     async fn append_collection_audit(
@@ -948,6 +957,25 @@ fn ensure_signed_tx_matches_job(
     Ok(())
 }
 
+fn collection_fees_from_estimate(
+    configured: CollectionFees,
+    estimate: Eip1559FeeEstimate,
+) -> CollectionFees {
+    let max_priority_fee_per_gas = configured
+        .max_priority_fee_per_gas
+        .max(estimate.max_priority_fee_per_gas);
+    let max_fee_per_gas = configured
+        .max_fee_per_gas
+        .max(estimate.max_fee_per_gas)
+        .max(max_priority_fee_per_gas);
+
+    CollectionFees::new(
+        configured.gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+    )
+}
+
 fn bump_collection_fees(fees: CollectionFees) -> Result<CollectionFees, CollectionServiceError> {
     Ok(CollectionFees::new(
         fees.gas_limit,
@@ -1088,6 +1116,14 @@ mod tests {
             signed_requests[0].data,
             erc20_transfer_data(treasury(), RawAmount::from(1_000))
         );
+        assert_eq!(
+            signed_requests[0].max_fee_per_gas,
+            config().fees.max_fee_per_gas
+        );
+        assert_eq!(
+            signed_requests[0].max_priority_fee_per_gas,
+            config().fees.max_priority_fee_per_gas
+        );
         assert_eq!(service.outbound.inserted().len(), 1);
         assert_eq!(
             service.collections.attached(),
@@ -1096,6 +1132,33 @@ mod tests {
         assert_eq!(
             service.audit.event_types(),
             vec!["collection.signed".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_next_collection_job_uses_dynamic_fee_estimate_above_config() {
+        let service = service(Fixture {
+            fee_estimate: Eip1559FeeEstimate {
+                max_fee_per_gas: RawAmount::from(70_000_000_000),
+                max_priority_fee_per_gas: RawAmount::from(25_000_000_000),
+            },
+            ..Fixture::default()
+        });
+
+        service
+            .prepare_next_collection_job("collector-1")
+            .await
+            .unwrap();
+
+        let signed_requests = service.signer.signed_requests();
+        assert_eq!(signed_requests.len(), 1);
+        assert_eq!(
+            signed_requests[0].max_fee_per_gas,
+            RawAmount::from(70_000_000_000)
+        );
+        assert_eq!(
+            signed_requests[0].max_priority_fee_per_gas,
+            RawAmount::from(25_000_000_000)
         );
     }
 
@@ -1292,7 +1355,7 @@ mod tests {
             FakeOutboundRepository::default(),
             FakeAuditRepository::default(),
             FakeSigner::default(),
-            FakeChain::new(fixture.token_balance),
+            FakeChain::new(fixture.token_balance, fixture.fee_estimate),
             FakeGasChecker::new(fixture.gas_error),
             FixedIds::new(vec![
                 Uuid::from_u128(100),
@@ -1310,6 +1373,7 @@ mod tests {
         token_balance: RawAmount,
         job_amount: Option<RawAmount>,
         gas_error: Option<GasFundingError>,
+        fee_estimate: Eip1559FeeEstimate,
     }
 
     impl Default for Fixture {
@@ -1319,6 +1383,10 @@ mod tests {
                 token_balance: RawAmount::from(1_000),
                 job_amount: None,
                 gas_error: None,
+                fee_estimate: Eip1559FeeEstimate {
+                    max_fee_per_gas: RawAmount::from(20_000_000_000),
+                    max_priority_fee_per_gas: RawAmount::from(1_000_000_000),
+                },
             }
         }
     }
@@ -1731,11 +1799,15 @@ mod tests {
     #[derive(Clone, Debug)]
     struct FakeChain {
         token_balance: RawAmount,
+        fee_estimate: Eip1559FeeEstimate,
     }
 
     impl FakeChain {
-        fn new(token_balance: RawAmount) -> Self {
-            Self { token_balance }
+        fn new(token_balance: RawAmount, fee_estimate: Eip1559FeeEstimate) -> Self {
+            Self {
+                token_balance,
+                fee_estimate,
+            }
         }
     }
 
@@ -1807,6 +1879,13 @@ mod tests {
 
         async fn broadcast_signed_tx(&self, _signed_tx: Vec<u8>) -> Result<TxHash, ChainError> {
             Ok(tx_hash(0xaa))
+        }
+    }
+
+    #[async_trait]
+    impl Eip1559FeeEstimator for FakeChain {
+        async fn estimate_eip1559_fees(&self) -> Result<Eip1559FeeEstimate, ChainError> {
+            Ok(self.fee_estimate)
         }
     }
 

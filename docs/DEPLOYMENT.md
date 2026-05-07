@@ -19,7 +19,18 @@ DATABASE_URL=postgres://user:pass@db.example:5432/pay3 docker compose up --build
 
 该默认配置要求宿主机 `8545` 已有 chain id `31337` 的 Anvil/local JSON-RPC；否则 runtime 会在 RPC chain id/readiness 校验处失败。只验证服务启动可以先用占位 `TOKEN_ADDRESS`，要跑 ERC20 转账和归集流程必须先部署 mock ERC20 并更新 `TOKEN_ADDRESS`。
 
-`pay3` 必须显式传入 `DATABASE_URL`，可以来自 shell、项目根 `.env` 或 Compose `--env-file`。`.env.example` 里的默认值只配合 `local-db` profile 使用。
+`pay3` 必须显式传入 `DATABASE_URL`，可以来自 shell、项目根 `.env` 或 Compose `--env-file`。`.env.example` 里的默认值只配合 `local-db` profile 使用；本地 Postgres 容器的初始化账号、密码和库名是 `docker-compose.yml` 内部固定的开发值，普通使用不需要再维护拆开的 `POSTGRES_USER`/`POSTGRES_PASSWORD`/`POSTGRES_DB`。
+
+归集交易 fee 默认按当前链 RPC 动态估算，collector 签名前会综合 `eth_feeHistory`、`eth_maxPriorityFeePerGas` 和 `eth_gasPrice`。`COLLECTION_MAX_FEE_PER_GAS_WEI` / `COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI` 只作为可选下限，不需要为不同链硬编码。
+
+Polygon Amoy 这类本地真实链测试可以用 `SIGNER_MODE=local` 直接从 env 读取 `SIGNER_MNEMONIC`，但必须同时设置 `ALLOW_LOCAL_SIGNER=true`。这条路径只用于受控测试环境；mnemonic 会进入进程/容器环境，production profile 会拒绝 local signer 以及任何 mnemonic/private key/xprv 环境变量。
+
+生成新的测试助记词可以直接用脚本：
+
+```bash
+scripts/generate-mnemonic.sh --words 12 --accounts 1
+scripts/generate-mnemonic.sh --write-env --env-file .env
+```
 
 需要本地覆盖配置时，复制 `.env.example` 为 `.env`，然后显式选择 env file：
 

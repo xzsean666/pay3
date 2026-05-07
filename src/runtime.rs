@@ -36,8 +36,8 @@ use crate::{
         verify::{ManualOrderVerifyService, ManualVerifyConfig},
     },
     signer::{
-        DeterministicFakeSigner, RemoteHttpSigner, SignedTx, SignerError, SignerProvider,
-        UnsignedTx,
+        DeterministicFakeSigner, LocalMnemonicSigner, RemoteHttpSigner, SignedTx, SignerError,
+        SignerProvider, UnsignedTx,
     },
     transfer_log_store::{
         LogSourceKind, RedbTransferLogIngestor, ScanTargetMode, StreamId, TransferLogIngestor,
@@ -81,6 +81,7 @@ enum RuntimeSigner {
         deriver: DeterministicFakeDeriver,
         signer: DeterministicFakeSigner,
     },
+    Local(LocalMnemonicSigner),
     Remote(RemoteHttpSigner),
 }
 
@@ -119,6 +120,7 @@ impl AddressDeriver for RuntimeSigner {
             Self::Fake { deriver, .. } => {
                 AddressDeriver::derive_address(deriver, key_ref, path).await
             }
+            Self::Local(signer) => AddressDeriver::derive_address(signer, key_ref, path).await,
             Self::Remote(signer) => AddressDeriver::derive_address(signer, key_ref, path).await,
         }
     }
@@ -135,6 +137,7 @@ impl SignerProvider for RuntimeSigner {
             Self::Fake { signer, .. } => {
                 SignerProvider::derive_address(signer, key_ref, path).await
             }
+            Self::Local(signer) => SignerProvider::derive_address(signer, key_ref, path).await,
             Self::Remote(signer) => SignerProvider::derive_address(signer, key_ref, path).await,
         }
     }
@@ -149,6 +152,9 @@ impl SignerProvider for RuntimeSigner {
             Self::Fake { signer, .. } => {
                 SignerProvider::sign_transaction(signer, key_ref, path, tx).await
             }
+            Self::Local(signer) => {
+                SignerProvider::sign_transaction(signer, key_ref, path, tx).await
+            }
             Self::Remote(signer) => {
                 SignerProvider::sign_transaction(signer, key_ref, path, tx).await
             }
@@ -158,6 +164,7 @@ impl SignerProvider for RuntimeSigner {
     async fn health_check(&self) -> Result<(), SignerError> {
         match self {
             Self::Fake { signer, .. } => SignerProvider::health_check(signer).await,
+            Self::Local(signer) => SignerProvider::health_check(signer).await,
             Self::Remote(signer) => SignerProvider::health_check(signer).await,
         }
     }
@@ -209,9 +216,6 @@ pub enum RuntimeError {
 
     #[error(transparent)]
     Signer(Box<SignerError>),
-
-    #[error("runtime signer mode {mode:?} is not supported; SIGNER_MODE=local remains disabled")]
-    UnsupportedSignerMode { mode: SignerMode },
 }
 
 impl From<ChainError> for RuntimeError {
@@ -466,7 +470,7 @@ fn runtime_signer(config: &AppConfig) -> Result<RuntimeSigner, RuntimeError> {
             let endpoint = config.signer.remote_endpoint.as_deref().ok_or_else(|| {
                 RuntimeError::Config(ConfigError::Validation {
                     errors: vec![
-                        "non-fake signer modes require SIGNER_REMOTE_ENDPOINT".to_string(),
+                        "external/kms/hsm signer modes require SIGNER_REMOTE_ENDPOINT".to_string(),
                     ],
                 })
             })?;
@@ -476,9 +480,24 @@ fn runtime_signer(config: &AppConfig) -> Result<RuntimeSigner, RuntimeError> {
                 config.signer.remote_request_timeout,
             )?))
         }
-        SignerMode::Local => Err(RuntimeError::UnsupportedSignerMode {
-            mode: SignerMode::Local,
-        }),
+        SignerMode::Local => {
+            if !config.signer.allow_local_signer {
+                return Err(RuntimeError::Config(ConfigError::Validation {
+                    errors: vec![
+                        "SIGNER_MODE=local requires explicit ALLOW_LOCAL_SIGNER=true".to_string(),
+                    ],
+                }));
+            }
+            let mnemonic = config.signer.mnemonic.as_deref().ok_or_else(|| {
+                RuntimeError::Config(ConfigError::Validation {
+                    errors: vec!["SIGNER_MODE=local requires SIGNER_MNEMONIC".to_string()],
+                })
+            })?;
+            Ok(RuntimeSigner::Local(LocalMnemonicSigner::new(
+                config.signer.key_ref.clone(),
+                mnemonic,
+            )?))
+        }
     }
 }
 
@@ -1167,24 +1186,54 @@ MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
         handle.abort();
     }
 
-    #[test]
-    fn runtime_signer_rejects_local_mode() {
+    #[tokio::test]
+    async fn runtime_signer_bootstraps_local_mnemonic_mode() {
         let config = test_config_owned(vec![
             ("SIGNER_MODE", "local".to_string()),
+            ("ALLOW_LOCAL_SIGNER", "true".to_string()),
             (
-                "SIGNER_REMOTE_ENDPOINT",
-                "http://localhost:8081".to_string(),
+                "SIGNER_MNEMONIC",
+                "test test test test test test test test test test test junk".to_string(),
             ),
         ]);
 
-        let error = runtime_signer(&config).expect_err("local mode should remain unsupported");
+        let signer = runtime_signer(&config).expect("local signer should bootstrap");
 
-        assert!(matches!(
-            error,
-            RuntimeError::UnsupportedSignerMode {
-                mode: SignerMode::Local
-            }
-        ));
+        assert!(matches!(&signer, RuntimeSigner::Local(_)));
+        ensure_runtime_signer_health(&signer)
+            .await
+            .expect("local signer health check");
+
+        let wallet = HdWallet::new(signer.clone());
+        let request = DeriveAddressRequest::new("pay3-master", 1, DerivationSegment::ZERO).unwrap();
+        let derived = wallet.derive_child_address(request.clone()).await.unwrap();
+        let derived_again = wallet.derive_child_address(request).await.unwrap();
+        assert_eq!(derived.derivation_path, "m/44'/60'/0'/0/0");
+        assert_eq!(derived.address, derived_again.address);
+
+        let unsigned = UnsignedTx::new(
+            "request-1",
+            31337,
+            9,
+            EvmAddress::from_bytes([0x33; 20]),
+            RawAmount::from(1_000u64),
+            80_000,
+            RawAmount::from(50_000_000_000u64),
+            RawAmount::from(2_000_000_000u64),
+            vec![0xaa, 0xbb, 0xcc],
+        )
+        .unwrap();
+        let signed = signer
+            .sign_transaction("pay3-master", &derived.derivation_path, unsigned.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(signed.request_id, unsigned.request_id);
+        assert_eq!(signed.chain_id, unsigned.chain_id);
+        assert_eq!(signed.from, derived.address);
+        assert_eq!(signed.to, unsigned.to);
+        assert_ne!(signed.tx_hash, TxHash::ZERO);
+        assert_eq!(signed.raw_tx.first(), Some(&0x02));
     }
 
     #[derive(Clone)]

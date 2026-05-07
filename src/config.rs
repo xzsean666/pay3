@@ -11,10 +11,21 @@ use std::{
 use crate::domain::{EvmAddress, RawAmount};
 
 const DEFAULT_COLLECTION_GAS_LIMIT: u64 = 80_000;
-const DEFAULT_COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 50_000_000_000;
-const DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 2_000_000_000;
+const DEFAULT_COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 0;
+const DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 0;
 const DEFAULT_COLLECTION_COLLECTOR_REPLACEMENT_STUCK_AFTER_SECS: u64 = 30 * 60;
 const DEFAULT_SIGNER_REMOTE_REQUEST_TIMEOUT_SECS: u64 = 15;
+const LOCAL_SIGNER_SECRET_KEYS: &[&str] = &[
+    "SIGNER_MNEMONIC",
+    "LOCAL_SIGNER_MNEMONIC",
+    "SIGNER_SERVICE_MNEMONIC",
+    "SIGNER_XPRV",
+    "LOCAL_SIGNER_XPRV",
+    "SIGNER_SERVICE_XPRV",
+    "SIGNER_PRIVATE_KEY",
+    "LOCAL_SIGNER_PRIVATE_KEY",
+    "DEPLOYER_PRIVATE_KEY",
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppProfile {
@@ -174,7 +185,9 @@ pub struct ChainConfig {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionConfig {
     pub gas_limit: u64,
+    /// Optional floor. Runtime collection signing estimates current fees from RPC.
     pub max_fee_per_gas_wei: RawAmount,
+    /// Optional floor. Runtime collection signing estimates current fees from RPC.
     pub max_priority_fee_per_gas_wei: RawAmount,
 }
 
@@ -205,12 +218,29 @@ impl Default for CollectorConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SignerConfig {
     pub mode: SignerMode,
     pub key_ref: String,
+    pub mnemonic: Option<String>,
+    pub allow_local_signer: bool,
+    pub secret_material_present: bool,
     pub remote_endpoint: Option<String>,
     pub remote_request_timeout: Duration,
+}
+
+impl fmt::Debug for SignerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignerConfig")
+            .field("mode", &self.mode)
+            .field("key_ref", &self.key_ref)
+            .field("mnemonic", &self.mnemonic.as_ref().map(|_| "<redacted>"))
+            .field("allow_local_signer", &self.allow_local_signer)
+            .field("secret_material_present", &self.secret_material_present)
+            .field("remote_endpoint", &self.remote_endpoint)
+            .field("remote_request_timeout", &self.remote_request_timeout)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,10 +271,6 @@ impl SignerMode {
 
     fn is_local_or_fake(&self) -> bool {
         matches!(self, Self::Local | Self::Fake)
-    }
-
-    fn is_fake(&self) -> bool {
-        matches!(self, Self::Fake)
     }
 }
 
@@ -395,6 +421,13 @@ impl AppConfig {
             signer: SignerConfig {
                 mode: SignerMode::parse(values.required_ref(&["SIGNER_MODE", "SIGNER_PROVIDER"])?)?,
                 key_ref: values.required(&["SIGNER_KEY_REF"])?,
+                mnemonic: values.optional_owned(&[
+                    "SIGNER_MNEMONIC",
+                    "LOCAL_SIGNER_MNEMONIC",
+                    "SIGNER_SERVICE_MNEMONIC",
+                ]),
+                allow_local_signer: parse_optional_bool(&values, &["ALLOW_LOCAL_SIGNER"], false)?,
+                secret_material_present: values.has_any(LOCAL_SIGNER_SECRET_KEYS),
                 remote_endpoint: values.optional_owned(&[
                     "SIGNER_REMOTE_ENDPOINT",
                     "SIGNER_ENDPOINT",
@@ -416,16 +449,46 @@ impl AppConfig {
     pub fn validate_profile(&self) -> Result<(), ConfigError> {
         let mut errors = Vec::new();
 
-        if !self.signer.mode.is_fake()
-            && self
-                .signer
-                .remote_endpoint
-                .as_deref()
-                .map(str::trim)
-                .unwrap_or("")
-                .is_empty()
-        {
-            errors.push("non-fake signer modes require SIGNER_REMOTE_ENDPOINT".to_string());
+        match self.signer.mode {
+            SignerMode::Fake => {}
+            SignerMode::Local => {
+                if !self.signer.allow_local_signer {
+                    errors.push(
+                        "SIGNER_MODE=local requires explicit ALLOW_LOCAL_SIGNER=true".to_string(),
+                    );
+                }
+                if self
+                    .signer
+                    .mnemonic
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    errors.push("SIGNER_MODE=local requires SIGNER_MNEMONIC".to_string());
+                }
+            }
+            SignerMode::External | SignerMode::Kms | SignerMode::Hsm => {
+                if self
+                    .signer
+                    .remote_endpoint
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    errors.push(
+                        "external/kms/hsm signer modes require SIGNER_REMOTE_ENDPOINT".to_string(),
+                    );
+                }
+            }
+        }
+
+        if self.collection.max_priority_fee_per_gas_wei > self.collection.max_fee_per_gas_wei {
+            errors.push(
+                "COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI must be <= COLLECTION_MAX_FEE_PER_GAS_WEI"
+                    .to_string(),
+            );
         }
 
         if !self.profile.is_production() {
@@ -438,6 +501,12 @@ impl AppConfig {
 
         if self.signer.mode.is_local_or_fake() {
             errors.push("production profile requires an external/KMS/HSM signer".to_string());
+        }
+
+        if self.signer.secret_material_present {
+            errors.push(
+                "production profile forbids local signer mnemonic/private key material".to_string(),
+            );
         }
 
         let distinct_rpc_urls = self
@@ -534,6 +603,14 @@ impl EnvPairs {
 
     fn optional_owned(&self, keys: &[&'static str]) -> Option<String> {
         self.optional(keys).map(ToOwned::to_owned)
+    }
+
+    fn has_any(&self, keys: &[&str]) -> bool {
+        keys.iter().any(|key| {
+            self.values
+                .get(*key)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
     }
 
     fn required(&self, keys: &[&'static str]) -> Result<String, ConfigError> {
@@ -866,6 +943,9 @@ mod tests {
         assert_eq!(config.collector, CollectorConfig::default());
         assert_eq!(config.signer.mode, SignerMode::External);
         assert_eq!(config.signer.key_ref, "pay3-master");
+        assert_eq!(config.signer.mnemonic, None);
+        assert!(!config.signer.allow_local_signer);
+        assert!(!config.signer.secret_material_present);
         assert_eq!(
             config.signer.remote_endpoint.as_deref(),
             Some("http://localhost:8081")
@@ -928,16 +1008,99 @@ mod tests {
     }
 
     #[test]
+    fn development_profile_allows_local_signer_with_mnemonic_without_remote_endpoint() {
+        let mut pairs = valid_pairs("development");
+        for (key, value) in &mut pairs {
+            if *key == "SIGNER_MODE" {
+                *value = "local".to_string();
+            } else if *key == "SIGNER_REMOTE_ENDPOINT" {
+                *value = "".to_string();
+            }
+        }
+        pairs.push((
+            "SIGNER_MNEMONIC",
+            "test test test test test test test test test test test junk".to_string(),
+        ));
+        pairs.push(("ALLOW_LOCAL_SIGNER", "true".to_string()));
+
+        let config = AppConfig::from_pairs(pairs).expect("config should parse");
+        assert!(config.validate_profile().is_ok());
+    }
+
+    #[test]
+    fn local_signer_requires_mnemonic_in_any_profile() {
+        let config = config_with(&[
+            ("APP_PROFILE", "development"),
+            ("SIGNER_MODE", "local"),
+            ("ALLOW_LOCAL_SIGNER", "true"),
+            ("SIGNER_MNEMONIC", ""),
+        ]);
+
+        let errors = validation_errors(&config);
+        assert!(errors.iter().any(|error| error.contains("SIGNER_MNEMONIC")));
+    }
+
+    #[test]
+    fn local_signer_requires_explicit_allow_flag() {
+        let config = config_with(&[
+            ("APP_PROFILE", "development"),
+            ("SIGNER_MODE", "local"),
+            (
+                "SIGNER_MNEMONIC",
+                "test test test test test test test test test test test junk",
+            ),
+        ]);
+
+        let errors = validation_errors(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("ALLOW_LOCAL_SIGNER"))
+        );
+    }
+
+    #[test]
     fn production_rejects_fake_or_local_signer() {
         for mode in ["fake", "local"] {
-            let config = config_with(&[("SIGNER_MODE", mode)]);
+            let config = config_with(&[
+                ("SIGNER_MODE", mode),
+                ("ALLOW_LOCAL_SIGNER", "true"),
+                (
+                    "SIGNER_MNEMONIC",
+                    "test test test test test test test test test test test junk",
+                ),
+            ]);
             let errors = validation_errors(&config);
             assert!(errors.iter().any(|error| error.contains("signer")));
         }
     }
 
     #[test]
-    fn non_fake_signer_requires_remote_endpoint_in_any_profile() {
+    fn production_rejects_local_secret_material_even_with_remote_signer() {
+        for key in [
+            "SIGNER_MNEMONIC",
+            "SIGNER_PRIVATE_KEY",
+            "SIGNER_XPRV",
+            "DEPLOYER_PRIVATE_KEY",
+        ] {
+            let config = config_with(&[
+                ("SIGNER_MODE", "external"),
+                ("SIGNER_REMOTE_ENDPOINT", "http://localhost:8081"),
+                (key, "secret-material"),
+            ]);
+
+            let errors = validation_errors(&config);
+            assert!(
+                errors.iter().any(|error| {
+                    error.contains("mnemonic") || error.contains("private key material")
+                }),
+                "expected production to reject {key}, got {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_signer_modes_require_remote_endpoint_in_any_profile() {
         let config = config_with(&[
             ("APP_PROFILE", "development"),
             ("SIGNER_MODE", "external"),
@@ -950,6 +1113,18 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("SIGNER_REMOTE_ENDPOINT"))
         );
+    }
+
+    #[test]
+    fn collection_priority_fee_must_not_exceed_max_fee() {
+        let config = config_with(&[
+            ("APP_PROFILE", "development"),
+            ("COLLECTION_MAX_FEE_PER_GAS_WEI", "100"),
+            ("COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI", "101"),
+        ]);
+
+        let errors = validation_errors(&config);
+        assert!(errors.iter().any(|error| error.contains("PRIORITY_FEE")));
     }
 
     #[test]

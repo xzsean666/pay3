@@ -6,14 +6,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use super::{
-    ChainBlock, ChainError, ChainHeaderReader, Erc20ChainClient, NativeBalanceReader,
-    TransactionStatus, TransferLog, TransferLogCapacityLimits, TransferLogCapacityReport,
-    TransferLogRange, TransferLogSource, TxReceipt,
+    ChainBlock, ChainError, ChainHeaderReader, Eip1559FeeEstimate, Eip1559FeeEstimator,
+    Erc20ChainClient, NativeBalanceReader, TransactionStatus, TransferLog,
+    TransferLogCapacityLimits, TransferLogCapacityReport, TransferLogRange, TransferLogSource,
+    TxReceipt,
 };
 use crate::domain::{BlockHash, ChainBlockRef, EvmAddress, RawAmount, TxHash};
 
 pub const ERC20_TRANSFER_TOPIC: &str =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const FEE_HISTORY_BLOCK_COUNT: u64 = 5;
+const FEE_HISTORY_REWARD_PERCENTILES: [u64; 2] = [50, 90];
 
 pub type SharedJsonRpcProvider = Arc<dyn JsonRpcProvider>;
 
@@ -110,6 +113,10 @@ impl JsonRpcProvider for HttpJsonRpcProvider {
                 self.id, error.code, error.message
             )));
         }
+        if method == "eth_getTransactionReceipt" && payload.result.is_none() {
+            return Ok(Value::Null);
+        }
+
         payload.result.ok_or_else(|| {
             ChainError::malformed_rpc_response(format!(
                 "provider {} omitted result for {method}",
@@ -590,6 +597,56 @@ impl NativeBalanceReader for RpcRangeSource {
 }
 
 #[async_trait]
+impl Eip1559FeeEstimator for RpcRangeSource {
+    async fn estimate_eip1559_fees(&self) -> Result<Eip1559FeeEstimate, ChainError> {
+        let history = self.fee_history_estimate().await.ok();
+        let rpc_priority = self.max_priority_fee_per_gas().await.ok();
+        let gas_price = self.gas_price().await.ok();
+
+        let base_fee = history.and_then(|estimate| estimate.base_fee_per_gas);
+        let mut priority_fee = max_optional_u256(
+            history.and_then(|estimate| estimate.priority_fee_per_gas),
+            rpc_priority,
+        );
+
+        if let (Some(gas_price), Some(base_fee)) = (gas_price, base_fee)
+            && let Some(inferred_priority) = gas_price.checked_sub(base_fee)
+        {
+            priority_fee = max_optional_u256(priority_fee, Some(inferred_priority));
+        }
+
+        if priority_fee.is_none() {
+            priority_fee = gas_price;
+        }
+
+        let priority_fee = priority_fee.ok_or_else(|| {
+            ChainError::rpc_unavailable(
+                "fee estimation failed: eth_feeHistory, eth_maxPriorityFeePerGas, and eth_gasPrice were unavailable",
+            )
+        })?;
+
+        let mut max_fee = priority_fee;
+        if let Some(base_fee) = base_fee {
+            let doubled_base_fee = base_fee.checked_mul(U256::from(2u8)).ok_or_else(|| {
+                ChainError::malformed_rpc_response("estimated base fee overflowed")
+            })?;
+            let eip1559_max_fee = doubled_base_fee.checked_add(priority_fee).ok_or_else(|| {
+                ChainError::malformed_rpc_response("estimated max fee overflowed")
+            })?;
+            max_fee = max_fee.max(eip1559_max_fee);
+        }
+        if let Some(gas_price) = gas_price {
+            max_fee = max_fee.max(gas_price);
+        }
+
+        Ok(Eip1559FeeEstimate {
+            max_fee_per_gas: RawAmount::new(max_fee),
+            max_priority_fee_per_gas: RawAmount::new(priority_fee),
+        })
+    }
+}
+
+#[async_trait]
 impl Erc20ChainClient for RpcRangeSource {
     async fn token_balance(
         &self,
@@ -607,10 +664,15 @@ impl Erc20ChainClient for RpcRangeSource {
     }
 
     async fn transaction_receipt(&self, tx: TxHash) -> Result<Option<TxReceipt>, ChainError> {
-        let ProviderValue { value, .. } = self
+        let ProviderValue { value, .. } = match self
             .manager
             .request_first_success("eth_getTransactionReceipt", json!([tx.to_string()]))
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(error) if is_transient_receipt_lookup_error(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         if value.is_null() {
             return Ok(None);
         }
@@ -627,6 +689,101 @@ impl Erc20ChainClient for RpcRangeSource {
         })?;
         parse_tx_hash(tx, "eth_sendRawTransaction result")
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ParsedFeeHistoryEstimate {
+    base_fee_per_gas: Option<U256>,
+    priority_fee_per_gas: Option<U256>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcFeeHistory {
+    base_fee_per_gas: Vec<String>,
+    reward: Option<Vec<Vec<String>>>,
+}
+
+impl RpcRangeSource {
+    async fn fee_history_estimate(&self) -> Result<ParsedFeeHistoryEstimate, ChainError> {
+        let ProviderValue { value, .. } = self
+            .manager
+            .request_first_success(
+                "eth_feeHistory",
+                json!([
+                    quantity_hex(FEE_HISTORY_BLOCK_COUNT),
+                    "latest",
+                    FEE_HISTORY_REWARD_PERCENTILES
+                ]),
+            )
+            .await?;
+        parse_fee_history_estimate(value)
+    }
+
+    async fn max_priority_fee_per_gas(&self) -> Result<U256, ChainError> {
+        let ProviderValue { value, .. } = self
+            .manager
+            .request_first_success("eth_maxPriorityFeePerGas", json!([]))
+            .await?;
+        let value = value.as_str().ok_or_else(|| {
+            ChainError::malformed_rpc_response(
+                "eth_maxPriorityFeePerGas result must be a hex string",
+            )
+        })?;
+        parse_hex_u256(value, "eth_maxPriorityFeePerGas result")
+    }
+
+    async fn gas_price(&self) -> Result<U256, ChainError> {
+        let ProviderValue { value, .. } = self
+            .manager
+            .request_first_success("eth_gasPrice", json!([]))
+            .await?;
+        let value = value.as_str().ok_or_else(|| {
+            ChainError::malformed_rpc_response("eth_gasPrice result must be a hex string")
+        })?;
+        parse_hex_u256(value, "eth_gasPrice result")
+    }
+}
+
+fn parse_fee_history_estimate(value: Value) -> Result<ParsedFeeHistoryEstimate, ChainError> {
+    let history: RpcFeeHistory = serde_json::from_value(value)
+        .map_err(|error| ChainError::malformed_rpc_response(error.to_string()))?;
+    let base_fee_per_gas = history
+        .base_fee_per_gas
+        .last()
+        .map(|value| parse_hex_u256(value, "eth_feeHistory baseFeePerGas"))
+        .transpose()?;
+
+    let mut priority_fee_per_gas = None;
+    if let Some(rewards) = history.reward {
+        for block_rewards in rewards {
+            for reward in block_rewards {
+                let parsed = parse_hex_u256(&reward, "eth_feeHistory reward")?;
+                priority_fee_per_gas = max_optional_u256(priority_fee_per_gas, Some(parsed));
+            }
+        }
+    }
+
+    Ok(ParsedFeeHistoryEstimate {
+        base_fee_per_gas,
+        priority_fee_per_gas,
+    })
+}
+
+fn max_optional_u256(left: Option<U256>, right: Option<U256>) -> Option<U256> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn is_transient_receipt_lookup_error(error: &ChainError) -> bool {
+    matches!(
+        error,
+        ChainError::RpcUnavailable { message }
+            if message.contains("eth_getTransactionReceipt")
+    )
 }
 
 fn transfer_filter(range: TransferLogRange) -> Value {
@@ -1123,6 +1280,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rpc_range_source_estimates_eip1559_fees_from_chain_hints() {
+        let p1 = Arc::new(
+            FakeRpcProvider::new("provider-1", 1)
+                .with_fee_history(100, [[10, 25], [0, 20]])
+                .with_max_priority_fee(20)
+                .with_gas_price(130),
+        );
+        let p2 = Arc::new(FakeRpcProvider::new("provider-2", 1));
+        let source = source(vec![p1, p2]);
+
+        let estimate = source.estimate_eip1559_fees().await.unwrap();
+
+        assert_eq!(estimate.max_priority_fee_per_gas, RawAmount::from(30));
+        assert_eq!(estimate.max_fee_per_gas, RawAmount::from(230));
+    }
+
     fn source(providers: Vec<Arc<FakeRpcProvider>>) -> RpcRangeSource {
         let providers = providers
             .into_iter()
@@ -1141,6 +1315,9 @@ mod tests {
         balance: Option<Value>,
         receipt: Option<Value>,
         broadcast: Option<Value>,
+        fee_history: Option<Value>,
+        max_priority_fee: Option<Value>,
+        gas_price: Option<Value>,
         failures: BTreeSet<&'static str>,
         calls: Mutex<Vec<String>>,
     }
@@ -1156,6 +1333,9 @@ mod tests {
                 balance: None,
                 receipt: None,
                 broadcast: None,
+                fee_history: None,
+                max_priority_fee: None,
+                gas_price: None,
                 failures: BTreeSet::new(),
                 calls: Mutex::new(Vec::new()),
             }
@@ -1188,6 +1368,38 @@ mod tests {
 
         fn with_broadcast(mut self, tx_hash: TxHash) -> Self {
             self.broadcast = Some(Value::String(tx_hash.to_string()));
+            self
+        }
+
+        fn with_fee_history<const N: usize>(
+            mut self,
+            base_fee: u64,
+            rewards: [[u64; 2]; N],
+        ) -> Self {
+            self.fee_history = Some(json!({
+                "oldestBlock": "0x1",
+                "baseFeePerGas": [uint256_hex(base_fee), uint256_hex(base_fee)],
+                "gasUsedRatio": [0.1],
+                "reward": rewards
+                    .into_iter()
+                    .map(|block_rewards| {
+                        block_rewards
+                            .into_iter()
+                            .map(uint256_hex)
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+            }));
+            self
+        }
+
+        fn with_max_priority_fee(mut self, fee: u64) -> Self {
+            self.max_priority_fee = Some(Value::String(uint256_hex(fee)));
+            self
+        }
+
+        fn with_gas_price(mut self, fee: u64) -> Self {
+            self.gas_price = Some(Value::String(uint256_hex(fee)));
             self
         }
 
@@ -1250,6 +1462,18 @@ mod tests {
                     .broadcast
                     .clone()
                     .ok_or_else(|| ChainError::rpc_unavailable("missing fake broadcast result")),
+                "eth_feeHistory" => self
+                    .fee_history
+                    .clone()
+                    .ok_or_else(|| ChainError::rpc_unavailable("missing fake fee history")),
+                "eth_maxPriorityFeePerGas" => self
+                    .max_priority_fee
+                    .clone()
+                    .ok_or_else(|| ChainError::rpc_unavailable("missing fake priority fee")),
+                "eth_gasPrice" => self
+                    .gas_price
+                    .clone()
+                    .ok_or_else(|| ChainError::rpc_unavailable("missing fake gas price")),
                 other => Err(ChainError::rpc_unavailable(format!(
                     "unsupported fake method {other}"
                 ))),

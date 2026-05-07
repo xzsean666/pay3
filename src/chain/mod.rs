@@ -245,6 +245,17 @@ pub trait NativeBalanceReader: Send + Sync {
     ) -> Result<RawAmount, ChainError>;
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Eip1559FeeEstimate {
+    pub max_fee_per_gas: RawAmount,
+    pub max_priority_fee_per_gas: RawAmount,
+}
+
+#[async_trait]
+pub trait Eip1559FeeEstimator: Send + Sync {
+    async fn estimate_eip1559_fees(&self) -> Result<Eip1559FeeEstimate, ChainError>;
+}
+
 #[async_trait]
 pub trait Erc20ChainClient: ChainHeaderReader + TransferLogSource {
     async fn token_balance(
@@ -332,6 +343,14 @@ impl FakeErc20ChainClient {
         self.clone()
     }
 
+    pub fn set_fee_estimate(&self, estimate: Eip1559FeeEstimate) -> Self {
+        self.state
+            .lock()
+            .expect("fake chain mutex poisoned")
+            .fee_estimate = estimate;
+        self.clone()
+    }
+
     pub fn set_receipt(&self, receipt: TxReceipt) -> Self {
         self.state
             .lock()
@@ -384,6 +403,7 @@ pub enum FakeChainCall {
         chain_id: u64,
         owner: EvmAddress,
     },
+    EstimateEip1559Fees,
     TokenBalance {
         token: EvmAddress,
         owner: EvmAddress,
@@ -401,6 +421,7 @@ struct FakeChainState {
     safe_head: Option<ChainBlockRef>,
     finalized_head: Option<ChainBlockRef>,
     native_balances: BTreeMap<EvmAddress, RawAmount>,
+    fee_estimate: Eip1559FeeEstimate,
     balances: BTreeMap<(EvmAddress, EvmAddress), RawAmount>,
     receipts: BTreeMap<TxHash, TxReceipt>,
     next_error: Option<String>,
@@ -545,6 +566,16 @@ impl NativeBalanceReader for FakeErc20ChainClient {
             .native_balances
             .get(&owner)
             .unwrap_or(&RawAmount::ZERO))
+    }
+}
+
+#[async_trait]
+impl Eip1559FeeEstimator for FakeErc20ChainClient {
+    async fn estimate_eip1559_fees(&self) -> Result<Eip1559FeeEstimate, ChainError> {
+        let mut state = self.state.lock().expect("fake chain mutex poisoned");
+        state.calls.push(FakeChainCall::EstimateEip1559Fees);
+        state.take_error()?;
+        Ok(state.fee_estimate)
     }
 }
 

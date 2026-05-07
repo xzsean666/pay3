@@ -301,7 +301,6 @@ pub async fn derive_address_from_mnemonic(
     let output = run_cast_command([
         "wallet",
         "address",
-        "-q",
         "--mnemonic",
         mnemonic,
         "--mnemonic-derivation-path",
@@ -474,7 +473,6 @@ async fn sign_erc20_transfer_with_cast(
     let gas_limit = gas_limit.to_string();
     let output = run_cast_command([
         "mktx",
-        "-q",
         "--legacy",
         "--chain",
         &chain_id,
@@ -574,7 +572,6 @@ async fn private_key_for_mnemonic(
     run_cast_command([
         "wallet",
         "private-key",
-        "-q",
         "--mnemonic",
         mnemonic,
         "--mnemonic-derivation-path",

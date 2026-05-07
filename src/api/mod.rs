@@ -289,7 +289,7 @@ where
     B: crate::db::repositories::OutboundRepository,
     A: crate::db::repositories::AuditRepository,
     S: crate::signer::SignerProvider,
-    H: crate::chain::Erc20ChainClient,
+    H: crate::chain::Erc20ChainClient + crate::chain::Eip1559FeeEstimator,
     G: crate::services::collections::PrefundedGasChecker,
     I: crate::services::orders::IdGenerator,
 {

@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+alloy-consensus = "1"
 alloy-primitives = { version = "1", features = ["serde"] }
+alloy-signer = "1"
+alloy-signer-local = { version = "1", features = ["mnemonic"] }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["macros"] }
 base64 = "0.22"
