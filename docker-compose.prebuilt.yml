@@ -1,0 +1,59 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    profiles:
+      - local-db
+    environment:
+      POSTGRES_USER: pay3
+      POSTGRES_PASSWORD: pay3_dev_password
+      POSTGRES_DB: pay3
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  pay3:
+    build:
+      context: .
+      dockerfile: Dockerfile.prebuilt
+      args:
+        PAY3_BINARY: ${PAY3_PREBUILT_BINARY:-deploy/prebuilt/pay3}
+    image: pay3:prebuilt
+    restart: unless-stopped
+    env_file:
+      - ${PAY3_ENV_FILE:-.env.example}
+    environment:
+      APP_BIND: 0.0.0.0:3000
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in the shell, .env, or docker compose --env-file}
+      KVDB_PATH: /var/lib/pay3/pay3.redb
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "curl -fsS http://127.0.0.1:3000/readyz >/dev/null",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    ports:
+      - "${PAY3_PORT:-3000}:3000"
+    volumes:
+      - pay3-kvdb:/var/lib/pay3
+
+volumes:
+  postgres-data:
+  pay3-kvdb:

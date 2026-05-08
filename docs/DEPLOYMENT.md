@@ -54,6 +54,41 @@ PAY3_ENV_FILE=staging.env docker compose --env-file staging.env up --build
 
 Compose/Dockerfile healthcheck 使用 `/readyz`，用于暴露 DB、RPC、signer、KVDB 和 worker readiness；`/healthz` 只代表进程存活。
 
+## 预编译二进制 Docker 入口
+
+默认 `Dockerfile` 和 `docker-compose.yml` 不变，仍然是在 Docker build 里编译 Rust。需要先在宿主机或 CI 里编译，再让 Docker 镜像只打包二进制时，使用新增的预编译入口：
+
+```bash
+scripts/build-prebuilt-binary.sh
+```
+
+该命令会执行 `cargo build --release --locked`，然后把可执行文件复制到 `deploy/prebuilt/pay3`。这个二进制不会提交到 git。构建出来的二进制必须匹配运行镜像平台，例如在 Linux amd64 服务器上运行，就要产出 Linux amd64 的 `pay3`。
+
+启动时直接使用完整的 `docker-compose.prebuilt.yml`。它和默认 compose 的 env、端口、volume、healthcheck、可选 `local-db` profile 保持一致，只是 `pay3` 镜像改为打包预编译二进制：
+
+```bash
+PAY3_ENV_FILE=.env.test docker compose \
+  --env-file .env.test \
+  -f docker-compose.prebuilt.yml \
+  up -d --build pay3
+```
+
+如果使用 compose 内置 PostgreSQL：
+
+```bash
+PAY3_ENV_FILE=.env.test docker compose \
+  --env-file .env.test \
+  --profile local-db \
+  -f docker-compose.prebuilt.yml \
+  up -d --build
+```
+
+只构建镜像不启动容器时：
+
+```bash
+docker build -f Dockerfile.prebuilt -t pay3:prebuilt .
+```
+
 ## 服务器 Docker Compose 测试部署
 
 下面流程适合在一台测试服务器上用 Docker Compose 跑 Pay3 API + worker 的 combined 进程。它仍是测试/staging dry-run，不是生产上线流程；生产必须满足本文后面的外部 signer、多 RPC、备份、告警和 runbook 要求。

@@ -6,7 +6,7 @@
 
 ```bash
 cd frontend-test
-npm run dev
+pnpm run dev
 ```
 
 默认地址是 `http://127.0.0.1:8788`。默认代理到 `http://127.0.0.1:3000` 的 Pay3 API。
@@ -15,10 +15,40 @@ npm run dev
 
 ```bash
 cd frontend-test
-npm run deploy
+pnpm run deploy
 ```
 
 部署到 Cloudflare 后，`PAY3_API_BASE_URL` 不能继续用 `127.0.0.1`，需要改成 Cloudflare 能访问到的 staging Pay3 API URL。
+
+如果要使用项目根 `.env.test` 的 JWT 配置现场生成测试 token，并部署这个测试页面，用：
+
+```bash
+cd frontend-test
+pnpm run deploy:page -- --api-base-url https://your-pay3-api.example
+```
+
+先 dry-run：
+
+```bash
+cd frontend-test
+pnpm run deploy:page:dry-run
+```
+
+这个脚本读取 `../.env.test` 里的 `JWT_SECRET`、`JWT_ISSUER`、`JWT_AUDIENCE`、`JWT_KEY_ID`，生成只含订单测试 scope 的 JWT，然后通过 `wrangler deploy --var` 注入：
+
+- `PAY3_TEST_JWT`
+- `PAY3_TEST_JWT_EXPIRES_AT`
+- `PAY3_API_BASE_URL`
+- `PAY3_DEFAULT_MODE`
+- `PAY3_PROXY_ENABLED`
+- `PAY3_DIRECT_ENABLED`
+- `PAY3_EXPOSE_TEST_JWT`
+
+关闭浏览器直连并不暴露 token：
+
+```bash
+pnpm run deploy:page -- --api-base-url https://your-pay3-api.example --no-direct --hide-token
+```
 
 ## 直连开关
 
@@ -55,7 +85,7 @@ PAY3_EXPOSE_TEST_JWT = "false"
 
 ```bash
 cd frontend-test
-npm run token
+pnpm run token
 ```
 
 生产或长期公开环境不要把 `PAY3_TEST_JWT` 放在 `wrangler.toml`；改用 `wrangler secret put PAY3_TEST_JWT`，并关闭 `PAY3_EXPOSE_TEST_JWT`。

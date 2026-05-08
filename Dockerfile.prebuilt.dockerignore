@@ -1,0 +1,5 @@
+**
+!deploy/
+!deploy/prebuilt/
+!deploy/prebuilt/**
+!Dockerfile.prebuilt

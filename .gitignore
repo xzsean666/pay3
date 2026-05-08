@@ -1,6 +1,8 @@
 /target/
 /out/
 /cache/
+#/deploy/prebuilt/*
+#!/deploy/prebuilt/README.md
 frontend-test/.wrangler/
 frontend-test/node_modules/
 
