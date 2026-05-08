@@ -8,3 +8,7 @@ PAY3_ENV_FILE=.env.test docker compose \
     --env-file .env.test \
     -f docker-compose.prebuilt.yml \
     up -d --build pay3
+PAY3_ENV_FILE=.env.test docker compose \
+    --env-file .env.test \
+    -f docker-compose.prebuilt.cn.yml \
+    up -d --build pay3
