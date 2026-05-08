@@ -1,10 +1,10 @@
 # Pay3 Next Session
 
-更新时间：2026-05-05
+更新时间：2026-05-08
 
 ## 当前状态
 
-仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，已完成 Phase 5 `workers/scanner` tick contract、常驻 loop、confirmation sweep、rolling lookback rescan 和 lag/readiness 初版，已完成 `services/collections` prefunded 初版、collector broadcast tick 初版、collector 常驻 loop、collector broadcast 前/后崩溃恢复与 receipt sweep tick 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版和 collection create/read API route contract 初版，并新增真实 API 启动路径的 runtime composition 初版、transfer log retention cleanup loop / KVDB readiness metrics wiring、真实 PostgreSQL 集成测试 `tests/collection_db_integration.rs` 和 Anvil+mock ERC20 e2e `tests/anvil_e2e.rs`，其中补了 collect replacement 回归。本轮进一步补齐 Docker/Compose dry-run 工件、production JWT local JWKS/RS256/EdDSA PEM guard、真实 native gas prefund check、runtime DB/RPC/signer/KVDB readiness refresh、订单过期重算 loop、统一错误 envelope 的 `retryable/details/request_id`、API 429 rate limit 初版，并把 clippy strict gate 修绿。
+仓库已经从纯文档进入 Rust 实现阶段。当前完成 Phase 1 基础模块，已完成 Phase 2 的 M4 `db/migrations` 和 M5 `db/repositories` 初版，已完成 Phase 3 的 M6 `wallet`、订单创建 service 初版和订单 API route contract，已推进 Phase 4 的 signer、chain、RPC provider manager、transfer log store、付款匹配 service 和手动 verify API route contract，已完成 Phase 5 `workers/scanner` tick contract、常驻 loop、confirmation sweep、rolling lookback rescan 和 lag/readiness 初版，已完成 `services/collections` prefunded 初版、collector broadcast tick 初版、collector 常驻 loop、collector broadcast 前/后崩溃恢复与 receipt sweep tick 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版和 collection create/read API route contract 初版，并新增真实 API 启动路径的 runtime composition 初版、transfer log retention cleanup loop / KVDB readiness metrics wiring、真实 PostgreSQL 集成测试 `tests/collection_db_integration.rs` 和 Anvil+mock ERC20 e2e `tests/anvil_e2e.rs`，其中补了 collect replacement 回归。本轮进一步补齐 Docker/Compose dry-run 工件、production JWT local JWKS/RS256/EdDSA PEM guard、真实 native gas prefund check、runtime DB/RPC/signer/KVDB readiness refresh、订单过期重算 loop、统一错误 envelope 的 `retryable/details/request_id`、API 429 rate limit 初版，并把 clippy strict gate 修绿；另新增 `tests/deployed_api_acceptance.rs`，用于对已部署 HTTP API 跑黑盒验收，覆盖 health/ready/metrics、鉴权、订单创建/查询、链上付款、manual verify、归集创建/查询/确认。
 
 已完成：
 
@@ -103,6 +103,7 @@
 - `tests/migration_contract.rs`: migration contract 测试；有 `PAY3_TEST_DATABASE_URL`/`TEST_DATABASE_URL` 时会实际 apply 到临时 schema，否则跳过 DB apply 分支。
 - `tests/collection_db_integration.rs`: 真实 PostgreSQL 集成测试，临时 schema + migrations 之后直接用 SQL 验证 collection/outbound trigger、collect-only purpose check 和 outbound active nonce replacement trajectory；无数据库 URL 时自动跳过。
 - `tests/anvil_e2e.rs`: 真实 Anvil + mock ERC20 e2e，覆盖订单创建、Transfer log 采集、scanner 付款确认、collection 广播/确认、stuck replacement 和 treasury 余额断言。
+- `tests/deployed_api_acceptance.rs`: 已部署 API 黑盒验收测试，通过 `PAY3_API_BASE_URL` 调远端 HTTP API，可用 env 文件现场签 HS256 JWT 或传入 `PAY3_API_JWT`，并可用 payer 私钥/助记词在测试网上完成付款和归集确认；默认 ignored 且需要 `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1`。
 - `tests/support/anvil.rs`: Anvil/Foundry 测试支撑层，封装 mnemonic 派生、mock ERC20 部署和 ERC20 转账广播。
 - `tests/repository_contract.rs`: repository SQL/contract 静态测试，覆盖幂等、lease/CAS、matched-only payments、collection job lock、nonce/replacement、audit insert。
 - `tests/chain_contract.rs`: chain 模块静态 contract 测试，确保暴露必要 trait/fake/RPC 控制点，且不依赖 axum API DTO、DB 或订单业务状态。
@@ -127,6 +128,9 @@
 最近验证：
 
 - `cargo fmt -- --check`: 通过。
+- `cargo test --test deployed_api_acceptance --no-run`: 通过。
+- `cargo test --test deployed_api_acceptance -- --ignored --nocapture`: 通过未开启 `PAY3_RUN_DEPLOYED_API_ACCEPTANCE` 的 skip 路径。
+- `cargo clippy --test deployed_api_acceptance -- -D warnings`: 通过。
 - `cargo clippy --all-targets --all-features -- -D warnings`: 通过。
 - `cargo test`: 通过，163 个库测试 + 65 个 integration/contract 测试 + 2 个 Anvil e2e + 0 doctest。
 - `cargo build --release --locked`: 通过。

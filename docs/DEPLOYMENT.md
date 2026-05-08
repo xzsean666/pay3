@@ -213,7 +213,33 @@ curl -fsS http://127.0.0.1:3000/readyz
 
 `/healthz` 只说明进程还活着。`/readyz` 会检查 DB、migration、RPC、signer、KVDB 和 worker readiness；如果 RPC、DB、token 地址、signer 或扫描状态不满足要求，`/readyz` 会返回非 200，这是预期的失败信号。
 
-### 6. 停止、重启和更新
+### 6. 已部署 API 验收测试
+
+部署后可以从本仓库对目标 HTTP API 跑黑盒验收测试。该测试不会启动本地 Pay3 服务，会调用 `PAY3_API_BASE_URL`，并在未跳过链上步骤时用 payer 账号发送真实测试网 ERC20 转账，再通过 API 轮询订单付款和归集状态。
+
+```bash
+PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 \
+PAY3_DEPLOYED_API_ENV_FILE=.env.test \
+PAY3_API_BASE_URL=https://your-pay3-api.example \
+cargo test --test deployed_api_acceptance -- --ignored --nocapture
+```
+
+env 文件或 shell 需要包含链和测试账号配置：
+
+- `RPC_HTTP_URLS`、`TOKEN_DECIMALS`、`MIN_CONFIRMATIONS`。
+- `PAY3_API_JWT` / `PAY3_TEST_JWT`；如果测试环境仍使用 HS256，也可以只提供 `JWT_SECRET`、`JWT_ISSUER`、`JWT_AUDIENCE`、`JWT_KEY_ID`，测试会现场签发带 `orders:create orders:read orders:verify collections:create collections:read` 的 JWT。
+- `PAY3_API_TEST_PAYER_PRIVATE_KEY`、`PAY3_E2E_PAYER_PRIVATE_KEY`、`DEPLOYER_PRIVATE_KEY` 之一；或 `PAY3_API_TEST_PAYER_MNEMONIC` / `PAY3_E2E_PAYER_MNEMONIC` / `SIGNER_MNEMONIC`。
+
+常用覆盖项：
+
+- `PAY3_API_TEST_PAYMENT_AMOUNT_RAW=1`: 付款 raw amount，默认 `1`。
+- `PAY3_API_TEST_SKIP_CHAIN_PAYMENT=1`: 只测健康检查、鉴权、订单创建和查询，不发链上交易。
+- `PAY3_API_TEST_SKIP_COLLECTION=1`: 测到订单付款为止，不创建归集。
+- `PAY3_API_TEST_ORDER_PAID_TIMEOUT_SECS=360`、`PAY3_API_TEST_COLLECTION_TIMEOUT_SECS=600`: 调整 worker 轮询等待时间。
+
+该测试会花测试网 gas/token，不能对有真实资金风险的环境随意运行。
+
+### 7. 停止、重启和更新
 
 停止：
 
