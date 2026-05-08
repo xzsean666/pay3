@@ -262,8 +262,12 @@ impl RpcProviderManager {
     pub async fn readiness_probe(&self) -> Result<RpcProviderReadiness, ChainError> {
         let providers = self.validate_chain_ids().await?;
         let latest_head = self.head_by_tag("latest").await?;
-        let safe_head = self.head_by_tag("safe").await?;
         let finalized_head = self.head_by_tag("finalized").await?;
+        let safe_head = match self.head_by_tag("safe").await {
+            Ok(head) => head,
+            Err(error) if is_missing_safe_block_error(&error) => finalized_head,
+            Err(error) => return Err(error),
+        };
         Ok(RpcProviderReadiness {
             expected_chain_id: self.expected_chain_id,
             providers,
@@ -395,6 +399,14 @@ pub struct RpcProviderReadiness {
     pub latest_head: ChainBlockRef,
     pub safe_head: ChainBlockRef,
     pub finalized_head: ChainBlockRef,
+}
+
+fn is_missing_safe_block_error(error: &ChainError) -> bool {
+    matches!(error, ChainError::BlockNotFound { number } if *number == u64::MAX)
+        || error
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("safe block not found")
 }
 
 #[derive(Clone, Debug)]
@@ -1327,6 +1339,26 @@ mod tests {
         assert_eq!(estimate.max_fee_per_gas, RawAmount::from(230));
     }
 
+    #[tokio::test]
+    async fn readiness_probe_accepts_missing_safe_tag_when_finalized_exists() {
+        let provider = Arc::new(
+            FakeRpcProvider::new("provider-1", 1)
+                .with_block(block(10, 0xaa))
+                .missing_safe_block(),
+        );
+        let source = RpcRangeSource::new(
+            RpcProviderManager::new(1, vec![provider as SharedJsonRpcProvider]).unwrap(),
+        );
+
+        let readiness = source.readiness_probe().await.unwrap();
+
+        assert_eq!(
+            readiness.latest_head,
+            ChainBlockRef::new(10, block_hash(0xaa))
+        );
+        assert_eq!(readiness.finalized_head, readiness.safe_head);
+    }
+
     fn source(providers: Vec<Arc<FakeRpcProvider>>) -> RpcRangeSource {
         let providers = providers
             .into_iter()
@@ -1348,6 +1380,7 @@ mod tests {
         fee_history: Option<Value>,
         max_priority_fee: Option<Value>,
         gas_price: Option<Value>,
+        missing_safe_block: bool,
         failures: BTreeSet<&'static str>,
         calls: Mutex<Vec<String>>,
     }
@@ -1366,6 +1399,7 @@ mod tests {
                 fee_history: None,
                 max_priority_fee: None,
                 gas_price: None,
+                missing_safe_block: false,
                 failures: BTreeSet::new(),
                 calls: Mutex::new(Vec::new()),
             }
@@ -1433,6 +1467,11 @@ mod tests {
             self
         }
 
+        fn missing_safe_block(mut self) -> Self {
+            self.missing_safe_block = true;
+            self
+        }
+
         fn fail_method(mut self, method: &'static str) -> Self {
             self.failures.insert(method);
             self
@@ -1469,6 +1508,9 @@ mod tests {
                         .and_then(|params| params.first())
                         .and_then(Value::as_str)
                         .ok_or_else(|| ChainError::malformed_rpc_response("missing block tag"))?;
+                    if tag == "safe" && self.missing_safe_block {
+                        return Err(ChainError::rpc_unavailable("safe block not found"));
+                    }
                     let block = match tag {
                         "latest" | "safe" | "finalized" => self.blocks.values().last().copied(),
                         value => {

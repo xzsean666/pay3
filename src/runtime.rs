@@ -949,7 +949,7 @@ fn expected_migration_version() -> i64 {
 }
 
 async fn refresh_db_dependency_status(dependencies: &StaticDependencyRegistry, pool: &PgPool) {
-    match sqlx::query_scalar::<_, i64>("SELECT 1")
+    match sqlx::query_scalar::<_, i64>("SELECT 1::BIGINT")
         .fetch_one(pool)
         .await
     {
