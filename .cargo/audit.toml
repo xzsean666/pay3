@@ -1,0 +1,24 @@
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071 is pulled into Cargo.lock through sqlx-mysql metadata.
+    # The service builds sqlx with postgres only; cargo tree -i rsa --locked
+    # --target all shows no active rsa edge for the checked build graph.
+    # Remove this ignore before enabling sqlx-mysql/RSA.
+    # https://rustsec.org/advisories/RUSTSEC-2023-0071
+    "RUSTSEC-2023-0071",
+    # Transitive through Alloy/ruint today. Revisit on Alloy upgrades and remove
+    # once upstream no longer pulls derivative.
+    # https://rustsec.org/advisories/RUSTSEC-2024-0388
+    "RUSTSEC-2024-0388",
+    # Transitive through Alloy Solidity macro parsing today. Revisit on Alloy
+    # upgrades and remove once upstream no longer pulls paste.
+    # https://rustsec.org/advisories/RUSTSEC-2024-0436
+    "RUSTSEC-2024-0436",
+]
+informational_warnings = ["unmaintained"]
+
+[output]
+deny = ["warnings"]
+format = "terminal"
+quiet = false
+show_tree = true

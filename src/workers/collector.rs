@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::{
-    chain::{ChainError, TransactionStatus, TxReceipt},
+    chain::{ChainError, ChainHeaderReader, TransactionStatus, TxReceipt},
     db::repositories::{
         BroadcastableOutboundTx, OutboundRepository, OutboundTxRecord, ReceiptCheckableOutboundTx,
         RepositoryError,
@@ -26,6 +26,7 @@ use crate::{
 pub struct CollectionCollectorConfig {
     pub worker_id: String,
     pub replacement_stuck_after: Duration,
+    pub min_confirmations: u64,
 }
 
 impl CollectionCollectorConfig {
@@ -33,11 +34,17 @@ impl CollectionCollectorConfig {
         Self {
             worker_id: worker_id.into(),
             replacement_stuck_after: Duration::ZERO,
+            min_confirmations: 0,
         }
     }
 
     pub fn with_replacement_stuck_after(mut self, replacement_stuck_after: Duration) -> Self {
         self.replacement_stuck_after = replacement_stuck_after;
+        self
+    }
+
+    pub const fn with_min_confirmations(mut self, min_confirmations: u64) -> Self {
+        self.min_confirmations = min_confirmations;
         self
     }
 
@@ -143,7 +150,9 @@ where
     B: OutboundRepository,
     A: crate::db::repositories::AuditRepository,
     S: crate::signer::SignerProvider,
-    H: crate::chain::Erc20ChainClient + crate::chain::Eip1559FeeEstimator,
+    H: crate::chain::Erc20ChainClient
+        + crate::chain::Eip1559FeeEstimator
+        + crate::chain::PendingNonceReader,
     G: crate::services::collections::PrefundedGasChecker,
     I: IdGenerator,
 {
@@ -173,7 +182,9 @@ where
     B: OutboundRepository,
     A: crate::db::repositories::AuditRepository,
     S: crate::signer::SignerProvider,
-    H: crate::chain::Erc20ChainClient + crate::chain::Eip1559FeeEstimator,
+    H: crate::chain::Erc20ChainClient
+        + crate::chain::Eip1559FeeEstimator
+        + crate::chain::PendingNonceReader,
     G: crate::services::collections::PrefundedGasChecker,
     I: IdGenerator,
 {
@@ -244,7 +255,7 @@ impl<P, O, B> CollectionCollectorWorker<P, O, B>
 where
     P: CollectionJobPreparer + CollectionJobReplacer,
     O: OutboundRepository,
-    B: SignedTxBroadcaster + TxReceiptReader,
+    B: SignedTxBroadcaster + TxReceiptReader + ChainHeaderReader,
 {
     pub async fn tick(&self) -> Result<CollectionCollectorTickOutcome, CollectionCollectorError> {
         self.config.validate()?;
@@ -366,6 +377,15 @@ where
 
         match receipt.status {
             TransactionStatus::Success => {
+                if !self
+                    .receipt_block_confirmed_and_canonical(receipt.block)
+                    .await?
+                {
+                    return Ok(CollectionCollectorTickOutcome::ReceiptPending {
+                        collection_id: checkable.collection_id,
+                        outbound: checkable.outbound,
+                    });
+                }
                 let outbound = self
                     .outbound
                     .mark_confirmed(checkable.outbound.id, receipt.block)
@@ -386,6 +406,31 @@ where
                 })
             }
         }
+    }
+
+    async fn receipt_block_confirmed_and_canonical(
+        &self,
+        receipt_block: crate::domain::ChainBlockRef,
+    ) -> Result<bool, CollectionCollectorError> {
+        let head = self.broadcaster.latest_head().await?;
+        if !receipt_block.has_confirmations(head, self.config.min_confirmations) {
+            return Ok(false);
+        }
+        let canonical_block = self
+            .broadcaster
+            .block_by_number(receipt_block.number)
+            .await?;
+        if canonical_block.hash != receipt_block.hash {
+            return Err(ChainError::ProviderHashMismatch {
+                context: format!("collection receipt block {}", receipt_block.number).into(),
+                left_provider: "receipt".into(),
+                left_hash: receipt_block.hash,
+                right_provider: "canonical".into(),
+                right_hash: canonical_block.hash,
+            }
+            .into());
+        }
+        Ok(true)
     }
 
     fn outbound_replacement_due(&self, outbound: &OutboundTxRecord) -> bool {
@@ -441,7 +486,7 @@ pub fn spawn_collection_collector_loop<P, O, B>(
 where
     P: CollectionJobPreparer + CollectionJobReplacer + 'static,
     O: OutboundRepository + 'static,
-    B: SignedTxBroadcaster + TxReceiptReader + 'static,
+    B: SignedTxBroadcaster + TxReceiptReader + ChainHeaderReader + 'static,
 {
     spawn_collection_collector_loop_with_optional_metrics(worker, poll_interval, None)
 }
@@ -454,7 +499,7 @@ pub fn spawn_collection_collector_loop_with_metrics<P, O, B>(
 where
     P: CollectionJobPreparer + CollectionJobReplacer + 'static,
     O: OutboundRepository + 'static,
-    B: SignedTxBroadcaster + TxReceiptReader + 'static,
+    B: SignedTxBroadcaster + TxReceiptReader + ChainHeaderReader + 'static,
 {
     spawn_collection_collector_loop_with_optional_metrics(worker, poll_interval, Some(metrics))
 }
@@ -467,7 +512,7 @@ fn spawn_collection_collector_loop_with_optional_metrics<P, O, B>(
 where
     P: CollectionJobPreparer + CollectionJobReplacer + 'static,
     O: OutboundRepository + 'static,
-    B: SignedTxBroadcaster + TxReceiptReader + 'static,
+    B: SignedTxBroadcaster + TxReceiptReader + ChainHeaderReader + 'static,
 {
     if poll_interval.is_zero() {
         return Err(CollectionCollectorError::InvalidConfig {
@@ -652,6 +697,34 @@ mod tests {
             worker.outbound.confirmed(),
             vec![(outbound.id, block_ref(90))]
         );
+    }
+
+    #[tokio::test]
+    async fn tick_keeps_success_receipt_pending_until_min_confirmations() {
+        let outbound = outbound_record(18, OutboundTxStatus::Broadcast);
+        let receipt = receipt(outbound.tx_hash, TransactionStatus::Success, block_ref(90));
+        let worker = CollectionCollectorWorker::new(
+            FakePreparer::with_outcomes(vec![Ok(PrepareCollectionJobOutcome::NoJob)]),
+            FakeOutboundRepository::with_receipt_checkable(ReceiptCheckableOutboundTx {
+                collection_id: collection_id(),
+                outbound: outbound.clone(),
+            }),
+            FakeBroadcaster::returning(tx_hash(0xaa))
+                .with_receipt(Some(receipt))
+                .with_head(block_ref(91)),
+            CollectionCollectorConfig::new("collector-1").with_min_confirmations(3),
+        );
+
+        let outcome = worker.tick().await.unwrap();
+
+        assert_eq!(
+            outcome,
+            CollectionCollectorTickOutcome::ReceiptPending {
+                collection_id: collection_id(),
+                outbound,
+            }
+        );
+        assert!(worker.outbound.confirmed().is_empty());
     }
 
     #[tokio::test]
@@ -1013,6 +1086,7 @@ mod tests {
             &self,
             _chain_id: u64,
             _from_address: EvmAddress,
+            _pending_nonce: RawAmount,
         ) -> Result<crate::db::repositories::ReservedNonce, RepositoryError> {
             unimplemented!("collector worker does not reserve nonce directly")
         }
@@ -1021,6 +1095,15 @@ mod tests {
             &self,
             _tx: NewSignedOutboundTx,
         ) -> Result<OutboundTxRecord, RepositoryError> {
+            unimplemented!("collector worker does not insert signed tx directly")
+        }
+
+        async fn insert_signed_collect_tx(
+            &self,
+            _collection_id: Uuid,
+            _tx: NewSignedOutboundTx,
+            _resolved_amount_raw: RawAmount,
+        ) -> Result<crate::db::repositories::InsertSignedCollectTxResult, RepositoryError> {
             unimplemented!("collector worker does not insert signed tx directly")
         }
 
@@ -1103,6 +1186,8 @@ mod tests {
     struct FakeBroadcaster {
         returned_hash: TxHash,
         receipt: Option<TxReceipt>,
+        head: ChainBlockRef,
+        blocks: Arc<Mutex<Vec<ChainBlockRef>>>,
         broadcasts: Arc<Mutex<Vec<Vec<u8>>>>,
         receipt_queries: Arc<Mutex<Vec<TxHash>>>,
     }
@@ -1112,6 +1197,8 @@ mod tests {
             Self {
                 returned_hash,
                 receipt: None,
+                head: block_ref(100),
+                blocks: Arc::new(Mutex::new(Vec::new())),
                 broadcasts: Arc::new(Mutex::new(Vec::new())),
                 receipt_queries: Arc::new(Mutex::new(Vec::new())),
             }
@@ -1119,6 +1206,11 @@ mod tests {
 
         fn with_receipt(mut self, receipt: Option<TxReceipt>) -> Self {
             self.receipt = receipt;
+            self
+        }
+
+        fn with_head(mut self, head: ChainBlockRef) -> Self {
+            self.head = head;
             self
         }
 
@@ -1162,6 +1254,37 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl ChainHeaderReader for FakeBroadcaster {
+        async fn latest_head(&self) -> Result<ChainBlockRef, ChainError> {
+            Ok(self.head)
+        }
+
+        async fn safe_head(&self) -> Result<ChainBlockRef, ChainError> {
+            Ok(self.head)
+        }
+
+        async fn finalized_head(&self) -> Result<ChainBlockRef, ChainError> {
+            Ok(self.head)
+        }
+
+        async fn block_by_number(
+            &self,
+            number: u64,
+        ) -> Result<crate::chain::ChainBlock, ChainError> {
+            self.blocks
+                .lock()
+                .expect("fake broadcaster mutex poisoned")
+                .push(block_ref(number));
+            Ok(crate::chain::ChainBlock::new(
+                number,
+                _block_hash(number as u8),
+                _block_hash(number.saturating_sub(1) as u8),
+                OffsetDateTime::now_utc(),
+            ))
+        }
+    }
+
     fn prepared_outcome(outbound: OutboundTxRecord) -> PrepareCollectionJobOutcome {
         PrepareCollectionJobOutcome::Prepared {
             collection: Box::new(collection_record(Some(outbound.id))),
@@ -1187,6 +1310,7 @@ mod tests {
     ) -> crate::db::repositories::CollectionRecord {
         crate::db::repositories::CollectionRecord {
             id: collection_id(),
+            owner_sub: "merchant-1".to_string(),
             order_id: Uuid::from_u128(1),
             idempotency_key: "collect-1".to_string(),
             request_hash: "request-hash".to_string(),

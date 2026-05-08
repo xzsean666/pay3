@@ -4,7 +4,7 @@ use uuid::Uuid;
 use crate::{
     chain::ChainError,
     db::repositories::RepositoryError,
-    domain::{OrderStatusError, RawAmount},
+    domain::{BlockHash, OrderStatusError, RawAmount},
     services::payments::PaymentMatchingError,
     transfer_log_store::TransferLogStoreError,
 };
@@ -64,6 +64,15 @@ pub enum ManualVerifyError {
 
     #[error("too many transfer logs for order {order_id}: limit {limit}")]
     LogLimitExceeded { order_id: Uuid, limit: usize },
+
+    #[error(
+        "canonical block hash mismatch for matched payment block {block_number}: stored {stored_hash}, canonical {canonical_hash}"
+    )]
+    CanonicalBlockMismatch {
+        block_number: u64,
+        stored_hash: BlockHash,
+        canonical_hash: BlockHash,
+    },
 
     #[error(transparent)]
     Repository(Box<RepositoryError>),

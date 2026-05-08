@@ -6,7 +6,7 @@ use manual_verify::{
     receive_address, service, service_with_config, stored_log, stream,
 };
 use pay3::{
-    domain::{PaymentChainStatus, PaymentMatchStatus, RawAmount},
+    domain::{BlockHash, PaymentChainStatus, PaymentMatchStatus, RawAmount},
     services::verify::{ManualVerifyConfig, ManualVerifyError, ManualVerifyStatus},
 };
 
@@ -132,6 +132,34 @@ async fn manual_verify_reports_confirming_until_confirmations_are_sufficient() {
     assert_eq!(result.matched_payments, 1);
     assert_eq!(result.paid_amount_raw, RawAmount::ZERO);
     assert_eq!(result.confirmations, 2);
+}
+
+#[tokio::test]
+async fn manual_verify_fails_closed_when_matched_payment_block_is_not_canonical() {
+    let mut log = stored_log(10, 0, receive_address(), RawAmount::from(100), 10);
+    log.block_hash = BlockHash::from_bytes([0xee; 32]);
+    let logs = vec![log];
+    let recorder = FakeRecorder::default();
+
+    let error = service(
+        FakeOrderRepository::with_view(order_view(RawAmount::from(100))),
+        recorder.clone(),
+        FakeLogReader::new(stream(), logs, Some(10)),
+        12,
+        1,
+    )
+    .verify_order(order_id())
+    .await
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ManualVerifyError::CanonicalBlockMismatch {
+            block_number: 10,
+            ..
+        }
+    ));
+    assert!(recorder.calls().is_empty());
 }
 
 #[tokio::test]

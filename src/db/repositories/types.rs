@@ -60,6 +60,7 @@ pub struct PaymentWindowRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateOrderCommand {
     pub order_id: Uuid,
+    pub owner_sub: String,
     pub external_id: String,
     pub request_hash: String,
     pub child_account: NewChildAccount,
@@ -72,6 +73,7 @@ pub struct CreateOrderCommand {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderRecord {
     pub id: Uuid,
+    pub owner_sub: String,
     pub external_id: String,
     pub request_hash: String,
     pub child_account_id: Uuid,
@@ -263,6 +265,7 @@ impl TryFrom<&str> for CollectionRecordStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateCollectionCommand {
     pub collection_id: Uuid,
+    pub owner_sub: String,
     pub order_id: Uuid,
     pub idempotency_key: String,
     pub request_hash: String,
@@ -277,6 +280,7 @@ pub struct CreateCollectionCommand {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionRecord {
     pub id: Uuid,
+    pub owner_sub: String,
     pub order_id: Uuid,
     pub idempotency_key: String,
     pub request_hash: String,
@@ -383,6 +387,12 @@ pub struct ReservedNonce {
     pub chain_id: u64,
     pub address: EvmAddress,
     pub nonce: RawAmount,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InsertSignedCollectTxResult {
+    pub collection_id: Uuid,
+    pub outbound: OutboundTxRecord,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

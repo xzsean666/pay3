@@ -14,7 +14,9 @@
 使用外部数据库的默认 dry-run：
 
 ```bash
-DATABASE_URL=postgres://user:pass@db.example:5432/pay3 docker compose up --build pay3
+DATABASE_URL=postgres://user:pass@db.example:5432/pay3 \
+PAY3_ENV_FILE=.env.example \
+docker compose --env-file .env.example up --build pay3
 ```
 
 该默认配置要求宿主机 `8545` 已有 chain id `31337` 的 Anvil/local JSON-RPC；否则 runtime 会在 RPC chain id/readiness 校验处失败。只验证服务启动可以先用占位 `TOKEN_ADDRESS`，要跑 ERC20 转账和归集流程必须先部署 mock ERC20 并更新 `TOKEN_ADDRESS`。
@@ -35,7 +37,7 @@ scripts/generate-mnemonic.sh --write-env --env-file .env
 需要本地覆盖配置时，复制 `.env.example` 为 `.env`，然后显式选择 env file：
 
 ```bash
-PAY3_ENV_FILE=.env docker compose up --build
+PAY3_ENV_FILE=.env docker compose --env-file .env up --build
 ```
 
 如果使用 compose 内置本地 Postgres：

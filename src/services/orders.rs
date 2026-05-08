@@ -243,12 +243,21 @@ where
         &self,
         input: CreateOrderInput,
     ) -> Result<CreateOrderResult, OrderServiceError> {
+        self.create_order_for_owner("system", input).await
+    }
+
+    pub async fn create_order_for_owner(
+        &self,
+        owner_sub: &str,
+        input: CreateOrderInput,
+    ) -> Result<CreateOrderResult, OrderServiceError> {
+        let owner_sub = normalize_owner_sub(owner_sub)?;
         let input = normalize_create_order_input(input)?;
         let request_hash = canonical_order_request_hash(&input)?;
 
         if let Some(existing) = self
             .repository
-            .get_order_by_external_id(&input.external_id)
+            .get_order_by_external_id_for_owner(&input.external_id, &owner_sub)
             .await?
         {
             if existing.request_hash != request_hash {
@@ -289,6 +298,7 @@ where
 
         let command = CreateOrderCommand {
             order_id,
+            owner_sub,
             external_id: input.external_id,
             request_hash,
             child_account: NewChildAccount {
@@ -327,18 +337,36 @@ where
         self.repository.get_order_view(id).await.map_err(Into::into)
     }
 
-    pub async fn get_order_by_external_id(
+    pub async fn get_order_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+    ) -> Result<Option<OrderView>, OrderServiceError> {
+        let owner_sub = normalize_owner_sub(owner_sub)?;
+        self.repository
+            .get_order_view_for_owner(id, &owner_sub)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn get_order_by_external_id_for_owner(
         &self,
         external_id: &str,
+        owner_sub: &str,
     ) -> Result<Option<OrderView>, OrderServiceError> {
+        let owner_sub = normalize_owner_sub(owner_sub)?;
         let Some(order) = self
             .repository
-            .get_order_by_external_id(external_id)
+            .get_order_by_external_id_for_owner(external_id, &owner_sub)
             .await?
         else {
             return Ok(None);
         };
-        let view = self.expect_order_view(order.id).await?;
+        let view = self
+            .repository
+            .get_order_view_for_owner(order.id, &owner_sub)
+            .await?
+            .ok_or(OrderServiceError::OrderViewMissing { order_id: order.id })?;
         Ok(Some(view))
     }
 
@@ -410,6 +438,17 @@ fn normalize_create_order_input(
         ttl_seconds: input.ttl_seconds,
         metadata,
     })
+}
+
+fn normalize_owner_sub(owner_sub: &str) -> Result<String, OrderServiceError> {
+    let owner_sub = owner_sub.trim().to_string();
+    if owner_sub.is_empty() {
+        return Err(OrderServiceError::invalid_argument(
+            "owner_sub",
+            "must not be empty",
+        ));
+    }
+    Ok(owner_sub)
 }
 
 fn canonical_order_request_hash(
@@ -545,6 +584,7 @@ mod tests {
         assert_eq!(state.create_commands.len(), 1);
         let command = &state.create_commands[0];
         assert_eq!(command.external_id, "merchant-order-10001");
+        assert_eq!(command.owner_sub, "system");
         assert_eq!(command.order_id, order_id);
         assert_eq!(
             command.payment_window.window_from,
@@ -730,6 +770,7 @@ mod tests {
         OrderView {
             order: OrderRecord {
                 id,
+                owner_sub: "system".to_string(),
                 external_id: external_id.to_string(),
                 request_hash: request_hash.to_string(),
                 child_account_id,
@@ -836,6 +877,7 @@ mod tests {
 
             let order = OrderRecord {
                 id: command.order_id,
+                owner_sub: command.owner_sub.clone(),
                 external_id: command.external_id.clone(),
                 request_hash: command.request_hash.clone(),
                 child_account_id: command.child_account.id,
@@ -887,17 +929,48 @@ mod tests {
             Ok(state.views.get(&id).map(|view| view.order.clone()))
         }
 
+        async fn get_order_for_owner(
+            &self,
+            id: Uuid,
+            owner_sub: &str,
+        ) -> Result<Option<OrderRecord>, RepositoryError> {
+            let state = self.state.lock().unwrap();
+            Ok(state
+                .views
+                .get(&id)
+                .filter(|view| view.order.owner_sub == owner_sub)
+                .map(|view| view.order.clone()))
+        }
+
         async fn get_order_view(&self, id: Uuid) -> Result<Option<OrderView>, RepositoryError> {
             let state = self.state.lock().unwrap();
             Ok(state.views.get(&id).cloned())
         }
 
-        async fn get_order_by_external_id(
+        async fn get_order_view_for_owner(
+            &self,
+            id: Uuid,
+            owner_sub: &str,
+        ) -> Result<Option<OrderView>, RepositoryError> {
+            let state = self.state.lock().unwrap();
+            Ok(state
+                .views
+                .get(&id)
+                .filter(|view| view.order.owner_sub == owner_sub)
+                .cloned())
+        }
+
+        async fn get_order_by_external_id_for_owner(
             &self,
             external_id: &str,
+            owner_sub: &str,
         ) -> Result<Option<OrderRecord>, RepositoryError> {
             let state = self.state.lock().unwrap();
-            Ok(state.orders_by_external_id.get(external_id).cloned())
+            Ok(state
+                .orders_by_external_id
+                .get(external_id)
+                .filter(|order| order.owner_sub == owner_sub)
+                .cloned())
         }
     }
 

@@ -245,6 +245,15 @@ pub trait NativeBalanceReader: Send + Sync {
     ) -> Result<RawAmount, ChainError>;
 }
 
+#[async_trait]
+pub trait PendingNonceReader: Send + Sync {
+    async fn pending_nonce(
+        &self,
+        chain_id: u64,
+        owner: EvmAddress,
+    ) -> Result<RawAmount, ChainError>;
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Eip1559FeeEstimate {
     pub max_fee_per_gas: RawAmount,
@@ -343,6 +352,15 @@ impl FakeErc20ChainClient {
         self.clone()
     }
 
+    pub fn set_pending_nonce(&self, owner: EvmAddress, nonce: RawAmount) -> Self {
+        self.state
+            .lock()
+            .expect("fake chain mutex poisoned")
+            .pending_nonces
+            .insert(owner, nonce);
+        self.clone()
+    }
+
     pub fn set_fee_estimate(&self, estimate: Eip1559FeeEstimate) -> Self {
         self.state
             .lock()
@@ -403,6 +421,10 @@ pub enum FakeChainCall {
         chain_id: u64,
         owner: EvmAddress,
     },
+    PendingNonce {
+        chain_id: u64,
+        owner: EvmAddress,
+    },
     EstimateEip1559Fees,
     TokenBalance {
         token: EvmAddress,
@@ -421,6 +443,7 @@ struct FakeChainState {
     safe_head: Option<ChainBlockRef>,
     finalized_head: Option<ChainBlockRef>,
     native_balances: BTreeMap<EvmAddress, RawAmount>,
+    pending_nonces: BTreeMap<EvmAddress, RawAmount>,
     fee_estimate: Eip1559FeeEstimate,
     balances: BTreeMap<(EvmAddress, EvmAddress), RawAmount>,
     receipts: BTreeMap<TxHash, TxReceipt>,
@@ -436,6 +459,28 @@ impl FakeChainState {
         } else {
             Ok(())
         }
+    }
+}
+
+#[async_trait]
+impl PendingNonceReader for FakeErc20ChainClient {
+    async fn pending_nonce(
+        &self,
+        chain_id: u64,
+        owner: EvmAddress,
+    ) -> Result<RawAmount, ChainError> {
+        let mut state = self.state.lock().expect("fake chain mutex poisoned");
+        state
+            .calls
+            .push(FakeChainCall::PendingNonce { chain_id, owner });
+        state.take_error()?;
+        if chain_id != state.chain_id {
+            return Err(ChainError::ChainIdMismatch {
+                expected: chain_id,
+                actual: state.chain_id,
+            });
+        }
+        Ok(*state.pending_nonces.get(&owner).unwrap_or(&RawAmount::ZERO))
     }
 }
 

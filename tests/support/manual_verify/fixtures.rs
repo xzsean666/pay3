@@ -18,6 +18,7 @@ pub fn order_view(expected_amount_raw: RawAmount) -> OrderView {
     OrderView {
         order: OrderRecord {
             id: order_id(),
+            owner_sub: "merchant-1".to_string(),
             external_id: "merchant-order-1".to_string(),
             request_hash: "0xrequest".to_string(),
             child_account_id,

@@ -63,6 +63,20 @@ impl OrderRepository for FakeOrderRepository {
             .map(|view| view.order.clone()))
     }
 
+    async fn get_order_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+    ) -> Result<Option<OrderRecord>, RepositoryError> {
+        Ok(self
+            .view
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|view| view.order.id == id && view.order.owner_sub == owner_sub)
+            .map(|view| view.order.clone()))
+    }
+
     async fn get_order_view(&self, id: Uuid) -> Result<Option<OrderView>, RepositoryError> {
         Ok(self
             .view
@@ -73,9 +87,24 @@ impl OrderRepository for FakeOrderRepository {
             .cloned())
     }
 
-    async fn get_order_by_external_id(
+    async fn get_order_view_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+    ) -> Result<Option<OrderView>, RepositoryError> {
+        Ok(self
+            .view
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|view| view.order.id == id && view.order.owner_sub == owner_sub)
+            .cloned())
+    }
+
+    async fn get_order_by_external_id_for_owner(
         &self,
         _external_id: &str,
+        _owner_sub: &str,
     ) -> Result<Option<OrderRecord>, RepositoryError> {
         unimplemented!("manual verify does not query external ids")
     }

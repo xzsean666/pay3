@@ -22,6 +22,7 @@ use super::{
 const ORDER_SELECT: &str = r#"
 SELECT
     o.id,
+    o.owner_sub,
     o.external_id,
     o.request_hash,
     o.child_account_id,
@@ -41,6 +42,7 @@ FROM orders o
 const ORDER_VIEW_SELECT: &str = r#"
 SELECT
     o.id,
+    o.owner_sub,
     o.external_id,
     o.request_hash,
     o.child_account_id,
@@ -107,11 +109,24 @@ pub trait OrderRepository: Send + Sync {
 
     async fn get_order(&self, id: Uuid) -> Result<Option<OrderRecord>, RepositoryError>;
 
+    async fn get_order_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+    ) -> Result<Option<OrderRecord>, RepositoryError>;
+
     async fn get_order_view(&self, id: Uuid) -> Result<Option<OrderView>, RepositoryError>;
 
-    async fn get_order_by_external_id(
+    async fn get_order_view_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+    ) -> Result<Option<OrderView>, RepositoryError>;
+
+    async fn get_order_by_external_id_for_owner(
         &self,
         external_id: &str,
+        owner_sub: &str,
     ) -> Result<Option<OrderRecord>, RepositoryError>;
 }
 
@@ -257,13 +272,15 @@ impl OrderRepository for PgOrderRepository {
     ) -> Result<CreateOrderOutcome, RepositoryError> {
         let mut tx = self.pool.begin().await.map_err(db_error)?;
 
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1)::bigint)")
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1 || ':' || $2)::bigint)")
+            .bind(&command.owner_sub)
             .bind(&command.external_id)
             .execute(&mut *tx)
             .await
             .map_err(db_error)?;
 
-        if let Some(existing) = fetch_order_by_external_id_tx(&mut tx, &command.external_id).await?
+        if let Some(existing) =
+            fetch_order_by_external_id_tx(&mut tx, &command.external_id, &command.owner_sub).await?
         {
             if existing.request_hash == command.request_hash {
                 tx.commit().await.map_err(db_error)?;
@@ -290,6 +307,22 @@ impl OrderRepository for PgOrderRepository {
         row.map(|row| row_to_order_record(&row)).transpose()
     }
 
+    async fn get_order_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+    ) -> Result<Option<OrderRecord>, RepositoryError> {
+        let sql = format!("{ORDER_SELECT} WHERE o.id = $1 AND o.owner_sub = $2");
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .bind(owner_sub)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_error)?;
+
+        row.map(|row| row_to_order_record(&row)).transpose()
+    }
+
     async fn get_order_view(&self, id: Uuid) -> Result<Option<OrderView>, RepositoryError> {
         let sql = format!("{ORDER_VIEW_SELECT} WHERE o.id = $1");
         let row = sqlx::query(&sql)
@@ -301,13 +334,31 @@ impl OrderRepository for PgOrderRepository {
         row.map(row_to_order_view).transpose()
     }
 
-    async fn get_order_by_external_id(
+    async fn get_order_view_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+    ) -> Result<Option<OrderView>, RepositoryError> {
+        let sql = format!("{ORDER_VIEW_SELECT} WHERE o.id = $1 AND o.owner_sub = $2");
+        let row = sqlx::query(&sql)
+            .bind(id)
+            .bind(owner_sub)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_error)?;
+
+        row.map(row_to_order_view).transpose()
+    }
+
+    async fn get_order_by_external_id_for_owner(
         &self,
         external_id: &str,
+        owner_sub: &str,
     ) -> Result<Option<OrderRecord>, RepositoryError> {
-        let sql = format!("{ORDER_SELECT} WHERE o.external_id = $1");
+        let sql = format!("{ORDER_SELECT} WHERE o.external_id = $1 AND o.owner_sub = $2");
         let row = sqlx::query(&sql)
             .bind(external_id)
+            .bind(owner_sub)
             .fetch_optional(&self.pool)
             .await
             .map_err(db_error)?;
@@ -504,6 +555,7 @@ async fn insert_order_tx(
         r#"
         INSERT INTO orders (
             id,
+            owner_sub,
             external_id,
             request_hash,
             child_account_id,
@@ -515,11 +567,12 @@ async fn insert_order_tx(
             expires_at,
             monitor_until
         ) VALUES (
-            $1, $2, $3, $4, $5, $6, $7, $8, 'pending', $9, $10
+            $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11
         )
         "#,
     )
     .bind(command.order_id)
+    .bind(&command.owner_sub)
     .bind(&command.external_id)
     .bind(&command.request_hash)
     .bind(child_account_id)
@@ -590,10 +643,12 @@ async fn fetch_order_by_id_tx(
 async fn fetch_order_by_external_id_tx(
     tx: &mut Transaction<'_, Postgres>,
     external_id: &str,
+    owner_sub: &str,
 ) -> Result<Option<OrderRecord>, RepositoryError> {
-    let sql = format!("{ORDER_SELECT} WHERE o.external_id = $1");
+    let sql = format!("{ORDER_SELECT} WHERE o.external_id = $1 AND o.owner_sub = $2");
     let row = sqlx::query(&sql)
         .bind(external_id)
+        .bind(owner_sub)
         .fetch_optional(&mut **tx)
         .await
         .map_err(db_error)?;
@@ -604,6 +659,7 @@ async fn fetch_order_by_external_id_tx(
 fn row_to_order_record(row: &PgRow) -> Result<OrderRecord, RepositoryError> {
     Ok(OrderRecord {
         id: row.try_get("id").map_err(db_error)?,
+        owner_sub: row.try_get("owner_sub").map_err(db_error)?,
         external_id: row.try_get("external_id").map_err(db_error)?,
         request_hash: row.try_get("request_hash").map_err(db_error)?,
         child_account_id: row.try_get("child_account_id").map_err(db_error)?,
@@ -705,6 +761,10 @@ fn row_to_payment_window_candidate(row: &PgRow) -> Result<PaymentWindowCandidate
 }
 
 fn validate_create_order_command(command: &CreateOrderCommand) -> Result<(), RepositoryError> {
+    if command.owner_sub.trim().is_empty() {
+        return Err(invalid_persisted_state("order owner_sub must not be empty"));
+    }
+
     if command.payment_window.order_id != command.order_id {
         return Err(invalid_persisted_state(
             "payment_window.order_id does not match command.order_id",

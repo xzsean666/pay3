@@ -9,7 +9,7 @@ use alloy_primitives::keccak256;
 use axum::{
     Json, Router,
     extract::State,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -259,6 +259,45 @@ async fn remote_http_signer_round_trip_is_deterministic() {
 }
 
 #[tokio::test]
+async fn remote_http_signer_sends_configured_bearer_token() {
+    let signer =
+        DeterministicFakeSigner::with_allowed_key_refs(TEST_NAMESPACE, [TEST_KEY_REF]).unwrap();
+    let server = spawn_remote_signer_server_with_auth(
+        ServerMode::Happy,
+        signer,
+        Some("test-signer-token".to_string()),
+    )
+    .await;
+    let remote = RemoteHttpSigner::with_bearer_token(
+        server.base_url.clone(),
+        TEST_TIMEOUT,
+        Some("test-signer-token"),
+    )
+    .unwrap();
+
+    assert!(remote.bearer_token_configured());
+    remote.health_check().await.unwrap();
+    remote
+        .derive_address(TEST_KEY_REF, TEST_PATH)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn remote_http_signer_debug_redacts_bearer_token() {
+    let remote = RemoteHttpSigner::with_bearer_token(
+        "https://signer.example",
+        TEST_TIMEOUT,
+        Some("super-secret-signer-token"),
+    )
+    .unwrap();
+
+    let debug = format!("{remote:?}");
+    assert!(debug.contains("<redacted>"));
+    assert!(!debug.contains("super-secret-signer-token"));
+}
+
+#[tokio::test]
 async fn remote_http_signer_reports_transport_failures() {
     let remote = RemoteHttpSigner::new(closed_endpoint().await, TEST_TIMEOUT).unwrap();
 
@@ -383,6 +422,7 @@ struct ServerState {
     expected_key_ref: String,
     expected_path: String,
     expected_tx: UnsignedTx,
+    expected_bearer_token: Option<String>,
 }
 
 struct TestServer {
@@ -418,12 +458,21 @@ async fn spawn_remote_signer_server(
     mode: ServerMode,
     signer: DeterministicFakeSigner,
 ) -> TestServer {
+    spawn_remote_signer_server_with_auth(mode, signer, None).await
+}
+
+async fn spawn_remote_signer_server_with_auth(
+    mode: ServerMode,
+    signer: DeterministicFakeSigner,
+    expected_bearer_token: Option<String>,
+) -> TestServer {
     let state = ServerState {
         signer,
         mode,
         expected_key_ref: TEST_KEY_REF.to_string(),
         expected_path: TEST_PATH.to_string(),
         expected_tx: unsigned_tx(12),
+        expected_bearer_token,
     };
 
     let app = Router::new()
@@ -453,14 +502,17 @@ async fn closed_endpoint() -> String {
     format!("http://{addr}")
 }
 
-async fn healthz() -> Json<HealthzResponse> {
+async fn healthz(State(state): State<ServerState>, headers: HeaderMap) -> Json<HealthzResponse> {
+    assert_expected_auth(&state, &headers);
     Json(HealthzResponse { status: "ok" })
 }
 
 async fn derive_address(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(request): Json<DeriveAddressRequest>,
 ) -> Response {
+    assert_expected_auth(&state, &headers);
     assert_eq!(request.key_ref, state.expected_key_ref);
     assert_eq!(request.path, state.expected_path);
 
@@ -478,8 +530,10 @@ async fn derive_address(
 
 async fn sign_transaction(
     State(state): State<ServerState>,
+    headers: HeaderMap,
     Json(request): Json<SignTransactionRequest>,
 ) -> Response {
+    assert_expected_auth(&state, &headers);
     assert_eq!(request.key_ref, state.expected_key_ref);
     assert_eq!(request.path, state.expected_path);
     assert_eq!(request.transaction, state.expected_tx);
@@ -494,4 +548,16 @@ async fn sign_transaction(
         .await
         .unwrap();
     Json(signed_tx).into_response()
+}
+
+fn assert_expected_auth(state: &ServerState, headers: &HeaderMap) {
+    if let Some(token) = &state.expected_bearer_token {
+        let expected = format!("Bearer {token}");
+        assert_eq!(
+            headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some(expected.as_str())
+        );
+    }
 }

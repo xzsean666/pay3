@@ -16,9 +16,9 @@ Rust ERC20 token 收款平台。MVP 目标是用单一链、单一 token、单�
 
 扫链数据分工：PostgreSQL 只保存订单、派生地址、matched Pay3 payments、业务 cursor、归集和 outbound tx；raw Transfer logs、非 Pay3 logs、raw scan batches、block header cache 只进 KVDB 或内存。
 
-当前验证：`cargo fmt -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test`、`cargo build --release --locked`、`DATABASE_URL=... docker compose config`、`PAY3_ENV_FILE=.env.example docker compose --env-file .env.example --profile local-db config` 均通过。最近一次全量测试为 163 个库测试 + 65 个 integration/contract 测试 + 2 个 Anvil e2e。
+当前验证：`cargo fmt -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --locked`、`cargo audit`、`cargo build --release --locked`、`DATABASE_URL=... PAY3_ENV_FILE=.env.example docker compose --env-file .env.example config`、`PAY3_ENV_FILE=.env.example docker compose --env-file .env.example --profile local-db config` 均通过。最近一次全量测试为 180 个库测试 + 75 个 integration/contract 测试，其中包含 2 个 Anvil e2e；真实链 e2e 仍为显式手动 gate。
 
-本地 Docker dry-run：默认需要传入 `DATABASE_URL`，并需要宿主机 `8545` 上有 chain id `31337` 的 Anvil/local JSON-RPC；需要跑 token 转账/归集流程时，先部署 mock ERC20 并覆盖 `TOKEN_ADDRESS`。外部数据库可直接用 `DATABASE_URL=... docker compose up --build pay3`；如需 compose 内置 Postgres，使用 `docker compose --profile local-db --env-file .env.example up --build`。本地覆盖配置可复制为 `.env` 后用 `PAY3_ENV_FILE=.env docker compose up --build pay3`。该 Compose 入口只用于 development/staging dry-run，不代表生产 signer、RPC、JWT key 和备份演练已经闭环。
+本地 Docker dry-run：默认需要传入 `DATABASE_URL`，并需要宿主机 `8545` 上有 chain id `31337` 的 Anvil/local JSON-RPC；需要跑 token 转账/归集流程时，先部署 mock ERC20 并覆盖 `TOKEN_ADDRESS`。外部数据库可用 `DATABASE_URL=... PAY3_ENV_FILE=.env.example docker compose --env-file .env.example up --build pay3`；如需 compose 内置 Postgres，使用 `PAY3_ENV_FILE=.env.example docker compose --env-file .env.example --profile local-db up --build`。本地覆盖配置可复制为 `.env` 后用 `PAY3_ENV_FILE=.env docker compose --env-file .env up --build pay3`。该 Compose 入口只用于 development/staging dry-run，不代表生产 signer、RPC、JWT key 和备份演练已经闭环。
 
 文档入口：
 

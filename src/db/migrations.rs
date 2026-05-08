@@ -84,7 +84,7 @@ async fn seed_chain_cursor(
 ) -> Result<(), MigrationBootstrapError> {
     let chain_id = i64::try_from(config.chain_id)?;
     let start_block = i64::try_from(config.start_block)?;
-    let last_scanned_block = start_block.saturating_sub(1);
+    let last_scanned_block = start_block.saturating_sub(1).max(0);
 
     sqlx::query(
         r#"

@@ -229,13 +229,19 @@ impl OrderResponseConfig {
 pub trait OrderApiService: Send + Sync {
     async fn create_order(
         &self,
+        owner_sub: &str,
         input: CreateOrderInput,
     ) -> Result<CreateOrderResult, OrderServiceError>;
 
-    async fn get_order(&self, id: Uuid) -> Result<Option<OrderView>, OrderServiceError>;
+    async fn get_order(
+        &self,
+        owner_sub: &str,
+        id: Uuid,
+    ) -> Result<Option<OrderView>, OrderServiceError>;
 
     async fn get_order_by_external_id(
         &self,
+        owner_sub: &str,
         external_id: &str,
     ) -> Result<Option<OrderView>, OrderServiceError>;
 }
@@ -249,6 +255,7 @@ pub trait CollectionApiService: Send + Sync {
 
     async fn get_collection(
         &self,
+        owner_sub: &str,
         id: Uuid,
     ) -> Result<Option<CollectionRecord>, CollectionServiceError>;
 }
@@ -264,20 +271,26 @@ where
 {
     async fn create_order(
         &self,
+        owner_sub: &str,
         input: CreateOrderInput,
     ) -> Result<CreateOrderResult, OrderServiceError> {
-        OrderService::create_order(self, input).await
+        OrderService::create_order_for_owner(self, owner_sub, input).await
     }
 
-    async fn get_order(&self, id: Uuid) -> Result<Option<OrderView>, OrderServiceError> {
-        OrderService::get_order(self, id).await
+    async fn get_order(
+        &self,
+        owner_sub: &str,
+        id: Uuid,
+    ) -> Result<Option<OrderView>, OrderServiceError> {
+        OrderService::get_order_for_owner(self, id, owner_sub).await
     }
 
     async fn get_order_by_external_id(
         &self,
+        owner_sub: &str,
         external_id: &str,
     ) -> Result<Option<OrderView>, OrderServiceError> {
-        OrderService::get_order_by_external_id(self, external_id).await
+        OrderService::get_order_by_external_id_for_owner(self, external_id, owner_sub).await
     }
 }
 
@@ -289,7 +302,9 @@ where
     B: crate::db::repositories::OutboundRepository,
     A: crate::db::repositories::AuditRepository,
     S: crate::signer::SignerProvider,
-    H: crate::chain::Erc20ChainClient + crate::chain::Eip1559FeeEstimator,
+    H: crate::chain::Erc20ChainClient
+        + crate::chain::Eip1559FeeEstimator
+        + crate::chain::PendingNonceReader,
     G: crate::services::collections::PrefundedGasChecker,
     I: crate::services::orders::IdGenerator,
 {
@@ -302,9 +317,10 @@ where
 
     async fn get_collection(
         &self,
+        owner_sub: &str,
         id: Uuid,
     ) -> Result<Option<CollectionRecord>, CollectionServiceError> {
-        CollectionService::get_collection(self, id).await
+        CollectionService::get_collection_for_owner(self, id, owner_sub).await
     }
 }
 
@@ -314,23 +330,23 @@ pub fn router(config: AppConfig) -> Router {
         DependencyCheck::healthy(DependencyName::WorkerLease),
         DependencyCheck::failed(
             DependencyName::Db,
-            "runtime services were not bootstrapped; use runtime::build_api_router",
+            "runtime services were not bootstrapped; use runtime::build_api_runtime",
         ),
         DependencyCheck::failed(
             DependencyName::Migration,
-            "runtime services were not bootstrapped; use runtime::build_api_router",
+            "runtime services were not bootstrapped; use runtime::build_api_runtime",
         ),
         DependencyCheck::failed(
             DependencyName::RpcChainId,
-            "runtime services were not bootstrapped; use runtime::build_api_router",
+            "runtime services were not bootstrapped; use runtime::build_api_runtime",
         ),
         DependencyCheck::failed(
             DependencyName::Kvdb,
-            "runtime services were not bootstrapped; use runtime::build_api_router",
+            "runtime services were not bootstrapped; use runtime::build_api_runtime",
         ),
         DependencyCheck::failed(
             DependencyName::Signer,
-            "runtime services were not bootstrapped; use runtime::build_api_router",
+            "runtime services were not bootstrapped; use runtime::build_api_runtime",
         ),
     ]))
 }
@@ -564,7 +580,7 @@ async fn create_order(
     headers: HeaderMap,
     payload: Result<Json<CreateOrderRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<OrderResponse>), ApiError> {
-    require_scope(&state, &headers, ORDERS_CREATE_SCOPE)?;
+    let principal = require_scope(&state, &headers, ORDERS_CREATE_SCOPE)?;
     let Json(payload) = payload.map_err(json_rejection)?;
     let config = state.order_response_config()?;
 
@@ -585,7 +601,7 @@ async fn create_order(
         .with_metadata(metadata);
     let result = state
         .orders()?
-        .create_order(input)
+        .create_order(&principal.subject, input)
         .await
         .map_err(order_service_error_to_api)?;
     let status = match result.outcome {
@@ -602,12 +618,12 @@ async fn get_order(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<OrderResponse>, ApiError> {
-    require_scope(&state, &headers, ORDERS_READ_SCOPE)?;
+    let principal = require_scope(&state, &headers, ORDERS_READ_SCOPE)?;
     let id = parse_order_id(&id)?;
     let config = state.order_response_config()?;
     let Some(view) = state
         .orders()?
-        .get_order(id)
+        .get_order(&principal.subject, id)
         .await
         .map_err(order_service_error_to_api)?
     else {
@@ -622,11 +638,11 @@ async fn get_order_by_external_id(
     headers: HeaderMap,
     Path(external_id): Path<String>,
 ) -> Result<Json<OrderResponse>, ApiError> {
-    require_scope(&state, &headers, ORDERS_READ_SCOPE)?;
+    let principal = require_scope(&state, &headers, ORDERS_READ_SCOPE)?;
     let config = state.order_response_config()?;
     let Some(view) = state
         .orders()?
-        .get_order_by_external_id(&external_id)
+        .get_order_by_external_id(&principal.subject, &external_id)
         .await
         .map_err(order_service_error_to_api)?
     else {
@@ -678,11 +694,11 @@ async fn get_collection(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<CollectionResponse>, ApiError> {
-    require_scope(&state, &headers, COLLECTIONS_READ_SCOPE)?;
+    let principal = require_scope(&state, &headers, COLLECTIONS_READ_SCOPE)?;
     let id = parse_collection_id(&id)?;
     let Some(collection) = state
         .collections()?
-        .get_collection(id)
+        .get_collection(&principal.subject, id)
         .await
         .map_err(collection_service_error_to_api)?
     else {
@@ -1127,13 +1143,12 @@ mod tests {
 
         let calls = service.calls.lock().unwrap();
         assert_eq!(calls.create_inputs.len(), 1);
-        assert_eq!(calls.create_inputs[0].external_id, "merchant-order-1");
-        assert_eq!(
-            calls.create_inputs[0].expected_amount_raw,
-            RawAmount::from(12_340_000)
-        );
-        assert_eq!(calls.create_inputs[0].ttl_seconds, 900);
-        assert_eq!(calls.create_inputs[0].metadata["note"], "optional");
+        assert_eq!(calls.create_inputs[0].0, "merchant-1");
+        let input = &calls.create_inputs[0].1;
+        assert_eq!(input.external_id, "merchant-order-1");
+        assert_eq!(input.expected_amount_raw, RawAmount::from(12_340_000));
+        assert_eq!(input.ttl_seconds, 900);
+        assert_eq!(input.metadata["note"], "optional");
     }
 
     #[tokio::test]
@@ -1226,6 +1241,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_order_returns_404_for_different_owner() {
+        let view = order_view(
+            Uuid::from_u128(3),
+            "merchant-order-3",
+            RawAmount::from(1_000_000),
+        );
+        let service = Arc::new(FakeOrderApiService::with_order(view));
+
+        let response = request_json_with_app(
+            orders_app(service.clone()),
+            Method::GET,
+            "/v1/orders/00000000-0000-0000-0000-000000000003",
+            Value::Null,
+            Some(token_for_subject("merchant-2", ORDERS_READ_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            service.calls.lock().unwrap().get_ids,
+            vec![("merchant-2".to_string(), Uuid::from_u128(3))]
+        );
+    }
+
+    #[tokio::test]
     async fn get_order_by_external_id_returns_order_view() {
         let view = order_view(
             Uuid::from_u128(4),
@@ -1246,6 +1286,31 @@ mod tests {
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.body["id"], Uuid::from_u128(4).to_string());
         assert_eq!(response.body["payment"]["amount"], "2.5");
+    }
+
+    #[tokio::test]
+    async fn get_order_by_external_id_returns_404_for_different_owner() {
+        let view = order_view(
+            Uuid::from_u128(4),
+            "merchant-order-4",
+            RawAmount::from(2_500_000),
+        );
+        let service = Arc::new(FakeOrderApiService::with_order(view));
+
+        let response = request_json_with_app(
+            orders_app(service.clone()),
+            Method::GET,
+            "/v1/orders/by-external-id/merchant-order-4",
+            Value::Null,
+            Some(token_for_subject("merchant-2", ORDERS_READ_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            service.calls.lock().unwrap().get_external_ids,
+            vec![("merchant-2".to_string(), "merchant-order-4".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -1532,7 +1597,34 @@ mod tests {
 
         assert_eq!(
             service.calls.lock().unwrap().get_ids,
-            vec![Uuid::from_u128(14)]
+            vec![("merchant-1".to_string(), Uuid::from_u128(14))]
+        );
+    }
+
+    #[tokio::test]
+    async fn get_collections_returns_404_for_different_owner() {
+        let mut record = collection_record(
+            Uuid::from_u128(16),
+            Uuid::from_u128(10),
+            CollectionRecordStatus::Confirming,
+        );
+        record.owner_sub = "merchant-2".to_string();
+        let service = Arc::new(FakeCollectionApiService::with_collection(record));
+
+        let response = request_json_with_app(
+            collections_app(service.clone()),
+            Method::GET,
+            "/v1/collections/00000000-0000-0000-0000-000000000010",
+            Value::Null,
+            Some(token_for_subject("merchant-1", COLLECTIONS_READ_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::NOT_FOUND);
+        assert_eq!(response.body["error"]["message"], "collection not found");
+        assert_eq!(
+            service.calls.lock().unwrap().get_ids,
+            vec![("merchant-1".to_string(), Uuid::from_u128(16))]
         );
     }
 
@@ -1618,6 +1710,10 @@ mod tests {
     }
 
     fn token(scopes: &str) -> String {
+        token_for_subject("merchant-1", scopes)
+    }
+
+    fn token_for_subject(subject: &str, scopes: &str) -> String {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -1628,7 +1724,7 @@ mod tests {
             iat: now,
             iss: ISSUER.to_string(),
             aud: Audience::One(AUDIENCE.to_string()),
-            sub: "merchant-1".to_string(),
+            sub: subject.to_string(),
             scope: Some(scopes.to_string()),
             scopes: None,
             scp: None,
@@ -1655,6 +1751,7 @@ mod tests {
         OrderView {
             order: OrderRecord {
                 id,
+                owner_sub: "merchant-1".to_string(),
                 external_id: external_id.to_string(),
                 request_hash: "0xrequest".to_string(),
                 child_account_id,
@@ -1701,6 +1798,7 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_777_777_777).unwrap();
         CollectionRecord {
             id,
+            owner_sub: "merchant-1".to_string(),
             order_id,
             idempotency_key: "collect-1".to_string(),
             request_hash: "0xcollection-request".to_string(),
@@ -1763,18 +1861,23 @@ mod tests {
 
     #[derive(Default)]
     struct FakeOrderApiCalls {
-        create_inputs: Vec<CreateOrderInput>,
-        get_ids: Vec<Uuid>,
-        get_external_ids: Vec<String>,
+        create_inputs: Vec<(String, CreateOrderInput)>,
+        get_ids: Vec<(String, Uuid)>,
+        get_external_ids: Vec<(String, String)>,
     }
 
     #[async_trait]
     impl OrderApiService for FakeOrderApiService {
         async fn create_order(
             &self,
+            owner_sub: &str,
             input: CreateOrderInput,
         ) -> Result<CreateOrderResult, OrderServiceError> {
-            self.calls.lock().unwrap().create_inputs.push(input);
+            self.calls
+                .lock()
+                .unwrap()
+                .create_inputs
+                .push((owner_sub.to_string(), input));
             match self.create_result.lock().unwrap().take() {
                 Some(Ok(result)) => Ok(result),
                 Some(Err(error)) => Err(error),
@@ -1785,20 +1888,35 @@ mod tests {
             }
         }
 
-        async fn get_order(&self, id: Uuid) -> Result<Option<OrderView>, OrderServiceError> {
-            self.calls.lock().unwrap().get_ids.push(id);
-            Ok(self.orders.lock().unwrap().get(&id).cloned())
+        async fn get_order(
+            &self,
+            owner_sub: &str,
+            id: Uuid,
+        ) -> Result<Option<OrderView>, OrderServiceError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .get_ids
+                .push((owner_sub.to_string(), id));
+            Ok(self
+                .orders
+                .lock()
+                .unwrap()
+                .get(&id)
+                .filter(|view| view.order.owner_sub == owner_sub)
+                .cloned())
         }
 
         async fn get_order_by_external_id(
             &self,
+            owner_sub: &str,
             external_id: &str,
         ) -> Result<Option<OrderView>, OrderServiceError> {
             self.calls
                 .lock()
                 .unwrap()
                 .get_external_ids
-                .push(external_id.to_string());
+                .push((owner_sub.to_string(), external_id.to_string()));
             let Some(id) = self
                 .orders_by_external_id
                 .lock()
@@ -1808,7 +1926,13 @@ mod tests {
             else {
                 return Ok(None);
             };
-            Ok(self.orders.lock().unwrap().get(&id).cloned())
+            Ok(self
+                .orders
+                .lock()
+                .unwrap()
+                .get(&id)
+                .filter(|view| view.order.owner_sub == owner_sub)
+                .cloned())
         }
     }
 
@@ -1847,7 +1971,7 @@ mod tests {
     #[derive(Default)]
     struct FakeCollectionApiCalls {
         create_inputs: Vec<CreateCollectionInput>,
-        get_ids: Vec<Uuid>,
+        get_ids: Vec<(String, Uuid)>,
     }
 
     #[async_trait]
@@ -1869,10 +1993,21 @@ mod tests {
 
         async fn get_collection(
             &self,
+            owner_sub: &str,
             id: Uuid,
         ) -> Result<Option<CollectionRecord>, CollectionServiceError> {
-            self.calls.lock().unwrap().get_ids.push(id);
-            Ok(self.collections.lock().unwrap().get(&id).cloned())
+            self.calls
+                .lock()
+                .unwrap()
+                .get_ids
+                .push((owner_sub.to_string(), id));
+            Ok(self
+                .collections
+                .lock()
+                .unwrap()
+                .get(&id)
+                .filter(|collection| collection.owner_sub == owner_sub)
+                .cloned())
         }
     }
 

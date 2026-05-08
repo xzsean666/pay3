@@ -8,7 +8,11 @@ const AUDIT_REPOSITORY: &str = include_str!("../src/db/repositories/audit.rs");
 #[test]
 fn order_repository_uses_external_id_lock_and_idempotency() {
     for fragment in [
-        "pg_advisory_xact_lock(hashtext($1)::bigint)",
+        "pg_advisory_xact_lock(hashtext($1 || ':' || $2)::bigint)",
+        "owner_sub",
+        "get_order_view_for_owner",
+        "get_order_by_external_id_for_owner",
+        "AND o.owner_sub = $2",
         "fetch_order_by_external_id_tx",
         "idempotency_conflict",
         "INSERT INTO child_accounts",
@@ -69,6 +73,10 @@ fn collection_repository_uses_job_lock_and_treasury_backed_insert() {
     for fragment in [
         "FOR UPDATE SKIP LOCKED",
         "status = 'queued'",
+        "owner_sub",
+        "get_collection_for_owner",
+        "ON CONFLICT (owner_sub, idempotency_key) DO NOTHING",
+        "AND owner_sub = $2",
         "idempotency_key",
         "request_hash",
         "get_collection",
@@ -108,6 +116,9 @@ fn outbound_repository_serializes_nonce_and_preserves_replacement_invariants() {
         "claim_broadcast_collect_tx_for_receipt",
         "c.status = 'confirming'",
         "o.status = 'broadcast'",
+        "rows_affected() != 1",
+        "not attached to a confirmable collection",
+        "not attached to a failable collection",
         "FOR UPDATE OF c SKIP LOCKED",
         "locked_until",
     ] {

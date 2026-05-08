@@ -11,8 +11,9 @@ use crate::domain::{BlockHash, ChainBlockRef, EvmAddress, RawAmount, TxHash};
 use super::{
     error::RepositoryError,
     types::{
-        BroadcastableOutboundTx, NewSignedOutboundTx, OutboundTxPurpose, OutboundTxRecord,
-        OutboundTxStatus, ReceiptCheckableOutboundTx, ReservedNonce,
+        BroadcastableOutboundTx, InsertSignedCollectTxResult, NewSignedOutboundTx,
+        OutboundTxPurpose, OutboundTxRecord, OutboundTxStatus, ReceiptCheckableOutboundTx,
+        ReservedNonce,
     },
 };
 
@@ -45,12 +46,20 @@ pub trait OutboundRepository: Send + Sync {
         &self,
         chain_id: u64,
         from_address: EvmAddress,
+        pending_nonce: RawAmount,
     ) -> Result<ReservedNonce, RepositoryError>;
 
     async fn insert_signed_tx(
         &self,
         tx: NewSignedOutboundTx,
     ) -> Result<OutboundTxRecord, RepositoryError>;
+
+    async fn insert_signed_collect_tx(
+        &self,
+        collection_id: Uuid,
+        tx: NewSignedOutboundTx,
+        resolved_amount_raw: RawAmount,
+    ) -> Result<InsertSignedCollectTxResult, RepositoryError>;
 
     async fn replace_signed_tx(
         &self,
@@ -111,9 +120,11 @@ impl OutboundRepository for PgOutboundRepository {
         &self,
         chain_id: u64,
         from_address: EvmAddress,
+        pending_nonce: RawAmount,
     ) -> Result<ReservedNonce, RepositoryError> {
         let chain_id_i64 = u64_to_i64(chain_id, "chain_id")?;
         let from_address_hex = from_address.to_lower_hex();
+        let pending_nonce_decimal = raw_amount_to_decimal(pending_nonce)?;
         let mut tx = self.pool.begin().await?;
 
         sqlx::query(
@@ -123,12 +134,15 @@ impl OutboundRepository for PgOutboundRepository {
                 address,
                 next_nonce
             )
-            VALUES ($1, $2, 0)
-            ON CONFLICT (chain_id, address) DO NOTHING
+            VALUES ($1, $2, $3)
+            ON CONFLICT (chain_id, address) DO UPDATE
+            SET next_nonce = GREATEST(account_nonces.next_nonce, EXCLUDED.next_nonce),
+                updated_at = now()
             "#,
         )
         .bind(chain_id_i64)
         .bind(&from_address_hex)
+        .bind(pending_nonce_decimal)
         .execute(&mut *tx)
         .await?;
 
@@ -177,6 +191,48 @@ impl OutboundRepository for PgOutboundRepository {
         let record = insert_signed_tx_row(&mut db_tx, &tx, None).await?;
         db_tx.commit().await?;
         Ok(record)
+    }
+
+    async fn insert_signed_collect_tx(
+        &self,
+        collection_id: Uuid,
+        tx: NewSignedOutboundTx,
+        resolved_amount_raw: RawAmount,
+    ) -> Result<InsertSignedCollectTxResult, RepositoryError> {
+        let mut db_tx = self.pool.begin().await?;
+        let record = insert_signed_tx_row(&mut db_tx, &tx, None).await?;
+
+        let update = sqlx::query(
+            r#"
+            UPDATE collections
+            SET outbound_tx_id = $2,
+                amount_raw = COALESCE(amount_raw, $3),
+                status = 'transferring',
+                locked_by = NULL,
+                locked_until = NULL,
+                error = NULL,
+                updated_at = now()
+            WHERE id = $1
+              AND status IN ('queued', 'transferring', 'replacing')
+            "#,
+        )
+        .bind(collection_id)
+        .bind(record.id)
+        .bind(raw_amount_to_decimal(resolved_amount_raw)?)
+        .execute(&mut *db_tx)
+        .await?;
+
+        if update.rows_affected() != 1 {
+            return Err(protocol_error(format!(
+                "collection {collection_id} is not attachable"
+            )));
+        }
+
+        db_tx.commit().await?;
+        Ok(InsertSignedCollectTxResult {
+            collection_id,
+            outbound: record,
+        })
     }
 
     async fn replace_signed_tx(
@@ -390,7 +446,7 @@ impl OutboundRepository for PgOutboundRepository {
             })?;
         let record = outbound_record_from_row(&row)?;
 
-        sqlx::query(
+        let update = sqlx::query(
             r#"
             UPDATE collections
             SET status = 'confirming',
@@ -404,6 +460,11 @@ impl OutboundRepository for PgOutboundRepository {
         .bind(tx_id)
         .execute(&mut *tx)
         .await?;
+        if update.rows_affected() != 1 {
+            return Err(protocol_error(format!(
+                "outbound transaction {tx_id} is not attached to a broadcastable collection"
+            )));
+        }
 
         tx.commit().await?;
         Ok(record)
@@ -440,7 +501,7 @@ impl OutboundRepository for PgOutboundRepository {
             })?;
         let record = outbound_record_from_row(&row)?;
 
-        sqlx::query(
+        let update = sqlx::query(
             r#"
             UPDATE collections
             SET status = 'confirmed',
@@ -449,11 +510,17 @@ impl OutboundRepository for PgOutboundRepository {
                 error = NULL,
                 updated_at = now()
             WHERE outbound_tx_id = $1
+              AND status = 'confirming'
             "#,
         )
         .bind(tx_id)
         .execute(&mut *tx)
         .await?;
+        if update.rows_affected() != 1 {
+            return Err(protocol_error(format!(
+                "outbound transaction {tx_id} is not attached to a confirmable collection"
+            )));
+        }
 
         tx.commit().await?;
         Ok(record)
@@ -487,7 +554,7 @@ impl OutboundRepository for PgOutboundRepository {
             })?;
         let record = outbound_record_from_row(&row)?;
 
-        sqlx::query(
+        let update = sqlx::query(
             r#"
             UPDATE collections
             SET status = 'failed',
@@ -496,12 +563,18 @@ impl OutboundRepository for PgOutboundRepository {
                 error = $2,
                 updated_at = now()
             WHERE outbound_tx_id = $1
+              AND status = 'confirming'
             "#,
         )
         .bind(tx_id)
         .bind(error)
         .execute(&mut *tx)
         .await?;
+        if update.rows_affected() != 1 {
+            return Err(protocol_error(format!(
+                "outbound transaction {tx_id} is not attached to a failable collection"
+            )));
+        }
 
         tx.commit().await?;
         Ok(record)

@@ -96,6 +96,19 @@ where
                 kv_reorg_epoch: cursor.reorg_epoch,
             },
         );
+        for payment in &match_page.matched_payments {
+            let canonical_block = self
+                .head_reader
+                .block_by_number(payment.block_number)
+                .await?;
+            if canonical_block.hash != payment.block_hash {
+                return Err(ManualVerifyError::CanonicalBlockMismatch {
+                    block_number: payment.block_number,
+                    stored_hash: payment.block_hash,
+                    canonical_hash: canonical_block.hash,
+                });
+            }
+        }
         let matched_count = match_page.matched_payments.len() as u64;
         let records = self
             .recorder

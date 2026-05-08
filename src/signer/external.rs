@@ -7,7 +7,7 @@
 //! - `POST /v1/transactions/sign` accepts `{ "key_ref": "...", "path": "...", "transaction": UnsignedTx }`
 //!   and returns a `SignedTx` JSON object.
 
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use async_trait::async_trait;
 use reqwest::Client;
@@ -25,24 +25,51 @@ const DERIVE_ADDRESS_PATH: &str = "/v1/addresses/derive";
 const SIGN_TRANSACTION_PATH: &str = "/v1/transactions/sign";
 const HEALTHY_STATUS: &str = "ok";
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RemoteHttpSigner {
     endpoint: String,
     timeout: Duration,
+    bearer_token: Option<String>,
     client: Client,
+}
+
+impl fmt::Debug for RemoteHttpSigner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteHttpSigner")
+            .field("endpoint", &self.endpoint)
+            .field("timeout", &self.timeout)
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 impl RemoteHttpSigner {
     pub fn new(endpoint: impl Into<String>, timeout: Duration) -> Result<Self, SignerError> {
+        Self::with_bearer_token(endpoint, timeout, None::<String>)
+    }
+
+    pub fn with_bearer_token(
+        endpoint: impl Into<String>,
+        timeout: Duration,
+        bearer_token: Option<impl Into<String>>,
+    ) -> Result<Self, SignerError> {
         let endpoint = endpoint.into();
         let endpoint = endpoint.trim().trim_end_matches('/');
         if endpoint.is_empty() {
             return Err(SignerError::EmptyRemoteSignerEndpoint);
         }
+        let bearer_token = bearer_token
+            .map(Into::into)
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
 
         Ok(Self {
             endpoint: endpoint.to_string(),
             timeout,
+            bearer_token,
             client: Client::new(),
         })
     }
@@ -55,8 +82,19 @@ impl RemoteHttpSigner {
         self.timeout
     }
 
+    pub fn bearer_token_configured(&self) -> bool {
+        self.bearer_token.is_some()
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}/{}", self.endpoint, path.trim_start_matches('/'))
+    }
+
+    fn authenticated(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.bearer_token {
+            Some(token) => request.bearer_auth(token),
+            None => request,
+        }
     }
 
     async fn request_json<T>(
@@ -144,9 +182,11 @@ impl SignerProvider for RemoteHttpSigner {
             path,
         };
         self.request_json(
-            self.client
-                .post(self.url(DERIVE_ADDRESS_PATH))
-                .json(&request),
+            self.authenticated(
+                self.client
+                    .post(self.url(DERIVE_ADDRESS_PATH))
+                    .json(&request),
+            ),
             "derive_address",
         )
         .await
@@ -191,9 +231,11 @@ impl SignerProvider for RemoteHttpSigner {
             transaction: &tx,
         };
         self.request_json(
-            self.client
-                .post(self.url(SIGN_TRANSACTION_PATH))
-                .json(&request),
+            self.authenticated(
+                self.client
+                    .post(self.url(SIGN_TRANSACTION_PATH))
+                    .json(&request),
+            ),
             "sign_transaction",
         )
         .await
@@ -202,7 +244,7 @@ impl SignerProvider for RemoteHttpSigner {
     async fn health_check(&self) -> Result<(), SignerError> {
         let health = self
             .request_json::<HealthzResponse>(
-                self.client.get(self.url(HEALTHZ_PATH)),
+                self.authenticated(self.client.get(self.url(HEALTHZ_PATH))),
                 "health_check",
             )
             .await?;

@@ -17,6 +17,7 @@ const DEFAULT_CLAIM_LEASE_SECONDS: u64 = 60;
 
 const COLLECTION_COLUMNS: &str = r#"
     id,
+    owner_sub,
     order_id,
     idempotency_key,
     request_hash,
@@ -44,6 +45,12 @@ pub trait CollectionRepository: Send + Sync {
     ) -> Result<CollectionRecord, RepositoryError>;
 
     async fn get_collection(&self, id: Uuid) -> Result<Option<CollectionRecord>, RepositoryError>;
+
+    async fn get_collection_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+    ) -> Result<Option<CollectionRecord>, RepositoryError>;
 
     async fn get_collection_job(&self, id: Uuid) -> Result<Option<CollectionJob>, RepositoryError>;
 
@@ -90,8 +97,12 @@ impl CollectionRepository for PgCollectionRepository {
     ) -> Result<CollectionRecord, RepositoryError> {
         let mut tx = self.pool.begin().await?;
 
-        if let Some(existing) =
-            select_collection_by_idempotency_key(&mut tx, &command.idempotency_key).await?
+        if let Some(existing) = select_collection_by_idempotency_key(
+            &mut tx,
+            &command.owner_sub,
+            &command.idempotency_key,
+        )
+        .await?
         {
             ensure_same_collection_request(&existing, &command)?;
             tx.commit().await?;
@@ -104,12 +115,15 @@ impl CollectionRepository for PgCollectionRepository {
         let collection = match inserted {
             Some(collection) => collection,
             None => {
-                let existing =
-                    select_collection_by_idempotency_key(&mut tx, &command.idempotency_key)
-                        .await?
-                        .ok_or_else(|| {
-                            protocol_error("collection idempotency conflict did not return a row")
-                        })?;
+                let existing = select_collection_by_idempotency_key(
+                    &mut tx,
+                    &command.owner_sub,
+                    &command.idempotency_key,
+                )
+                .await?
+                .ok_or_else(|| {
+                    protocol_error("collection idempotency conflict did not return a row")
+                })?;
                 ensure_same_collection_request(&existing, &command)?;
                 existing
             }
@@ -130,6 +144,29 @@ impl CollectionRepository for PgCollectionRepository {
 
         sqlx::query(&sql)
             .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| collection_record_from_row(&row))
+            .transpose()
+    }
+
+    async fn get_collection_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+    ) -> Result<Option<CollectionRecord>, RepositoryError> {
+        let sql = format!(
+            r#"
+            SELECT {COLLECTION_COLUMNS}
+            FROM collections
+            WHERE id = $1
+              AND owner_sub = $2
+            "#
+        );
+
+        sqlx::query(&sql)
+            .bind(id)
+            .bind(owner_sub)
             .fetch_optional(&self.pool)
             .await?
             .map(|row| collection_record_from_row(&row))
@@ -244,18 +281,21 @@ impl CollectionRepository for PgCollectionRepository {
 
 async fn select_collection_by_idempotency_key(
     tx: &mut Transaction<'_, Postgres>,
+    owner_sub: &str,
     idempotency_key: &str,
 ) -> Result<Option<CollectionRecord>, RepositoryError> {
     let sql = format!(
         r#"
         SELECT {COLLECTION_COLUMNS}
         FROM collections
-        WHERE idempotency_key = $1
+        WHERE owner_sub = $1
+          AND idempotency_key = $2
         FOR UPDATE
         "#
     );
 
     sqlx::query(&sql)
+        .bind(owner_sub)
         .bind(idempotency_key)
         .fetch_optional(&mut **tx)
         .await?
@@ -272,6 +312,7 @@ async fn lock_paid_order_for_collection(
         SELECT status
         FROM orders
         WHERE id = $1
+          AND owner_sub = $6
           AND child_account_id = $2
           AND chain_id = $3
           AND token_address = $4
@@ -284,6 +325,7 @@ async fn lock_paid_order_for_collection(
     .bind(u64_to_i64(command.chain_id, "collections.chain_id")?)
     .bind(command.token_address.to_lower_hex())
     .bind(command.from_address.to_lower_hex())
+    .bind(&command.owner_sub)
     .fetch_optional(&mut **tx)
     .await?
     .ok_or_else(|| RepositoryError::not_found("orders", command.order_id.to_string()))?;
@@ -307,6 +349,7 @@ async fn insert_collection(
         r#"
         INSERT INTO collections (
             id,
+            owner_sub,
             order_id,
             idempotency_key,
             request_hash,
@@ -318,14 +361,15 @@ async fn insert_collection(
             amount_raw,
             status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'queued')
-        ON CONFLICT (idempotency_key) DO NOTHING
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued')
+        ON CONFLICT (owner_sub, idempotency_key) DO NOTHING
         RETURNING {COLLECTION_COLUMNS}
         "#
     );
 
     sqlx::query(&sql)
         .bind(command.collection_id)
+        .bind(&command.owner_sub)
         .bind(command.order_id)
         .bind(&command.idempotency_key)
         .bind(&command.request_hash)
@@ -361,6 +405,7 @@ fn collection_record_from_row(row: &PgRow) -> Result<CollectionRecord, Repositor
 
     Ok(CollectionRecord {
         id: row.try_get("id")?,
+        owner_sub: row.try_get("owner_sub")?,
         order_id: row.try_get("order_id")?,
         idempotency_key: row.try_get("idempotency_key")?,
         request_hash: row.try_get("request_hash")?,

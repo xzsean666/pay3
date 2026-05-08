@@ -11,18 +11,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = AppConfig::from_env()?;
     config.validate_profile()?;
 
-    let app = runtime::build_api_router(config.clone())
-        .await?
-        .layer(TraceLayer::new_for_http());
-    let listener = tokio::net::TcpListener::bind(config.http.bind_addr).await?;
+    let runtime = runtime::build_api_runtime(config.clone()).await?;
 
-    tracing::info!(addr = %config.http.bind_addr, "pay3 api listening");
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    if config.runtime.api_enabled() {
+        let app = runtime.router().layer(TraceLayer::new_for_http());
+        let listener = tokio::net::TcpListener::bind(config.http.bind_addr).await?;
+
+        tracing::info!(addr = %config.http.bind_addr, "pay3 api listening");
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    } else {
+        tracing::info!("pay3 worker runtime started");
+        shutdown_signal().await;
+    }
+
+    runtime.shutdown().await;
 
     Ok(())
 }

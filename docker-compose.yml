@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     profiles:
       - local-db
     environment:
@@ -27,6 +28,7 @@ services:
       context: .
       dockerfile: Dockerfile
     image: pay3:local
+    restart: unless-stopped
     env_file:
       - ${PAY3_ENV_FILE:-.env.example}
     environment:

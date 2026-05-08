@@ -1,0 +1,77 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pay3
+          POSTGRES_PASSWORD: pay3_dev_password
+          POSTGRES_DB: pay3
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pay3 -d pay3"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PAY3_TEST_DATABASE_URL: postgres://pay3:pay3_dev_password@127.0.0.1:5432/pay3
+      TEST_DATABASE_URL: postgres://pay3:pay3_dev_password@127.0.0.1:5432/pay3
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Format
+        run: cargo fmt -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Audit Ignore Guard
+        run: |
+          if cargo tree -i rsa --locked --target all | grep -q '^rsa v'; then
+            echo "RUSTSEC-2023-0071 is ignored only while rsa is absent from the active build graph"
+            exit 1
+          fi
+          if cargo tree -i sqlx-mysql --locked --target all | grep -q '^sqlx-mysql v'; then
+            echo "RUSTSEC-2023-0071 is ignored only while sqlx-mysql is absent from the active build graph"
+            exit 1
+          fi
+
+      - name: Audit
+        run: cargo audit
+
+      - name: Release Build
+        run: cargo build --release --locked
+
+      - name: Docker Compose Config
+        run: |
+          DATABASE_URL="$PAY3_TEST_DATABASE_URL" PAY3_ENV_FILE=.env.example docker compose --env-file .env.example config
+          PAY3_ENV_FILE=.env.example docker compose --env-file .env.example --profile local-db config
+
+      - name: Docker Build
+        run: docker build --pull --no-cache -t pay3:ci .

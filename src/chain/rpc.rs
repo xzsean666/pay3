@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 use super::{
     ChainBlock, ChainError, ChainHeaderReader, Eip1559FeeEstimate, Eip1559FeeEstimator,
-    Erc20ChainClient, NativeBalanceReader, TransactionStatus, TransferLog,
+    Erc20ChainClient, NativeBalanceReader, PendingNonceReader, TransactionStatus, TransferLog,
     TransferLogCapacityLimits, TransferLogCapacityReport, TransferLogRange, TransferLogSource,
     TxReceipt,
 };
@@ -643,6 +643,36 @@ impl Eip1559FeeEstimator for RpcRangeSource {
             max_fee_per_gas: RawAmount::new(max_fee),
             max_priority_fee_per_gas: RawAmount::new(priority_fee),
         })
+    }
+}
+
+#[async_trait]
+impl PendingNonceReader for RpcRangeSource {
+    async fn pending_nonce(
+        &self,
+        chain_id: u64,
+        owner: EvmAddress,
+    ) -> Result<RawAmount, ChainError> {
+        if chain_id != self.manager.expected_chain_id() {
+            return Err(ChainError::ChainIdMismatch {
+                expected: chain_id,
+                actual: self.manager.expected_chain_id(),
+            });
+        }
+
+        let ProviderValue { value, .. } = self
+            .manager
+            .request_first_success(
+                "eth_getTransactionCount",
+                json!([owner.to_string(), "pending"]),
+            )
+            .await?;
+        let value = value.as_str().ok_or_else(|| {
+            ChainError::malformed_rpc_response(
+                "eth_getTransactionCount result must be a hex string",
+            )
+        })?;
+        parse_hex_u256(value, "eth_getTransactionCount result").map(RawAmount::new)
     }
 }
 

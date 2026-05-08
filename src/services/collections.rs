@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::{
     chain::{
         ChainError, Eip1559FeeEstimate, Eip1559FeeEstimator, Erc20ChainClient, NativeBalanceReader,
+        PendingNonceReader,
     },
     db::repositories::{
         AuditEventInput, AuditRepository, CollectionJob, CollectionRecord, CollectionRecordStatus,
@@ -440,7 +441,7 @@ where
     B: OutboundRepository,
     A: AuditRepository,
     S: SignerProvider,
-    H: Erc20ChainClient + Eip1559FeeEstimator,
+    H: Erc20ChainClient + Eip1559FeeEstimator + PendingNonceReader,
     G: PrefundedGasChecker,
     I: IdGenerator,
 {
@@ -449,17 +450,24 @@ where
         input: CreateCollectionInput,
     ) -> Result<CreateCollectionResult, CollectionServiceError> {
         let input = normalize_create_collection_input(input)?;
-        let view = self.orders.get_order_view(input.order_id).await?.ok_or(
-            CollectionServiceError::OrderNotFound {
-                order_id: input.order_id,
-            },
-        )?;
+        let view = match input.audit.principal_sub.as_deref() {
+            Some(owner_sub) => {
+                self.orders
+                    .get_order_view_for_owner(input.order_id, owner_sub)
+                    .await?
+            }
+            None => self.orders.get_order_view(input.order_id).await?,
+        }
+        .ok_or(CollectionServiceError::OrderNotFound {
+            order_id: input.order_id,
+        })?;
         validate_collectable_order(&view, &self.config)?;
 
         let collection_id = self.ids.new_id();
         let request_hash = canonical_collection_request_hash(&input, &self.config)?;
         let command = CreateCollectionCommand {
             collection_id,
+            owner_sub: view.order.owner_sub.clone(),
             order_id: view.order.id,
             idempotency_key: input.idempotency_key.clone(),
             request_hash,
@@ -508,6 +516,24 @@ where
         Ok(self.collections.get_collection(id).await?)
     }
 
+    pub async fn get_collection_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+    ) -> Result<Option<CollectionRecord>, CollectionServiceError> {
+        let owner_sub = owner_sub.trim();
+        if owner_sub.is_empty() {
+            return Err(CollectionServiceError::invalid_argument(
+                "owner_sub",
+                "must not be empty",
+            ));
+        }
+        Ok(self
+            .collections
+            .get_collection_for_owner(id, owner_sub)
+            .await?)
+    }
+
     pub async fn prepare_next_collection_job(
         &self,
         worker_id: &str,
@@ -537,9 +563,17 @@ where
             .await?;
         self.signer.health_check().await?;
 
+        let pending_nonce = self
+            .chain
+            .pending_nonce(job.collection.chain_id, job.collection.from_address)
+            .await?;
         let reserved_nonce = self
             .outbound
-            .reserve_nonce(job.collection.chain_id, job.collection.from_address)
+            .reserve_nonce(
+                job.collection.chain_id,
+                job.collection.from_address,
+                pending_nonce,
+            )
             .await?;
         let nonce = raw_amount_to_u64(reserved_nonce.nonce)?;
         let unsigned = UnsignedTx::new(
@@ -561,23 +595,32 @@ where
 
         let outbound = self
             .outbound
-            .insert_signed_tx(NewSignedOutboundTx {
-                id: self.ids.new_id(),
-                chain_id: job.collection.chain_id,
-                purpose: OutboundTxPurpose::Collect,
-                from_address: job.collection.from_address,
-                to_address: job.collection.to_address,
-                nonce: reserved_nonce.nonce,
-                tx_hash: signed.tx_hash,
-                signed_tx: signed.raw_tx.clone(),
-                replacement_of: None,
-                replacement_reason: None,
-            })
+            .insert_signed_collect_tx(
+                job.collection.id,
+                NewSignedOutboundTx {
+                    id: self.ids.new_id(),
+                    chain_id: job.collection.chain_id,
+                    purpose: OutboundTxPurpose::Collect,
+                    from_address: job.collection.from_address,
+                    to_address: job.collection.to_address,
+                    nonce: reserved_nonce.nonce,
+                    tx_hash: signed.tx_hash,
+                    signed_tx: signed.raw_tx.clone(),
+                    replacement_of: None,
+                    replacement_reason: None,
+                },
+                amount,
+            )
             .await?;
-        let collection = self
-            .collections
-            .attach_outbound_tx(job.collection.id, outbound.id, amount)
-            .await?;
+        let outbound = outbound.outbound;
+        let mut collection = job.collection;
+        collection.outbound_tx_id = Some(outbound.id);
+        collection.amount_raw = Some(amount);
+        collection.status = CollectionRecordStatus::Transferring;
+        collection.locked_by = None;
+        collection.locked_until = None;
+        collection.error = None;
+        collection.updated_at = OffsetDateTime::now_utc();
         self.append_collection_audit(
             "collection.signed",
             &AuditContext::default(),
@@ -1085,6 +1128,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_collection_rejects_order_owned_by_different_principal() {
+        let service = service(Fixture::default());
+
+        let error = service
+            .create_collection(
+                CreateCollectionInput::max(order_id(), "collect-1").with_audit(AuditContext {
+                    principal_sub: Some("merchant-2".to_string()),
+                    ..AuditContext::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CollectionServiceError::OrderNotFound { .. }
+        ));
+        assert!(service.collections.commands().is_empty());
+    }
+
+    #[tokio::test]
     async fn prepare_next_collection_job_checks_balance_signs_and_persists_outbound() {
         let service = service(Fixture::default());
 
@@ -1107,6 +1171,10 @@ mod tests {
         assert_eq!(outbound.to_address, treasury());
         assert_eq!(outbound.nonce, RawAmount::from(7));
         assert_eq!(outbound.tx_hash, signed_tx.tx_hash);
+        assert_eq!(
+            service.outbound.reserved(),
+            vec![(1, child_address(), RawAmount::from(7))]
+        );
         let signed_requests = service.signer.signed_requests();
         assert_eq!(signed_requests.len(), 1);
         assert_eq!(signed_requests[0].to, token());
@@ -1125,10 +1193,7 @@ mod tests {
             config().fees.max_priority_fee_per_gas
         );
         assert_eq!(service.outbound.inserted().len(), 1);
-        assert_eq!(
-            service.collections.attached(),
-            vec![(collection_id(), outbound.id, RawAmount::from(1_000))]
-        );
+        assert!(service.collections.attached().is_empty());
         assert_eq!(
             service.audit.event_types(),
             vec!["collection.signed".to_string()]
@@ -1445,13 +1510,36 @@ mod tests {
             Ok(Some(self.view.order.clone()))
         }
 
+        async fn get_order_for_owner(
+            &self,
+            id: Uuid,
+            owner_sub: &str,
+        ) -> Result<Option<OrderRecord>, RepositoryError> {
+            Ok(
+                (id == self.view.order.id && self.view.order.owner_sub == owner_sub)
+                    .then_some(self.view.order.clone()),
+            )
+        }
+
         async fn get_order_view(&self, id: Uuid) -> Result<Option<OrderView>, RepositoryError> {
             Ok((id == self.view.order.id).then_some(self.view.clone()))
         }
 
-        async fn get_order_by_external_id(
+        async fn get_order_view_for_owner(
+            &self,
+            id: Uuid,
+            owner_sub: &str,
+        ) -> Result<Option<OrderView>, RepositoryError> {
+            Ok(
+                (id == self.view.order.id && self.view.order.owner_sub == owner_sub)
+                    .then_some(self.view.clone()),
+            )
+        }
+
+        async fn get_order_by_external_id_for_owner(
             &self,
             _external_id: &str,
+            _owner_sub: &str,
         ) -> Result<Option<OrderRecord>, RepositoryError> {
             Ok(None)
         }
@@ -1532,6 +1620,17 @@ mod tests {
                 .or(Some(collection_record(id, None, None))))
         }
 
+        async fn get_collection_for_owner(
+            &self,
+            id: Uuid,
+            owner_sub: &str,
+        ) -> Result<Option<CollectionRecord>, RepositoryError> {
+            Ok(self
+                .get_collection(id)
+                .await?
+                .filter(|collection| collection.owner_sub == owner_sub))
+        }
+
         async fn get_collection_job(
             &self,
             id: Uuid,
@@ -1592,13 +1691,13 @@ mod tests {
 
     #[derive(Clone, Debug, Default)]
     struct FakeOutboundState {
-        reserved: Vec<(u64, EvmAddress)>,
+        reserved: Vec<(u64, EvmAddress, RawAmount)>,
         inserted: Vec<NewSignedOutboundTx>,
         replacements: Vec<(Uuid, NewSignedOutboundTx)>,
     }
 
     impl FakeOutboundRepository {
-        fn reserved(&self) -> Vec<(u64, EvmAddress)> {
+        fn reserved(&self) -> Vec<(u64, EvmAddress, RawAmount)> {
             self.state
                 .lock()
                 .expect("fake outbound repo mutex poisoned")
@@ -1629,12 +1728,13 @@ mod tests {
             &self,
             chain_id: u64,
             from_address: EvmAddress,
+            _pending_nonce: RawAmount,
         ) -> Result<ReservedNonce, RepositoryError> {
             self.state
                 .lock()
                 .expect("fake outbound repo mutex poisoned")
                 .reserved
-                .push((chain_id, from_address));
+                .push((chain_id, from_address, _pending_nonce));
             Ok(ReservedNonce {
                 chain_id,
                 address: from_address,
@@ -1652,6 +1752,23 @@ mod tests {
                 .inserted
                 .push(tx.clone());
             Ok(outbound_record(tx))
+        }
+
+        async fn insert_signed_collect_tx(
+            &self,
+            _collection_id: Uuid,
+            tx: NewSignedOutboundTx,
+            _resolved_amount_raw: RawAmount,
+        ) -> Result<crate::db::repositories::InsertSignedCollectTxResult, RepositoryError> {
+            self.state
+                .lock()
+                .expect("fake outbound repo mutex poisoned")
+                .inserted
+                .push(tx.clone());
+            Ok(crate::db::repositories::InsertSignedCollectTxResult {
+                collection_id: collection_id(),
+                outbound: outbound_record(tx),
+            })
         }
 
         async fn replace_signed_tx(
@@ -1800,6 +1917,7 @@ mod tests {
     struct FakeChain {
         token_balance: RawAmount,
         fee_estimate: Eip1559FeeEstimate,
+        pending_nonce: RawAmount,
     }
 
     impl FakeChain {
@@ -1807,6 +1925,7 @@ mod tests {
             Self {
                 token_balance,
                 fee_estimate,
+                pending_nonce: RawAmount::from(7),
             }
         }
     }
@@ -1889,6 +2008,17 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl PendingNonceReader for FakeChain {
+        async fn pending_nonce(
+            &self,
+            _chain_id: u64,
+            _owner: EvmAddress,
+        ) -> Result<RawAmount, ChainError> {
+            Ok(self.pending_nonce)
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct FakeGasChecker {
         error: Option<GasFundingError>,
@@ -1930,6 +2060,7 @@ mod tests {
         OrderView {
             order: OrderRecord {
                 id: order_id(),
+                owner_sub: "merchant-1".to_string(),
                 external_id: "merchant-order-1".to_string(),
                 request_hash: "request-hash".to_string(),
                 child_account_id: child_account_id(),
@@ -1985,6 +2116,7 @@ mod tests {
     ) -> CollectionRecord {
         CollectionRecord {
             id,
+            owner_sub: "merchant-1".to_string(),
             order_id: order_id(),
             idempotency_key: "collect-1".to_string(),
             request_hash: "collection-request-hash".to_string(),

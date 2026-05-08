@@ -3,11 +3,28 @@ use sqlx::{Connection, Executor, PgConnection};
 use std::{env, error::Error, process, time::SystemTime};
 
 const INITIAL_SCHEMA: &str = include_str!("../src/db/migrations/20260502000100_initial_schema.sql");
+const AUTO_COLLECTION_INDEXES: &str =
+    include_str!("../src/db/migrations/20260507000100_auto_collection_indexes.sql");
+const ORDER_OWNER_SUB: &str =
+    include_str!("../src/db/migrations/20260507000200_order_owner_sub.sql");
+const COLLECTION_OWNER_SUB: &str =
+    include_str!("../src/db/migrations/20260507000300_collection_owner_sub.sql");
 
 #[test]
 fn migrator_embeds_initial_schema() {
-    assert_eq!(MIGRATOR.iter().count(), 1);
-    assert_eq!(MIGRATOR.iter().next().unwrap().version, 20260502000100);
+    let versions = MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        versions,
+        vec![
+            20260502000100,
+            20260507000100,
+            20260507000200,
+            20260507000300
+        ]
+    );
 }
 
 #[test]
@@ -63,6 +80,57 @@ fn initial_schema_contains_funds_safety_constraints() {
         "CREATE TABLE audit_events",
     ] {
         assert!(INITIAL_SCHEMA.contains(fragment), "missing {fragment}");
+    }
+}
+
+#[test]
+fn auto_collection_migration_adds_background_scan_indexes() {
+    for fragment in [
+        "CREATE INDEX orders_paid_auto_collection_idx",
+        "WHERE status = 'paid'",
+        "CREATE INDEX collections_order_idx",
+        "ON collections(order_id)",
+    ] {
+        assert!(
+            AUTO_COLLECTION_INDEXES.contains(fragment),
+            "missing {fragment}"
+        );
+    }
+}
+
+#[test]
+fn order_owner_migration_scopes_external_ids_by_owner() {
+    for fragment in [
+        "ADD COLUMN owner_sub text",
+        "SET owner_sub = 'legacy'",
+        "ALTER COLUMN owner_sub SET NOT NULL",
+        "ADD CONSTRAINT orders_owner_sub_not_empty CHECK (owner_sub <> '')",
+        "DROP CONSTRAINT IF EXISTS orders_external_id_key",
+        "CREATE UNIQUE INDEX orders_owner_external_id_idx",
+        "ON orders(owner_sub, external_id)",
+    ] {
+        assert!(ORDER_OWNER_SUB.contains(fragment), "missing {fragment}");
+    }
+}
+
+#[test]
+fn collection_owner_migration_scopes_reads_and_idempotency_by_owner() {
+    for fragment in [
+        "ADD COLUMN owner_sub text",
+        "SET owner_sub = o.owner_sub",
+        "ALTER COLUMN owner_sub SET NOT NULL",
+        "ADD CONSTRAINT collections_owner_sub_not_empty CHECK (owner_sub <> '')",
+        "CREATE UNIQUE INDEX orders_id_owner_sub_idx",
+        "FOREIGN KEY (order_id, owner_sub) REFERENCES orders(id, owner_sub)",
+        "DROP INDEX IF EXISTS collections_idempotency_key_idx",
+        "CREATE UNIQUE INDEX collections_owner_idempotency_key_idx",
+        "ON collections(owner_sub, idempotency_key)",
+        "CREATE INDEX collections_owner_idx",
+    ] {
+        assert!(
+            COLLECTION_OWNER_SUB.contains(fragment),
+            "missing {fragment}"
+        );
     }
 }
 
@@ -142,6 +210,247 @@ async fn migrations_apply_to_postgres_when_test_database_is_configured()
                 .fetch_one(&mut conn)
                 .await?;
         assert_eq!(seeded_wallet_cursor, 1);
+
+        let order_owner_not_null: bool = sqlx::query_scalar(
+            r#"
+            SELECT is_nullable = 'NO'
+            FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name = 'orders'
+              AND column_name = 'owner_sub'
+            "#,
+        )
+        .bind(&schema)
+        .fetch_one(&mut conn)
+        .await?;
+        assert!(order_owner_not_null);
+
+        let collection_owner_not_null: bool = sqlx::query_scalar(
+            r#"
+            SELECT is_nullable = 'NO'
+            FROM information_schema.columns
+            WHERE table_schema = $1
+              AND table_name = 'collections'
+              AND column_name = 'owner_sub'
+            "#,
+        )
+        .bind(&schema)
+        .fetch_one(&mut conn)
+        .await?;
+        assert!(collection_owner_not_null);
+
+        let owner_indexes: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*)::bigint
+            FROM pg_indexes
+            WHERE schemaname = $1
+              AND indexname IN (
+                'orders_owner_external_id_idx',
+                'collections_owner_idempotency_key_idx'
+              )
+            "#,
+        )
+        .bind(&schema)
+        .fetch_one(&mut conn)
+        .await?;
+        assert_eq!(owner_indexes, 2);
+
+        let global_collection_idempotency_index: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*)::bigint
+            FROM pg_indexes
+            WHERE schemaname = $1
+              AND indexname = 'collections_idempotency_key_idx'
+            "#,
+        )
+        .bind(&schema)
+        .fetch_one(&mut conn)
+        .await?;
+        assert_eq!(global_collection_idempotency_index, 0);
+
+        sqlx::query(
+            r#"
+            INSERT INTO child_accounts (
+                id,
+                signer_key_ref,
+                derivation_version,
+                account_index,
+                change_index,
+                address_index,
+                derivation_path,
+                address
+            ) VALUES
+                (
+                    '00000000-0000-0000-0000-000000000101',
+                    'pay3-master',
+                    1,
+                    0,
+                    0,
+                    1,
+                    'm/44''/60''/0''/0/1',
+                    '0x1111111111111111111111111111111111111111'
+                ),
+                (
+                    '00000000-0000-0000-0000-000000000102',
+                    'pay3-master',
+                    1,
+                    0,
+                    0,
+                    2,
+                    'm/44''/60''/0''/0/2',
+                    '0x2222222222222222222222222222222222222222'
+                )
+            "#,
+        )
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO treasury_addresses (
+                chain_id,
+                token_address,
+                treasury_address
+            ) VALUES (
+                1,
+                '0x9999999999999999999999999999999999999999',
+                '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+            )
+            "#,
+        )
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO orders (
+                id,
+                owner_sub,
+                external_id,
+                request_hash,
+                child_account_id,
+                receive_address,
+                chain_id,
+                token_address,
+                expected_amount_raw,
+                paid_amount_raw,
+                status,
+                expires_at,
+                monitor_until
+            ) VALUES
+                (
+                    '00000000-0000-0000-0000-000000000201',
+                    'merchant-a',
+                    'shared-external-id',
+                    'request-a',
+                    '00000000-0000-0000-0000-000000000101',
+                    '0x1111111111111111111111111111111111111111',
+                    1,
+                    '0x9999999999999999999999999999999999999999',
+                    100,
+                    100,
+                    'paid',
+                    now() + interval '1 hour',
+                    now() + interval '2 hours'
+                ),
+                (
+                    '00000000-0000-0000-0000-000000000202',
+                    'merchant-b',
+                    'shared-external-id',
+                    'request-b',
+                    '00000000-0000-0000-0000-000000000102',
+                    '0x2222222222222222222222222222222222222222',
+                    1,
+                    '0x9999999999999999999999999999999999999999',
+                    100,
+                    100,
+                    'paid',
+                    now() + interval '1 hour',
+                    now() + interval '2 hours'
+                )
+            "#,
+        )
+        .execute(&mut conn)
+        .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO collections (
+                id,
+                owner_sub,
+                order_id,
+                idempotency_key,
+                request_hash,
+                child_account_id,
+                chain_id,
+                token_address,
+                from_address,
+                to_address,
+                status
+            ) VALUES
+                (
+                    '00000000-0000-0000-0000-000000000301',
+                    'merchant-a',
+                    '00000000-0000-0000-0000-000000000201',
+                    'shared-collection-key',
+                    'collection-request-a',
+                    '00000000-0000-0000-0000-000000000101',
+                    1,
+                    '0x9999999999999999999999999999999999999999',
+                    '0x1111111111111111111111111111111111111111',
+                    '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    'queued'
+                ),
+                (
+                    '00000000-0000-0000-0000-000000000302',
+                    'merchant-b',
+                    '00000000-0000-0000-0000-000000000202',
+                    'shared-collection-key',
+                    'collection-request-b',
+                    '00000000-0000-0000-0000-000000000102',
+                    1,
+                    '0x9999999999999999999999999999999999999999',
+                    '0x2222222222222222222222222222222222222222',
+                    '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                    'queued'
+                )
+            "#,
+        )
+        .execute(&mut conn)
+        .await?;
+
+        let duplicate_collection = sqlx::query(
+            r#"
+            INSERT INTO collections (
+                id,
+                owner_sub,
+                order_id,
+                idempotency_key,
+                request_hash,
+                child_account_id,
+                chain_id,
+                token_address,
+                from_address,
+                to_address,
+                status
+            ) VALUES (
+                '00000000-0000-0000-0000-000000000303',
+                'merchant-a',
+                '00000000-0000-0000-0000-000000000201',
+                'shared-collection-key',
+                'collection-request-c',
+                '00000000-0000-0000-0000-000000000101',
+                1,
+                '0x9999999999999999999999999999999999999999',
+                '0x1111111111111111111111111111111111111111',
+                '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                'confirmed'
+            )
+            "#,
+        )
+        .execute(&mut conn)
+        .await;
+        assert!(duplicate_collection.is_err());
 
         Ok::<(), Box<dyn Error>>(())
     }

@@ -58,6 +58,7 @@ impl AppProfile {
 #[derive(Clone)]
 pub struct AppConfig {
     pub profile: AppProfile,
+    pub runtime: RuntimeConfig,
     pub http: HttpConfig,
     pub database: DatabaseConfig,
     pub kvdb: KvdbConfig,
@@ -66,6 +67,66 @@ pub struct AppConfig {
     pub collection: CollectionConfig,
     pub collector: CollectorConfig,
     pub signer: SignerConfig,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    pub role: RuntimeRole,
+    pub workers: WorkerEnableConfig,
+}
+
+impl RuntimeConfig {
+    pub fn api_enabled(&self) -> bool {
+        matches!(self.role, RuntimeRole::Api | RuntimeRole::All)
+    }
+
+    pub fn workers_enabled(&self) -> bool {
+        matches!(self.role, RuntimeRole::Worker | RuntimeRole::All)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeRole {
+    Api,
+    Worker,
+    All,
+}
+
+impl RuntimeRole {
+    fn parse(value: &str) -> Result<Self, ConfigError> {
+        match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "api" | "web" | "server" => Ok(Self::Api),
+            "worker" | "workers" => Ok(Self::Worker),
+            "all" | "combined" | "api_worker" | "api_workers" => Ok(Self::All),
+            _ => Err(ConfigError::invalid(
+                "RUN_ROLE",
+                value,
+                "expected one of api, worker, all",
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkerEnableConfig {
+    pub transfer_log_ingestor: bool,
+    pub transfer_log_retention: bool,
+    pub runtime_readiness: bool,
+    pub order_expiry: bool,
+    pub payment_scanner: bool,
+    pub collection_enqueuer: bool,
+    pub collection_collector: bool,
+}
+
+impl WorkerEnableConfig {
+    fn any_worker_enabled(&self) -> bool {
+        self.transfer_log_ingestor
+            || self.transfer_log_retention
+            || self.order_expiry
+            || self.payment_scanner
+            || self.collection_enqueuer
+            || self.collection_collector
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +230,13 @@ fn redacted_jwt_key_source(key_source: &JwtKeySource) -> &'static str {
     }
 }
 
+fn is_https_url(value: &str) -> bool {
+    value
+        .trim()
+        .get(..8)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+}
+
 #[derive(Clone)]
 pub struct ChainConfig {
     pub chain_id: u64,
@@ -227,6 +295,8 @@ pub struct SignerConfig {
     pub secret_material_present: bool,
     pub remote_endpoint: Option<String>,
     pub remote_request_timeout: Duration,
+    pub remote_bearer_token: Option<String>,
+    pub allow_insecure_remote_signer: bool,
 }
 
 impl fmt::Debug for SignerConfig {
@@ -239,6 +309,14 @@ impl fmt::Debug for SignerConfig {
             .field("secret_material_present", &self.secret_material_present)
             .field("remote_endpoint", &self.remote_endpoint)
             .field("remote_request_timeout", &self.remote_request_timeout)
+            .field(
+                "remote_bearer_token",
+                &self.remote_bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "allow_insecure_remote_signer",
+                &self.allow_insecure_remote_signer,
+            )
             .finish()
     }
 }
@@ -348,6 +426,56 @@ impl AppConfig {
 
         Ok(Self {
             profile,
+            runtime: RuntimeConfig {
+                role: RuntimeRole::parse(
+                    values
+                        .optional(&["RUN_ROLE", "PAY3_RUN_ROLE", "APP_ROLE"])
+                        .unwrap_or("all"),
+                )?,
+                workers: WorkerEnableConfig {
+                    transfer_log_ingestor: parse_optional_bool(
+                        &values,
+                        &[
+                            "ENABLE_TRANSFER_LOG_INGESTOR",
+                            "WORKER_TRANSFER_LOG_INGESTOR",
+                        ],
+                        true,
+                    )?,
+                    transfer_log_retention: parse_optional_bool(
+                        &values,
+                        &[
+                            "ENABLE_TRANSFER_LOG_RETENTION",
+                            "WORKER_TRANSFER_LOG_RETENTION",
+                        ],
+                        true,
+                    )?,
+                    runtime_readiness: parse_optional_bool(
+                        &values,
+                        &["ENABLE_RUNTIME_READINESS", "WORKER_RUNTIME_READINESS"],
+                        true,
+                    )?,
+                    order_expiry: parse_optional_bool(
+                        &values,
+                        &["ENABLE_ORDER_EXPIRY_WORKER", "WORKER_ORDER_EXPIRY"],
+                        true,
+                    )?,
+                    payment_scanner: parse_optional_bool(
+                        &values,
+                        &["ENABLE_PAYMENT_SCANNER", "WORKER_PAYMENT_SCANNER"],
+                        true,
+                    )?,
+                    collection_enqueuer: parse_optional_bool(
+                        &values,
+                        &["ENABLE_COLLECTION_ENQUEUER", "WORKER_COLLECTION_ENQUEUER"],
+                        true,
+                    )?,
+                    collection_collector: parse_optional_bool(
+                        &values,
+                        &["ENABLE_COLLECTION_COLLECTOR", "WORKER_COLLECTION_COLLECTOR"],
+                        true,
+                    )?,
+                },
+            },
             http: HttpConfig { bind_addr },
             database: DatabaseConfig {
                 url: values.required(&["DATABASE_URL"])?,
@@ -442,6 +570,19 @@ impl AppConfig {
                     ],
                     Duration::from_secs(DEFAULT_SIGNER_REMOTE_REQUEST_TIMEOUT_SECS),
                 )?,
+                remote_bearer_token: values.optional_owned(&[
+                    "SIGNER_REMOTE_BEARER_TOKEN",
+                    "SIGNER_BEARER_TOKEN",
+                    "REMOTE_SIGNER_BEARER_TOKEN",
+                ]),
+                allow_insecure_remote_signer: parse_optional_bool(
+                    &values,
+                    &[
+                        "ALLOW_INSECURE_REMOTE_SIGNER",
+                        "SIGNER_ALLOW_INSECURE_REMOTE_ENDPOINT",
+                    ],
+                    false,
+                )?,
             },
         })
     }
@@ -480,8 +621,37 @@ impl AppConfig {
                     errors.push(
                         "external/kms/hsm signer modes require SIGNER_REMOTE_ENDPOINT".to_string(),
                     );
+                } else if self.profile.is_production()
+                    && !self.signer.allow_insecure_remote_signer
+                    && !self
+                        .signer
+                        .remote_endpoint
+                        .as_deref()
+                        .is_some_and(is_https_url)
+                {
+                    errors.push(
+                        "production remote signer endpoint must use https unless ALLOW_INSECURE_REMOTE_SIGNER=true"
+                            .to_string(),
+                    );
+                }
+                if self.profile.is_production()
+                    && self
+                        .signer
+                        .remote_bearer_token
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .is_empty()
+                {
+                    errors.push(
+                        "production remote signer requires SIGNER_REMOTE_BEARER_TOKEN".to_string(),
+                    );
                 }
             }
+        }
+
+        if self.runtime.workers_enabled() && !self.runtime.workers.any_worker_enabled() {
+            errors.push("worker runtime role has no enabled workers".to_string());
         }
 
         if self.collection.max_priority_fee_per_gas_wei > self.collection.max_fee_per_gas_wei {
@@ -879,13 +1049,24 @@ mod tests {
             ("SIGNER_KEY_REF", "pay3-master".to_string()),
             (
                 "SIGNER_REMOTE_ENDPOINT",
-                "http://localhost:8081".to_string(),
+                if profile.eq_ignore_ascii_case("production")
+                    || profile.eq_ignore_ascii_case("prod")
+                {
+                    "https://signer.local"
+                } else {
+                    "http://localhost:8081"
+                }
+                .to_string(),
             ),
             ("SIGNER_REMOTE_REQUEST_TIMEOUT_SECS", "15".to_string()),
         ];
 
         if profile.eq_ignore_ascii_case("production") || profile.eq_ignore_ascii_case("prod") {
             pairs.push(("JWT_JWKS_JSON", RSA_JWKS_JSON.to_string()));
+            pairs.push((
+                "SIGNER_REMOTE_BEARER_TOKEN",
+                "prod-signer-token".to_string(),
+            ));
         } else {
             pairs.push(("JWT_SECRET", "0123456789abcdef0123456789abcdef".to_string()));
             pairs.push(("JWT_KEY_ID", "pay3-key-1".to_string()));
@@ -922,6 +1103,10 @@ mod tests {
             AppConfig::from_pairs(valid_pairs("development")).expect("config should parse");
 
         assert_eq!(config.profile, AppProfile::Development);
+        assert_eq!(config.runtime.role, RuntimeRole::All);
+        assert!(config.runtime.api_enabled());
+        assert!(config.runtime.workers_enabled());
+        assert!(config.runtime.workers.payment_scanner);
         assert_eq!(config.http.bind_addr.to_string(), "127.0.0.1:8080");
         assert_eq!(
             config.database.url,
@@ -954,6 +1139,24 @@ mod tests {
             config.signer.remote_request_timeout,
             Duration::from_secs(15)
         );
+        assert_eq!(config.signer.remote_bearer_token, None);
+        assert!(!config.signer.allow_insecure_remote_signer);
+    }
+
+    #[test]
+    fn runtime_role_and_worker_flags_can_be_overridden_from_pairs() {
+        let config = config_with(&[
+            ("APP_PROFILE", "development"),
+            ("RUN_ROLE", "api"),
+            ("ENABLE_PAYMENT_SCANNER", "false"),
+            ("ENABLE_COLLECTION_COLLECTOR", "false"),
+        ]);
+
+        assert_eq!(config.runtime.role, RuntimeRole::Api);
+        assert!(config.runtime.api_enabled());
+        assert!(!config.runtime.workers_enabled());
+        assert!(!config.runtime.workers.payment_scanner);
+        assert!(!config.runtime.workers.collection_collector);
     }
 
     #[test]
@@ -1112,6 +1315,65 @@ mod tests {
             errors
                 .iter()
                 .any(|error| error.contains("SIGNER_REMOTE_ENDPOINT"))
+        );
+    }
+
+    #[test]
+    fn production_requires_https_remote_signer_unless_insecure_flag_is_explicit() {
+        let config = config_with(&[("SIGNER_REMOTE_ENDPOINT", "http://localhost:8081")]);
+        let errors = validation_errors(&config);
+        assert!(errors.iter().any(|error| error.contains("https")));
+
+        let config = config_with(&[
+            ("SIGNER_REMOTE_ENDPOINT", "http://localhost:8081"),
+            ("ALLOW_INSECURE_REMOTE_SIGNER", "true"),
+        ]);
+        assert!(config.validate_profile().is_ok());
+    }
+
+    #[test]
+    fn production_requires_remote_signer_bearer_token() {
+        let config = config_with(&[("SIGNER_REMOTE_BEARER_TOKEN", "")]);
+        let errors = validation_errors(&config);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("SIGNER_REMOTE_BEARER_TOKEN"))
+        );
+    }
+
+    #[test]
+    fn worker_role_rejects_runtime_readiness_without_real_workers() {
+        let config = config_with(&[
+            ("RUN_ROLE", "worker"),
+            ("ENABLE_TRANSFER_LOG_INGESTOR", "false"),
+            ("ENABLE_TRANSFER_LOG_RETENTION", "false"),
+            ("ENABLE_RUNTIME_READINESS", "true"),
+            ("ENABLE_ORDER_EXPIRY_WORKER", "false"),
+            ("ENABLE_PAYMENT_SCANNER", "false"),
+            ("ENABLE_COLLECTION_ENQUEUER", "false"),
+            ("ENABLE_COLLECTION_COLLECTOR", "false"),
+        ]);
+        let errors = validation_errors(&config);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("no enabled workers"))
+        );
+    }
+
+    #[test]
+    fn remote_signer_bearer_token_can_be_loaded_from_pairs() {
+        let config = config_with(&[
+            ("APP_PROFILE", "development"),
+            ("SIGNER_REMOTE_BEARER_TOKEN", "test-token"),
+        ]);
+
+        assert_eq!(
+            config.signer.remote_bearer_token.as_deref(),
+            Some("test-token")
         );
     }
 

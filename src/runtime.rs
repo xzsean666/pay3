@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use axum::Router;
 use sqlx::PgPool;
 use thiserror::Error;
+use tokio::task::JoinHandle;
 
 use crate::{
     api::{self, OrderResponseConfig},
@@ -12,10 +13,14 @@ use crate::{
         ChainError, ChainHeaderReader, RpcRangeSource, TransferLogCapacityLimits, TransferLogRange,
         TransferLogSource,
     },
-    config::{AppConfig, ConfigError, JwtAlgorithm, JwtKeySource, SignerMode},
+    config::{
+        AppConfig, ConfigError, JwtAlgorithm, JwtKeySource, RuntimeRole, SignerMode,
+        WorkerEnableConfig,
+    },
     db::{
         migrations::{
-            MigrationBootstrapError, RuntimeSeedConfig, run_schema_migrations, seed_runtime_config,
+            MIGRATOR, MigrationBootstrapError, RuntimeSeedConfig, run_schema_migrations,
+            seed_runtime_config,
         },
         repositories::{
             ExpiredOrderRepository, PaymentRepository, PgAuditRepository, PgCollectionRepository,
@@ -23,13 +28,16 @@ use crate::{
             PgVerifiedPaymentRecorder, RepositoryError,
         },
     },
-    domain::CollectionFees,
+    domain::{CollectionFees, EvmAddress},
     health::{
         DependencyCheck, DependencyName, MetricsRecorder, RuntimeDependencyRegistry,
         StaticDependencyRegistry,
     },
     services::{
-        collections::{CollectionService, CollectionServiceConfig, NativeBalanceGasChecker},
+        collections::{
+            CollectionService, CollectionServiceConfig, CreateCollectionInput,
+            NativeBalanceGasChecker,
+        },
         orders::{OrderService, OrderServiceConfig, SystemClock},
         payment_windows::{RepositoryPaymentWindowLookup, WatchSetPaymentWindowLookup},
         payments::{PaymentMatcher, PaymentMatchingConfig},
@@ -70,6 +78,8 @@ const TRANSFER_LOG_RPC_MAX_RETRIES: u32 = 3;
 const TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS: u64 = 60_000;
 const PAYMENT_SCANNER_POLL_INTERVAL_MS: u64 = 5_000;
 const PAYMENT_SCANNER_LEASE_SECONDS: i64 = 30;
+const COLLECTION_ENQUEUER_POLL_INTERVAL_MS: u64 = 5_000;
+const COLLECTION_ENQUEUER_BATCH_LIMIT: u32 = 100;
 const COLLECTION_COLLECTOR_POLL_INTERVAL_MS: u64 = 5_000;
 const RUNTIME_READINESS_POLL_INTERVAL_MS: u64 = 30_000;
 const ORDER_EXPIRY_POLL_INTERVAL_MS: u64 = 5_000;
@@ -279,6 +289,73 @@ impl From<SignerError> for RuntimeError {
 }
 
 pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError> {
+    let mut config = config;
+    config.runtime.role = RuntimeRole::Api;
+    config.runtime.workers = WorkerEnableConfig {
+        transfer_log_ingestor: false,
+        transfer_log_retention: false,
+        runtime_readiness: false,
+        order_expiry: false,
+        payment_scanner: false,
+        collection_enqueuer: false,
+        collection_collector: false,
+    };
+    Ok(build_api_runtime(config).await?.into_router())
+}
+
+pub struct ApiRuntime {
+    router: Router,
+    background_tasks: BackgroundTasks,
+}
+
+impl ApiRuntime {
+    pub fn router(&self) -> Router {
+        self.router.clone()
+    }
+
+    pub fn into_router(self) -> Router {
+        self.router
+    }
+
+    pub async fn shutdown(self) {
+        self.background_tasks.shutdown().await;
+    }
+}
+
+pub struct BackgroundTasks {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl BackgroundTasks {
+    fn new() -> Self {
+        Self {
+            handles: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, handle: JoinHandle<()>) {
+        self.handles.push(handle);
+    }
+
+    async fn shutdown(mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+        while let Some(handle) = self.handles.pop() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for BackgroundTasks {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeError> {
     config.validate_profile()?;
 
     let pool = PgPool::connect(&config.database.url).await?;
@@ -305,6 +382,7 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
     let kvdb_retention_repository = retention_repository.clone();
     let payment_repository = PgPaymentRepository::new(pool.clone());
     let static_dependencies = StaticDependencyRegistry::all_healthy();
+    refresh_migration_dependency_status(&static_dependencies, &pool).await;
     let dependency_registry =
         RuntimeDependencyRegistry::new(static_dependencies.clone(), metrics.clone());
     let kvdb_readiness = KvdbReadinessResources {
@@ -325,38 +403,51 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
         signer: signer.clone(),
     };
     refresh_runtime_dependency_status(&readiness).await;
-    let _log_ingestor_loop = spawn_transfer_log_ingestor_loop_with_metrics(
-        log_store.clone(),
-        TransferLogIngestorLoopConfig::new(
+    let mut background_tasks = BackgroundTasks::new();
+    let workers = &config.runtime.workers;
+    let runtime_workers_enabled = config.runtime.workers_enabled();
+    if runtime_workers_enabled && workers.transfer_log_ingestor {
+        background_tasks.push(spawn_transfer_log_ingestor_loop_with_metrics(
+            log_store.clone(),
+            TransferLogIngestorLoopConfig::new(
+                stream,
+                std::time::Duration::from_millis(stream_config.poll_interval_ms),
+                config.chain.min_confirmations.saturating_mul(2),
+            ),
+            metrics.clone(),
+        )?);
+    }
+    if runtime_workers_enabled && workers.transfer_log_retention {
+        background_tasks.push(tokio::spawn(transfer_log_retention_loop(
+            retention_repository,
+            log_store.clone(),
             stream,
-            std::time::Duration::from_millis(stream_config.poll_interval_ms),
-            config.chain.min_confirmations.saturating_mul(2),
-        ),
-        metrics.clone(),
-    )?;
-    let _transfer_log_retention_loop = tokio::spawn(transfer_log_retention_loop(
-        retention_repository,
-        log_store.clone(),
-        stream,
-        stream_config.start_block,
-        stream_config.reorg_lookback_blocks,
-        config.kvdb.manual_rebuild_floor_block,
-        std::time::Duration::from_millis(TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS),
-    ));
-    let _runtime_readiness_loop = tokio::spawn(runtime_readiness_loop(
-        readiness,
-        std::time::Duration::from_millis(RUNTIME_READINESS_POLL_INTERVAL_MS),
-    ));
-    let _order_expiry_loop = tokio::spawn(order_expiry_loop(
-        PgOrderRepository::new(pool.clone()),
-        std::time::Duration::from_millis(ORDER_EXPIRY_POLL_INTERVAL_MS),
-        ORDER_EXPIRY_BATCH_LIMIT,
-    ));
-    let _payment_scanner_loop = spawn_payment_scanner_loop_with_metrics(
-        payment_scanner_worker(&config, pool.clone(), log_store.clone(), rpc_source.clone()),
-        std::time::Duration::from_millis(PAYMENT_SCANNER_POLL_INTERVAL_MS),
-        metrics.clone(),
-    )?;
+            stream_config.start_block,
+            stream_config.reorg_lookback_blocks,
+            config.kvdb.manual_rebuild_floor_block,
+            std::time::Duration::from_millis(TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS),
+        )));
+    }
+    if config.runtime.api_enabled() && workers.runtime_readiness {
+        background_tasks.push(tokio::spawn(runtime_readiness_loop(
+            readiness,
+            std::time::Duration::from_millis(RUNTIME_READINESS_POLL_INTERVAL_MS),
+        )));
+    }
+    if runtime_workers_enabled && workers.order_expiry {
+        background_tasks.push(tokio::spawn(order_expiry_loop(
+            PgOrderRepository::new(pool.clone()),
+            std::time::Duration::from_millis(ORDER_EXPIRY_POLL_INTERVAL_MS),
+            ORDER_EXPIRY_BATCH_LIMIT,
+        )));
+    }
+    if runtime_workers_enabled && workers.payment_scanner {
+        background_tasks.push(spawn_payment_scanner_loop_with_metrics(
+            payment_scanner_worker(&config, pool.clone(), log_store.clone(), rpc_source.clone()),
+            std::time::Duration::from_millis(PAYMENT_SCANNER_POLL_INTERVAL_MS),
+            metrics.clone(),
+        )?);
+    }
 
     let auth = jwt_verifier(&config)?;
     let orders = Arc::new(order_service(
@@ -371,16 +462,28 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
         rpc_source.clone(),
         signer.clone(),
     )?);
-    let _collection_collector_loop = spawn_collection_collector_loop_with_metrics(
-        CollectionCollectorWorker::new(
+    if runtime_workers_enabled && workers.collection_enqueuer {
+        background_tasks.push(tokio::spawn(auto_collection_enqueue_loop(
+            pool.clone(),
             collection_service(&config, pool.clone(), rpc_source.clone(), signer.clone())?,
-            PgOutboundRepository::new(pool.clone()),
-            rpc_source.clone(),
-            collection_collector_config(&config),
-        ),
-        std::time::Duration::from_millis(COLLECTION_COLLECTOR_POLL_INTERVAL_MS),
-        metrics.clone(),
-    )?;
+            config.chain.chain_id,
+            config.chain.token_address,
+            std::time::Duration::from_millis(COLLECTION_ENQUEUER_POLL_INTERVAL_MS),
+            COLLECTION_ENQUEUER_BATCH_LIMIT,
+        )));
+    }
+    if runtime_workers_enabled && workers.collection_collector {
+        background_tasks.push(spawn_collection_collector_loop_with_metrics(
+            CollectionCollectorWorker::new(
+                collection_service(&config, pool.clone(), rpc_source.clone(), signer.clone())?,
+                PgOutboundRepository::new(pool.clone()),
+                rpc_source.clone(),
+                collection_collector_config(&config),
+            ),
+            std::time::Duration::from_millis(COLLECTION_COLLECTOR_POLL_INTERVAL_MS),
+            metrics.clone(),
+        )?);
+    }
     let order_verify = Arc::new(ManualOrderVerifyService::new(
         PgOrderRepository::new(pool.clone()),
         PgVerifiedPaymentRecorder::new(pool),
@@ -393,7 +496,7 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
         ),
     ));
 
-    Ok(api::router_with_runtime_services_and_metrics(
+    let router = api::router_with_runtime_services_and_metrics(
         dependency_registry,
         metrics,
         auth,
@@ -401,7 +504,12 @@ pub async fn build_api_router(config: AppConfig) -> Result<Router, RuntimeError>
         order_verify,
         collections,
         OrderResponseConfig::from_config(&config),
-    ))
+    );
+
+    Ok(ApiRuntime {
+        router,
+        background_tasks,
+    })
 }
 
 fn runtime_seed_config(config: &AppConfig) -> RuntimeSeedConfig {
@@ -475,9 +583,10 @@ fn runtime_signer(config: &AppConfig) -> Result<RuntimeSigner, RuntimeError> {
                 })
             })?;
 
-            Ok(RuntimeSigner::Remote(RemoteHttpSigner::new(
+            Ok(RuntimeSigner::Remote(RemoteHttpSigner::with_bearer_token(
                 endpoint,
                 config.signer.remote_request_timeout,
+                config.signer.remote_bearer_token.clone(),
             )?))
         }
         SignerMode::Local => {
@@ -559,6 +668,121 @@ fn collection_service_config(config: &AppConfig) -> CollectionServiceConfig {
 fn collection_collector_config(config: &AppConfig) -> CollectionCollectorConfig {
     CollectionCollectorConfig::new(format!("collection-collector-{}", std::process::id()))
         .with_replacement_stuck_after(config.collector.replacement_stuck_after)
+        .with_min_confirmations(config.chain.min_confirmations)
+}
+
+async fn auto_collection_enqueue_loop(
+    pool: PgPool,
+    collection_service: RuntimeCollectionService<RuntimeSigner>,
+    chain_id: u64,
+    token_address: EvmAddress,
+    poll_interval: std::time::Duration,
+    batch_limit: u32,
+) {
+    let mut interval = tokio::time::interval(poll_interval);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        interval.tick().await;
+        match enqueue_paid_orders_for_collection(
+            &pool,
+            &collection_service,
+            chain_id,
+            token_address,
+            batch_limit,
+        )
+        .await
+        {
+            Ok(0) => {
+                tracing::debug!("auto collection enqueuer idle");
+            }
+            Ok(enqueued) => {
+                tracing::info!(enqueued, "auto collection enqueuer queued collections");
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "auto collection enqueuer tick failed");
+            }
+        }
+    }
+}
+
+async fn enqueue_paid_orders_for_collection(
+    pool: &PgPool,
+    collection_service: &RuntimeCollectionService<RuntimeSigner>,
+    chain_id: u64,
+    token_address: EvmAddress,
+    batch_limit: u32,
+) -> Result<usize, RuntimeError> {
+    if batch_limit == 0 {
+        return Ok(0);
+    }
+
+    let order_ids =
+        paid_orders_without_collections(pool, chain_id, token_address, batch_limit).await?;
+    let mut enqueued = 0;
+    for order_id in order_ids {
+        match collection_service
+            .create_collection(CreateCollectionInput::max(
+                order_id,
+                format!("auto-collect-{order_id}"),
+            ))
+            .await
+        {
+            Ok(result) => {
+                enqueued += 1;
+                tracing::info!(
+                    order_id = %order_id,
+                    collection_id = %result.collection.id,
+                    outcome = ?result.outcome,
+                    "auto collection enqueued paid order"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    order_id = %order_id,
+                    error = %error,
+                    "auto collection enqueue skipped paid order"
+                );
+            }
+        }
+    }
+
+    Ok(enqueued)
+}
+
+async fn paid_orders_without_collections(
+    pool: &PgPool,
+    chain_id: u64,
+    token_address: EvmAddress,
+    limit: u32,
+) -> Result<Vec<uuid::Uuid>, RuntimeError> {
+    let rows = sqlx::query_scalar(
+        r#"
+        SELECT o.id
+        FROM orders o
+        WHERE o.chain_id = $1
+          AND o.token_address = $2
+          AND o.status = 'paid'
+          AND NOT EXISTS (
+              SELECT 1
+              FROM collections c
+              WHERE c.order_id = o.id
+          )
+        ORDER BY o.updated_at, o.id
+        LIMIT $3
+        "#,
+    )
+    .bind(i64::try_from(chain_id).map_err(|error| {
+        RuntimeError::Config(ConfigError::Validation {
+            errors: vec![format!("CHAIN_ID does not fit PostgreSQL bigint: {error}")],
+        })
+    })?)
+    .bind(token_address.to_lower_hex())
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
 }
 
 fn payment_scanner_worker(
@@ -663,6 +887,7 @@ where
     S: SignerProvider,
 {
     refresh_db_dependency_status(&resources.kvdb.dependencies, &resources.pool).await;
+    refresh_migration_dependency_status(&resources.kvdb.dependencies, &resources.pool).await;
     refresh_rpc_dependency_status(
         &resources.kvdb.dependencies,
         &resources.rpc_source,
@@ -686,6 +911,41 @@ where
                 error.to_string(),
             ));
     }
+}
+
+async fn refresh_migration_dependency_status(
+    dependencies: &StaticDependencyRegistry,
+    pool: &PgPool,
+) {
+    let expected = expected_migration_version();
+    match sqlx::query_scalar::<_, Option<i64>>("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(Some(version)) if version >= expected => {
+            dependencies.set_status(DependencyCheck::healthy(DependencyName::Migration));
+        }
+        Ok(Some(version)) => dependencies.set_status(DependencyCheck::failed(
+            DependencyName::Migration,
+            format!("database migration version {version} is behind expected {expected}"),
+        )),
+        Ok(None) => dependencies.set_status(DependencyCheck::failed(
+            DependencyName::Migration,
+            format!("database has no applied migrations; expected {expected}"),
+        )),
+        Err(error) => dependencies.set_status(DependencyCheck::failed(
+            DependencyName::Migration,
+            error.to_string(),
+        )),
+    }
+}
+
+fn expected_migration_version() -> i64 {
+    MIGRATOR
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or_default()
 }
 
 async fn refresh_db_dependency_status(dependencies: &StaticDependencyRegistry, pool: &PgPool) {
@@ -1087,6 +1347,10 @@ MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
         assert_eq!(
             collector_config.replacement_stuck_after,
             std::time::Duration::from_secs(120)
+        );
+        assert_eq!(
+            collector_config.min_confirmations,
+            config.chain.min_confirmations
         );
     }
 
