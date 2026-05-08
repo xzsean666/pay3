@@ -1,0 +1,30 @@
+name = "pay3-frontend-test"
+main = "src/worker.js"
+compatibility_date = "2025-01-01"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+
+[vars]
+# Local Wrangler dev can proxy to a local Pay3 API. For Cloudflare deploys,
+# replace this with a staging API URL that Cloudflare can reach.
+PAY3_API_BASE_URL = "http://127.0.0.1:3000"
+
+# Default mode is proxy. The page still exposes an explicit browser-direct
+# switch because this is a test console.
+PAY3_DEFAULT_MODE = "proxy"
+PAY3_PROXY_ENABLED = "true"
+PAY3_DIRECT_ENABLED = "true"
+
+# Exposes the test JWT to the browser so the direct switch can be used.
+# Set both PAY3_DIRECT_ENABLED and PAY3_EXPOSE_TEST_JWT to false for the
+# normal non-direct test deployment posture.
+PAY3_EXPOSE_TEST_JWT = "true"
+PAY3_TEST_JWT_EXPIRES_AT = "2030-01-01T00:00:00Z"
+
+# Signed with .env.example development JWT settings:
+# iss=pay3, aud=pay3-api, kid=pay3-dev-key-1,
+# secret=dev-dry-run-jwt-secret-000000000000
+# scopes=orders:create orders:read orders:verify
+PAY3_TEST_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InBheTMtZGV2LWtleS0xIn0.eyJleHAiOjE4OTM0NTYwMDAsIm5iZiI6MTc3ODIwNTkxNSwiaWF0IjoxNzc4MjA1OTc1LCJpc3MiOiJwYXkzIiwiYXVkIjoicGF5My1hcGkiLCJzdWIiOiJmcm9udGVuZC10ZXN0Iiwic2NvcGUiOiJvcmRlcnM6Y3JlYXRlIG9yZGVyczpyZWFkIG9yZGVyczp2ZXJpZnkifQ.Moo5s7BYsMaPEpXDoliBA0P8MKrvK5oUellfR2GUOV0"

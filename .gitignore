@@ -1,6 +1,8 @@
 /target/
 /out/
 /cache/
+frontend-test/.wrangler/
+frontend-test/node_modules/
 
 # Local/editor files
 .DS_Store

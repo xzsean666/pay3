@@ -1,0 +1,12 @@
+{
+  "name": "pay3-frontend-test",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npx wrangler dev --local --port 8788",
+    "deploy": "npx wrangler deploy",
+    "deploy:dry-run": "npx wrangler deploy --dry-run",
+    "token": "node scripts/create-test-jwt.mjs"
+  }
+}

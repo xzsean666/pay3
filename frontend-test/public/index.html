@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Pay3 前端测试台</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Pay3 test console</p>
+          <h1>Pay3 前端测试台</h1>
+        </div>
+        <div class="top-status">
+          <span id="modeBadge" class="badge">代理模式</span>
+          <span id="connectionBadge" class="badge muted">未连接</span>
+        </div>
+      </header>
+
+      <nav class="tabs" aria-label="Pay3 测试流程">
+        <button class="tab active" type="button" data-tab="config">连接</button>
+        <button class="tab" type="button" data-tab="create">创建订单</button>
+        <button class="tab" type="button" data-tab="pay">二维码</button>
+        <button class="tab" type="button" data-tab="wait">等待支付</button>
+        <button class="tab" type="button" data-tab="success">成功页</button>
+        <button class="tab" type="button" data-tab="logs">日志</button>
+      </nav>
+
+      <section id="panel-config" class="panel active" data-panel="config">
+        <div class="panel-head">
+          <div>
+            <h2>连接设置</h2>
+            <p>默认走 Wrangler Worker 同源代理；浏览器直连需要显式打开，并要求 Pay3 API 自己支持 CORS。</p>
+          </div>
+          <button id="saveConfigBtn" type="button" class="button primary">保存设置</button>
+        </div>
+
+        <div class="settings-grid">
+          <fieldset class="field-group">
+            <legend>调用模式</legend>
+            <label class="choice">
+              <input id="proxyMode" type="radio" name="callMode" value="proxy" checked />
+              <span>Worker 代理注入测试 token</span>
+            </label>
+            <label class="choice">
+              <input id="directMode" type="radio" name="callMode" value="direct" />
+              <span>浏览器直连 Pay3 API</span>
+            </label>
+            <p id="directHint" class="hint">直连开关已开启，但仍需要后端 CORS 白名单允许这个页面的域名。</p>
+          </fieldset>
+
+          <label class="field">
+            <span>Pay3 API Base URL</span>
+            <input id="apiBaseUrl" type="url" placeholder="http://127.0.0.1:3000" />
+            <small class="hint">浏览器直连会使用这里；Worker 代理使用 wrangler.toml 的 PAY3_API_BASE_URL。</small>
+          </label>
+
+          <label class="field">
+            <span>成功跳转 URL（可选）</span>
+            <input id="successRedirectUrl" type="url" placeholder="留空则切到内置成功页" />
+          </label>
+
+          <label class="field">
+            <span>轮询间隔（毫秒）</span>
+            <input id="pollIntervalMs" type="number" min="1000" step="500" value="3000" />
+          </label>
+        </div>
+
+        <div class="token-panel">
+          <div class="panel-head compact">
+            <div>
+              <h3>测试 token</h3>
+              <p>只包含订单测试 scope：orders:create、orders:read、orders:verify。</p>
+            </div>
+            <div class="button-row">
+              <button id="fillTokenBtn" type="button" class="button">填入内置 token</button>
+              <button id="copyTokenBtn" type="button" class="button">复制 token</button>
+            </div>
+          </div>
+          <textarea id="tokenField" spellcheck="false" rows="5" placeholder="浏览器直连时会使用这里的 Bearer token"></textarea>
+          <p id="tokenMeta" class="hint">内置 token 适配 .env.example 的 development JWT 配置。</p>
+        </div>
+      </section>
+
+      <section id="panel-create" class="panel" data-panel="create">
+        <div class="panel-head">
+          <div>
+            <h2>创建订单</h2>
+            <p>创建成功后会自动进入二维码页，并开始轮询订单状态。</p>
+          </div>
+          <button id="newOrderBtn" type="button" class="button">重置表单</button>
+        </div>
+
+        <form id="createOrderForm" class="form-grid">
+          <label class="field">
+            <span>external_id</span>
+            <input id="externalId" name="external_id" required />
+          </label>
+          <label class="field">
+            <span>金额</span>
+            <input id="amount" name="amount" inputmode="decimal" required value="1.00" />
+          </label>
+          <label class="field">
+            <span>TTL 秒数</span>
+            <input id="ttlSeconds" name="ttl_seconds" type="number" min="60" step="60" required value="900" />
+          </label>
+          <label class="field span-2">
+            <span>metadata JSON</span>
+            <textarea id="metadata" name="metadata" rows="5" spellcheck="false"></textarea>
+          </label>
+          <div class="form-actions">
+            <button id="createOrderBtn" type="submit" class="button primary">创建订单</button>
+            <button id="recoverByExternalIdBtn" type="button" class="button">按 external_id 恢复</button>
+          </div>
+        </form>
+      </section>
+
+      <section id="panel-pay" class="panel" data-panel="pay">
+        <div class="panel-head">
+          <div>
+            <h2>二维码付款</h2>
+            <p>二维码默认编码 ERC20 transfer URI；钱包不识别时直接复制收款地址和金额。</p>
+          </div>
+          <div class="segmented">
+            <button id="qrUriBtn" type="button" class="segment active">Token URI</button>
+            <button id="qrAddressBtn" type="button" class="segment">地址</button>
+          </div>
+        </div>
+
+        <div id="emptyPayState" class="empty-state">还没有订单。先创建订单，或按 external_id 恢复已有订单。</div>
+        <div id="paymentView" class="payment-layout hidden">
+          <div class="qr-box">
+            <img id="qrImage" alt="Pay3 payment QR code" />
+            <textarea id="qrPayload" rows="4" readonly></textarea>
+          </div>
+          <div class="details">
+            <dl id="paymentDetails" class="detail-list"></dl>
+            <div class="button-row">
+              <button id="copyAddressBtn" type="button" class="button">复制地址</button>
+              <button id="copyAmountBtn" type="button" class="button">复制金额</button>
+              <button id="copyPaymentUriBtn" type="button" class="button">复制 URI</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-wait" class="panel" data-panel="wait">
+        <div class="panel-head">
+          <div>
+            <h2>等待支付</h2>
+            <p>轮询订单状态；支付确认后会自动切到成功页。</p>
+          </div>
+          <div class="button-row">
+            <button id="pollOnceBtn" type="button" class="button">查一次</button>
+            <button id="startPollBtn" type="button" class="button primary">开始轮询</button>
+            <button id="stopPollBtn" type="button" class="button danger">停止</button>
+          </div>
+        </div>
+
+        <div class="status-strip">
+          <div>
+            <span class="label">订单状态</span>
+            <strong id="orderStatusText">未创建</strong>
+          </div>
+          <div>
+            <span class="label">已支付 raw</span>
+            <strong id="paidRawText">0</strong>
+          </div>
+          <div>
+            <span class="label">过期倒计时</span>
+            <strong id="expiresInText">-</strong>
+          </div>
+          <div>
+            <span class="label">最后轮询</span>
+            <strong id="lastPollText">-</strong>
+          </div>
+        </div>
+
+        <div class="wait-controls">
+          <label class="choice">
+            <input id="autoVerify" type="checkbox" />
+            <span>轮询前自动调用 verify</span>
+          </label>
+          <button id="verifyOnceBtn" type="button" class="button">手动 verify</button>
+        </div>
+
+        <pre id="verifyResult" class="json-output"></pre>
+      </section>
+
+      <section id="panel-success" class="panel" data-panel="success">
+        <div id="successEmpty" class="empty-state">还没有支付成功的订单。</div>
+        <div id="successView" class="success-layout hidden">
+          <div class="success-mark">支付成功</div>
+          <dl id="successDetails" class="detail-list"></dl>
+          <div class="button-row">
+            <button id="createAnotherBtn" type="button" class="button primary">再创建一笔</button>
+            <button id="openRedirectBtn" type="button" class="button">打开跳转 URL</button>
+          </div>
+        </div>
+      </section>
+
+      <section id="panel-logs" class="panel" data-panel="logs">
+        <div class="panel-head">
+          <div>
+            <h2>调试日志</h2>
+            <p>记录页面请求、响应和异常，方便定位 CORS、JWT、后端依赖问题。</p>
+          </div>
+          <div class="button-row">
+            <button id="clearLogsBtn" type="button" class="button danger">清空</button>
+            <button id="downloadLogsBtn" type="button" class="button">下载 JSON</button>
+          </div>
+        </div>
+        <ol id="logList" class="log-list"></ol>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

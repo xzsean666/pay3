@@ -54,6 +54,173 @@ PAY3_ENV_FILE=staging.env docker compose --env-file staging.env up --build
 
 Compose/Dockerfile healthcheck 使用 `/readyz`，用于暴露 DB、RPC、signer、KVDB 和 worker readiness；`/healthz` 只代表进程存活。
 
+## 服务器 Docker Compose 测试部署
+
+下面流程适合在一台测试服务器上用 Docker Compose 跑 Pay3 API + worker 的 combined 进程。它仍是测试/staging dry-run，不是生产上线流程；生产必须满足本文后面的外部 signer、多 RPC、备份、告警和 runbook 要求。
+
+### 1. 准备服务器
+
+服务器需要安装 Docker Engine 和 Docker Compose plugin：
+
+```bash
+docker version
+docker compose version
+```
+
+建议把仓库放在固定目录，例如：
+
+```bash
+sudo mkdir -p /opt/pay3
+sudo chown "$USER":"$USER" /opt/pay3
+git clone <repo-url> /opt/pay3
+cd /opt/pay3
+```
+
+如果服务器已经有代码，发布新版本时：
+
+```bash
+cd /opt/pay3
+git pull --ff-only
+```
+
+### 2. 准备 env 文件
+
+不要直接使用 `.env.example` 接真实测试网。复制一个独立 env 文件，例如：
+
+```bash
+cp .env.example .env.test
+chmod 600 .env.test
+```
+
+如果使用项目里的 `.env.test` 作为 Amoy 测试环境配置，至少确认：
+
+```bash
+PAY3_ENV_FILE=.env.test
+APP_PROFILE=development
+CHAIN_ID=80002
+RPC_HTTP_URLS=https://...
+DATABASE_URL=postgres://...
+TOKEN_ADDRESS=0x...
+TREASURY_ADDRESS=0x...
+START_BLOCK=<token 起始扫描区块>
+MIN_CONFIRMATIONS=12
+SIGNER_MODE=local
+ALLOW_LOCAL_SIGNER=true
+SIGNER_MNEMONIC=<测试网助记词>
+```
+
+`PAY3_ENV_FILE` 很重要：`docker-compose.yml` 会用它决定 service 的 `env_file`。如果文件名是 `.env.test`，就把文件内也写成 `PAY3_ENV_FILE=.env.test`，或者每次命令前显式加 `PAY3_ENV_FILE=.env.test`。
+
+如果服务器前面有 Nginx/Caddy 反代，建议只绑定本机端口：
+
+```bash
+PAY3_PORT=127.0.0.1:3000
+```
+
+如果要让 Docker 直接暴露到公网端口，可以用：
+
+```bash
+PAY3_PORT=3000
+```
+
+但必须用安全组/防火墙限制访问，尤其是 `/readyz`、`/metrics` 和所有 `/v1/*` 接口。
+
+### 3. 检查 Compose 渲染结果
+
+先看最终 Compose 配置。输出会包含 env 值，不要贴到公开渠道：
+
+```bash
+PAY3_ENV_FILE=.env.test docker compose --env-file .env.test config
+```
+
+检查重点：
+
+- `pay3.environment.DATABASE_URL` 是目标 PostgreSQL，不是空值。
+- `pay3.environment.APP_BIND` 在 Compose 下是 `0.0.0.0:3000`。
+- `pay3.environment.KVDB_PATH` 在 Compose 下是 `/var/lib/pay3/pay3.redb`。
+- `pay3.ports` 是否符合预期，例如 `127.0.0.1:3000:3000` 或 `3000:3000`。
+- `pay3.volumes` 包含 `pay3-kvdb:/var/lib/pay3`。
+
+### 4. 启动
+
+使用外部 PostgreSQL 时，只启动 `pay3`：
+
+```bash
+PAY3_ENV_FILE=.env.test docker compose --env-file .env.test up -d --build pay3
+```
+
+如果只是本机 dry-run 并使用 Compose 内置 PostgreSQL，把 `DATABASE_URL` 改成 `postgres://pay3:pay3_dev_password@postgres:5432/pay3`，然后启用 `local-db` profile：
+
+```bash
+PAY3_ENV_FILE=.env.test docker compose --env-file .env.test --profile local-db up -d --build
+```
+
+查看日志：
+
+```bash
+docker compose --env-file .env.test logs -f pay3
+```
+
+查看容器状态：
+
+```bash
+docker compose --env-file .env.test ps
+```
+
+### 5. 健康检查
+
+在服务器上检查：
+
+```bash
+curl -fsS http://127.0.0.1:3000/healthz
+curl -fsS http://127.0.0.1:3000/readyz
+```
+
+`/healthz` 只说明进程还活着。`/readyz` 会检查 DB、migration、RPC、signer、KVDB 和 worker readiness；如果 RPC、DB、token 地址、signer 或扫描状态不满足要求，`/readyz` 会返回非 200，这是预期的失败信号。
+
+### 6. 停止、重启和更新
+
+停止：
+
+```bash
+docker compose --env-file .env.test down
+```
+
+重启：
+
+```bash
+PAY3_ENV_FILE=.env.test docker compose --env-file .env.test up -d --build pay3
+```
+
+更新代码后重新构建：
+
+```bash
+git pull --ff-only
+PAY3_ENV_FILE=.env.test docker compose --env-file .env.test up -d --build pay3
+docker compose --env-file .env.test logs -f pay3
+```
+
+保留 `pay3-kvdb` volume 可以让 redb 扫链缓存持续存在。测试环境需要从头重建 KVDB 时才删除 volume：
+
+```bash
+docker compose --env-file .env.test down -v
+```
+
+不要在有真实资金风险的环境随意执行 `down -v`。
+
+### `.env.test` 使用结论
+
+当前 `.env.test` 是 Polygon Amoy 测试网配置，可以用于受控测试服务器 dry-run，但不能用于生产部署。主要原因：
+
+- `APP_PROFILE=development`。
+- 使用 `JWT_SECRET` / HS256，只适合开发和测试。
+- `SIGNER_MODE=local` 且包含 `SIGNER_MNEMONIC`，助记词会进入容器环境变量。
+- `ALLOW_LOCAL_SIGNER=true`，production profile 会拒绝。
+- `RPC_HTTP_URLS` 只有一个 provider，不满足生产至少两个 RPC provider 的要求。
+- 文件里包含 e2e/deployer 相关私钥变量时，不应该传入长期运行的 server container。
+
+用于测试服务器前，建议删除或注释掉运行时不需要的私钥变量，例如 `PAY3_E2E_PAYER_PRIVATE_KEY`、`DEPLOYER_PRIVATE_KEY`；这些变量不属于 Pay3 runtime 必需配置。
+
 ## 生产目标组件拓扑
 
 当前 Docker/Compose dry-run 是单个 `pay3` 进程同时启动 API、log ingestor、scanner 和 collector loop；下面是生产候选拆分部署的目标边界。
