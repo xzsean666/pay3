@@ -25,6 +25,49 @@ Pay3 是一个用 Rust 实现的 ERC20 收款后端。它面向“订单收款�
 - payment scanner 只读 KVDB，不直接对每个订单轮询 RPC。
 - production profile 不允许使用 mnemonic、private key 或本地 signer。
 
+## 订单状态与边界情况
+
+订单状态由“按时付款金额”和链上确认状态重算，不由单次转账直接覆盖。系统会把同一个订单地址收到的多笔 ERC20 `Transfer` 相加，但只把 `on_time` 且未被 reorg 作废的付款计入订单完成度。
+
+订单状态：
+
+- `pending`: 尚未发现有效按时付款，且订单未过期。
+- `partial`: 订单未过期，已发现部分按时付款，但累计金额不足。
+- `confirming`: 已发现的按时付款累计达到或超过应付金额，但确认数还没达到 `MIN_CONFIRMATIONS`。
+- `paid`: 已确认的按时付款累计达到或超过应付金额。
+- `expired`: 到达 `expires_at` 后，按时付款累计仍不足。
+
+付款匹配分类：
+
+- `on_time`: `block_number >= window_from_block` 且 `block_time <= expires_at`。只有这类付款会计入订单完成度。
+- `late`: `expires_at < block_time <= monitor_until`。用于对账和人工处理，不会把订单改成 `paid`。
+- `outside_window`: 命中历史 Pay3 地址，但不在订单支付窗口或监控窗口内，不计入订单完成度。
+- `orphaned`: 付款所在区块被 reorg 作废，不计入订单完成度，并可能让订单从 `paid/confirming` 回退。
+
+常见边界情况：
+
+| 情况 | 系统结果 |
+| --- | --- |
+| 用户未付款 | 过期前是 `pending`，到 `expires_at` 后变为 `expired`。 |
+| 用户支付不足 | 过期前是 `partial`；到期后如果累计仍不足，变为 `expired`。 |
+| 用户分多笔支付 | 多笔 `on_time` 付款会累计；累计不足是 `partial`，累计足额但确认不足是 `confirming`，确认足额后是 `paid`。 |
+| 用户支付刚好足额 | 确认不足时是 `confirming`，达到确认数后是 `paid`。 |
+| 用户支付超额 | 没有单独的“超额”状态；状态是 `paid`，同时 `paid_amount_raw` 会大于应付 `amount_raw`，超出部分需要业务侧对账或退款策略处理。 |
+| 订单已经过期后才支付 | 付款会被记录为 `late` 或 `outside_window`，订单保持 `expired` 或原有 `paid` 状态，不会因为这笔付款自动改成正常完成。确认后会进入问题资金归集。 |
+| 用户在过期前付款，但 scanner 过期后才扫到 | 因为判断依据是链上 `block_time`，这笔付款仍是 `on_time`；订单可以从 `expired` 恢复到 `confirming/paid`。 |
+| 用户转错 token、转错链或转错地址 | 当前订单不会匹配到这笔付款；订单状态不变。 |
+| 链发生 reorg | 被作废的付款标记为 `orphaned`；订单可能从 `paid` 回退到 `confirming`、`partial`、`pending` 或 `expired`。 |
+| 重复向同一订单地址转账 | 地址不会复用，所有命中该订单窗口的 `on_time` 转账都会累计到该订单。 |
+
+`paid_amount_raw` 表示“已确认且按时”的累计金额，不包含确认中的付款，也不包含 `late/outside_window/orphaned` 付款。因此前端展示时应同时看 `status` 和 `paid_amount_raw`：`confirming` 可能已经观察到足额付款，但 `paid_amount_raw` 仍小于应付金额，直到确认数满足后才推进。
+
+归集分两条路径：
+
+- 正常资金：`paid` 订单会自动归集到 `TREASURY_ADDRESS`。自动归集使用已确认按时金额，避免把过期后追加的 late payment 一起扫入 treasury。
+- 问题资金：订单过期后仍留在收款地址里的已确认 token 会自动归集到 `PROBLEM_FUNDS_ADDRESS`，包括过期订单的部分付款、过期后付款，以及已支付订单在过期后又收到的 late/outside-window 付款。
+
+`pending`、`partial`、`confirming` 订单不会进入归集。`expired` 订单只会走问题资金归集，不会走正常 treasury 归集。
+
 ## 主要模块
 
 - `src/api`: Axum HTTP API，包含 health、readiness、metrics、订单、付款验证和归集接口。
@@ -126,6 +169,7 @@ scripts/build-prebuilt-binary.sh
 - `TOKEN_DECIMALS`: token 精度。
 - `TOKEN_SYMBOL`: token 符号。
 - `TREASURY_ADDRESS`: 归集目标地址。
+- `PROBLEM_FUNDS_ADDRESS`: 问题资金归集地址，用于统一处理过期后付款、过期不足额付款等异常资金。
 - `RPC_HTTP_URLS`: 逗号分隔的 RPC HTTP provider 列表。
 - `START_BLOCK`: Transfer log 采集起始区块。
 - `MIN_CONFIRMATIONS`: 付款确认数。
@@ -140,6 +184,7 @@ scripts/build-prebuilt-binary.sh
 
 - 使用外部 signer，不在 Pay3 进程内保存 mnemonic/private key。
 - 使用强 JWT key material，生产环境不使用 `JWT_SECRET` dry-run 配置。
+- `TREASURY_ADDRESS` 和 `PROBLEM_FUNDS_ADDRESS` 必须是不同地址，并纳入资金对账流程。
 - 配置至少两个可靠 RPC provider，并完成 provider 切换演练。
 - 为 PostgreSQL 配置备份、PITR 和 migration rollback 流程。
 - 为 KVDB rebuild、reorg、collection 卡住、RPC 异常准备 runbook。

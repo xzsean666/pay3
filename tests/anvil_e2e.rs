@@ -64,6 +64,7 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
     let child_address = anvil.derive_address(CHILD_PATH).await?;
     let deployer_address = anvil.derive_address(DEPLOYER_PATH).await?;
     let treasury_address = anvil.derive_address(TREASURY_PATH).await?;
+    let problem_funds_address = anvil.derive_address("m/44'/60'/0'/0/3").await?;
 
     let initial_supply = RawAmount::from(1_000_000u64);
     let payment_amount = RawAmount::from(12_345u64);
@@ -100,6 +101,7 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
                 chain_id,
                 token_address,
                 treasury_address,
+                problem_funds_address,
                 start_block,
             },
         )
@@ -159,6 +161,7 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
                 chain_id,
                 token_address,
                 treasury_address,
+                problem_funds_address,
                 CollectionFees::new(
                     120_000,
                     RawAmount::from(10_000_000_000u64),
@@ -178,6 +181,7 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
                 chain_id,
                 token_address,
                 treasury_address,
+                problem_funds_address,
                 CollectionFees::new(
                     120_000,
                     RawAmount::from(10_000_000_000u64),
@@ -353,6 +357,7 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
     let child_address = anvil.derive_address(CHILD_PATH).await?;
     let deployer_address = anvil.derive_address(DEPLOYER_PATH).await?;
     let treasury_address = anvil.derive_address(TREASURY_PATH).await?;
+    let problem_funds_address = anvil.derive_address("m/44'/60'/0'/0/3").await?;
 
     let initial_supply = RawAmount::from(1_000_000u64);
     let payment_amount = RawAmount::from(12_345u64);
@@ -390,6 +395,7 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
                 chain_id,
                 token_address,
                 treasury_address,
+                problem_funds_address,
                 start_block,
             },
         )
@@ -449,6 +455,7 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
                 chain_id,
                 token_address,
                 treasury_address,
+                problem_funds_address,
                 CollectionFees::new(
                     120_000,
                     RawAmount::from(10_000_000_000u64),
@@ -468,6 +475,7 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
                 chain_id,
                 token_address,
                 treasury_address,
+                problem_funds_address,
                 CollectionFees::new(
                     120_000,
                     RawAmount::from(10_000_000_000u64),

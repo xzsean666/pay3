@@ -16,10 +16,10 @@ use crate::{
         PendingNonceReader,
     },
     db::repositories::{
-        AuditEventInput, AuditRepository, CollectionJob, CollectionRecord, CollectionRecordStatus,
-        CollectionRepository, CreateCollectionCommand, NewSignedOutboundTx, OrderRepository,
-        OrderView, OutboundRepository, OutboundTxPurpose, OutboundTxRecord,
-        ReceiptCheckableOutboundTx, RepositoryError,
+        AuditEventInput, AuditRepository, CollectionJob, CollectionOrderRequirement,
+        CollectionRecord, CollectionRecordStatus, CollectionRepository, CreateCollectionCommand,
+        NewSignedOutboundTx, OrderRepository, OrderView, OutboundRepository, OutboundTxPurpose,
+        OutboundTxRecord, ReceiptCheckableOutboundTx, RepositoryError,
     },
     domain::{
         CollectionFees, CollectionPurpose, CollectionTxPlan, EvmAddress, OrderStatus, RawAmount,
@@ -35,6 +35,7 @@ pub struct CollectionServiceConfig {
     pub chain_id: u64,
     pub token_address: EvmAddress,
     pub treasury_address: EvmAddress,
+    pub problem_funds_address: EvmAddress,
     pub fees: CollectionFees,
 }
 
@@ -43,12 +44,14 @@ impl CollectionServiceConfig {
         chain_id: u64,
         token_address: EvmAddress,
         treasury_address: EvmAddress,
+        problem_funds_address: EvmAddress,
         fees: CollectionFees,
     ) -> Self {
         Self {
             chain_id,
             token_address,
             treasury_address,
+            problem_funds_address,
             fees,
         }
     }
@@ -70,6 +73,18 @@ impl CollectionServiceConfig {
             return Err(CollectionServiceError::invalid_argument(
                 "treasury_address",
                 "must not be zero",
+            ));
+        }
+        if self.problem_funds_address == EvmAddress::ZERO {
+            return Err(CollectionServiceError::invalid_argument(
+                "problem_funds_address",
+                "must not be zero",
+            ));
+        }
+        if self.problem_funds_address == self.treasury_address {
+            return Err(CollectionServiceError::invalid_argument(
+                "problem_funds_address",
+                "must differ from treasury_address",
             ));
         }
         if self.fees.gas_limit == 0 {
@@ -163,6 +178,42 @@ impl AuditContext {
 pub enum CreateCollectionOutcome {
     Created,
     Existing,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CollectionRoute {
+    Treasury,
+    ProblemFunds,
+}
+
+impl CollectionRoute {
+    fn to_address(self, config: &CollectionServiceConfig) -> EvmAddress {
+        match self {
+            Self::Treasury => config.treasury_address,
+            Self::ProblemFunds => config.problem_funds_address,
+        }
+    }
+
+    fn order_requirement(self) -> CollectionOrderRequirement {
+        match self {
+            Self::Treasury => CollectionOrderRequirement::Paid,
+            Self::ProblemFunds => CollectionOrderRequirement::ProblemFunds,
+        }
+    }
+
+    fn audit_event_type(self) -> &'static str {
+        match self {
+            Self::Treasury => "collection.create",
+            Self::ProblemFunds => "collection.problem_funds.create",
+        }
+    }
+
+    fn canonical_destination(self) -> &'static str {
+        match self {
+            Self::Treasury => "treasury",
+            Self::ProblemFunds => "problem_funds",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -268,7 +319,7 @@ pub enum CollectionServiceError {
     #[error("order not found: {order_id}")]
     OrderNotFound { order_id: Uuid },
 
-    #[error("order {order_id} is not paid and cannot be collected")]
+    #[error("order {order_id} with status {status:?} cannot be collected for this destination")]
     OrderNotCollectable { order_id: Uuid, status: OrderStatus },
 
     #[error("order {order_id} is for a different chain/token")]
@@ -449,6 +500,23 @@ where
         &self,
         input: CreateCollectionInput,
     ) -> Result<CreateCollectionResult, CollectionServiceError> {
+        self.create_collection_for_route(input, CollectionRoute::Treasury)
+            .await
+    }
+
+    pub async fn create_problem_funds_collection(
+        &self,
+        input: CreateCollectionInput,
+    ) -> Result<CreateCollectionResult, CollectionServiceError> {
+        self.create_collection_for_route(input, CollectionRoute::ProblemFunds)
+            .await
+    }
+
+    async fn create_collection_for_route(
+        &self,
+        input: CreateCollectionInput,
+        route: CollectionRoute,
+    ) -> Result<CreateCollectionResult, CollectionServiceError> {
         let input = normalize_create_collection_input(input)?;
         let view = match input.audit.principal_sub.as_deref() {
             Some(owner_sub) => {
@@ -461,10 +529,10 @@ where
         .ok_or(CollectionServiceError::OrderNotFound {
             order_id: input.order_id,
         })?;
-        validate_collectable_order(&view, &self.config)?;
+        validate_collectable_order(&view, &self.config, route)?;
 
         let collection_id = self.ids.new_id();
-        let request_hash = canonical_collection_request_hash(&input, &self.config)?;
+        let request_hash = canonical_collection_request_hash(&input, &self.config, route)?;
         let command = CreateCollectionCommand {
             collection_id,
             owner_sub: view.order.owner_sub.clone(),
@@ -475,8 +543,9 @@ where
             chain_id: self.config.chain_id,
             token_address: self.config.token_address,
             from_address: view.order.receive_address,
-            to_address: self.config.treasury_address,
+            to_address: route.to_address(&self.config),
             amount_raw: input.amount.as_optional_raw(),
+            order_requirement: route.order_requirement(),
         };
 
         let collection = self
@@ -489,13 +558,14 @@ where
             CreateCollectionOutcome::Existing
         };
         self.append_collection_audit(
-            "collection.create",
+            route.audit_event_type(),
             &input.audit,
             Some(collection.order_id),
             Some(collection.id),
             None,
             json!({
                 "outcome": outcome,
+                "destination": route.canonical_destination(),
                 "from_address": collection.from_address,
                 "to_address": collection.to_address,
                 "amount_raw": collection.amount_raw.map(|amount| amount.to_string()),
@@ -911,12 +981,18 @@ fn normalize_create_collection_input(
 fn validate_collectable_order(
     view: &OrderView,
     config: &CollectionServiceConfig,
+    route: CollectionRoute,
 ) -> Result<(), CollectionServiceError> {
-    if view.order.status != OrderStatus::Paid {
-        return Err(CollectionServiceError::OrderNotCollectable {
-            order_id: view.order.id,
-            status: view.order.status,
-        });
+    match route {
+        CollectionRoute::Treasury if view.order.status == OrderStatus::Paid => {}
+        CollectionRoute::ProblemFunds
+            if matches!(view.order.status, OrderStatus::Expired | OrderStatus::Paid) => {}
+        _ => {
+            return Err(CollectionServiceError::OrderNotCollectable {
+                order_id: view.order.id,
+                status: view.order.status,
+            });
+        }
     }
     if view.order.chain_id != config.chain_id || view.order.token_address != config.token_address {
         return Err(CollectionServiceError::OrderStreamMismatch {
@@ -929,6 +1005,7 @@ fn validate_collectable_order(
 fn canonical_collection_request_hash(
     input: &NormalizedCreateCollectionInput,
     config: &CollectionServiceConfig,
+    route: CollectionRoute,
 ) -> Result<String, CollectionServiceError> {
     #[derive(Serialize)]
     struct CanonicalRequest<'a> {
@@ -937,7 +1014,8 @@ fn canonical_collection_request_hash(
         amount: String,
         chain_id: u64,
         token_address: EvmAddress,
-        treasury_address: EvmAddress,
+        destination: &'a str,
+        to_address: EvmAddress,
     }
 
     let canonical = CanonicalRequest {
@@ -946,7 +1024,8 @@ fn canonical_collection_request_hash(
         amount: input.amount.canonical_value(),
         chain_id: config.chain_id,
         token_address: config.token_address,
-        treasury_address: config.treasury_address,
+        destination: route.canonical_destination(),
+        to_address: route.to_address(config),
     };
     let bytes = serde_json::to_vec(&canonical)?;
     Ok(keccak256(bytes).to_string())
@@ -1106,6 +1185,60 @@ mod tests {
             service.audit.event_types(),
             vec!["collection.create".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn create_problem_funds_collection_uses_problem_address_for_expired_order() {
+        let service = service(Fixture {
+            order_status: OrderStatus::Expired,
+            ..Fixture::default()
+        });
+        let result = service
+            .create_problem_funds_collection(CreateCollectionInput::max(
+                order_id(),
+                " problem-collect-1 ",
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(result.outcome, CreateCollectionOutcome::Created);
+        assert_eq!(result.collection.to_address, problem_funds());
+        let commands = service.collections.commands();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].idempotency_key, "problem-collect-1");
+        assert_eq!(commands[0].order_id, order_id());
+        assert_eq!(commands[0].from_address, child_address());
+        assert_eq!(commands[0].to_address, problem_funds());
+        assert_eq!(
+            commands[0].order_requirement,
+            CollectionOrderRequirement::ProblemFunds
+        );
+        assert_eq!(
+            service.audit.event_types(),
+            vec!["collection.problem_funds.create".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_problem_funds_collection_rejects_open_order() {
+        let service = service(Fixture {
+            order_status: OrderStatus::Partial,
+            ..Fixture::default()
+        });
+
+        let error = service
+            .create_problem_funds_collection(CreateCollectionInput::max(
+                order_id(),
+                "problem-collect-1",
+            ))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CollectionServiceError::OrderNotCollectable { .. }
+        ));
+        assert!(service.collections.commands().is_empty());
     }
 
     #[tokio::test]
@@ -1599,8 +1732,9 @@ mod tests {
                 .expect("fake collection repo mutex poisoned")
                 .commands
                 .push(command.clone());
-            Ok(collection_record(
+            Ok(collection_record_to(
                 command.collection_id,
+                command.to_address,
                 command.amount_raw,
                 None,
             ))
@@ -2048,6 +2182,7 @@ mod tests {
             1,
             token(),
             treasury(),
+            problem_funds(),
             CollectionFees::new(
                 65_000,
                 RawAmount::from(30_000_000_000),
@@ -2114,6 +2249,15 @@ mod tests {
         amount_raw: Option<RawAmount>,
         outbound_tx_id: Option<Uuid>,
     ) -> CollectionRecord {
+        collection_record_to(id, treasury(), amount_raw, outbound_tx_id)
+    }
+
+    fn collection_record_to(
+        id: Uuid,
+        to_address: EvmAddress,
+        amount_raw: Option<RawAmount>,
+        outbound_tx_id: Option<Uuid>,
+    ) -> CollectionRecord {
         CollectionRecord {
             id,
             owner_sub: "merchant-1".to_string(),
@@ -2124,7 +2268,7 @@ mod tests {
             chain_id: 1,
             token_address: token(),
             from_address: child_address(),
-            to_address: treasury(),
+            to_address,
             amount_raw,
             status: if outbound_tx_id.is_some() {
                 crate::db::repositories::CollectionRecordStatus::Transferring
@@ -2185,6 +2329,10 @@ mod tests {
 
     fn treasury() -> EvmAddress {
         address(0x22)
+    }
+
+    fn problem_funds() -> EvmAddress {
+        address(0x44)
     }
 
     fn child_address() -> EvmAddress {

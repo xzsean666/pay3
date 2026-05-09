@@ -234,6 +234,7 @@ async fn real_chain_order_payment_collection_flow() -> Result<(), AnyError> {
                 chain_id: config.chain.chain_id,
                 token_address: config.chain.token_address,
                 treasury_address: config.chain.treasury_address,
+                problem_funds_address: config.chain.problem_funds_address,
                 start_block,
             },
         )
@@ -318,6 +319,7 @@ async fn real_chain_order_payment_collection_flow() -> Result<(), AnyError> {
             config.chain.chain_id,
             config.chain.token_address,
             config.chain.treasury_address,
+            config.chain.problem_funds_address,
             collection_fees,
         );
         let collection_config_for_concurrent = collection_config.clone();

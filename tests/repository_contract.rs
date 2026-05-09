@@ -80,7 +80,8 @@ fn collection_repository_uses_job_lock_and_treasury_backed_insert() {
         "idempotency_key",
         "request_hash",
         "get_collection",
-        "status != \"paid\"",
+        "CollectionOrderRequirement::Paid",
+        "CollectionOrderRequirement::ProblemFunds",
         "INSERT INTO collections",
         "attach_outbound_tx",
     ] {

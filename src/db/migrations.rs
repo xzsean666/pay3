@@ -13,6 +13,7 @@ pub struct RuntimeSeedConfig {
     pub chain_id: u64,
     pub token_address: EvmAddress,
     pub treasury_address: EvmAddress,
+    pub problem_funds_address: EvmAddress,
     pub start_block: u64,
 }
 
@@ -111,22 +112,24 @@ async fn seed_treasury_address(
     tx: &mut Transaction<'_, Postgres>,
     config: &RuntimeSeedConfig,
 ) -> Result<(), MigrationBootstrapError> {
-    sqlx::query(
-        r#"
-        INSERT INTO treasury_addresses (
-            chain_id,
-            token_address,
-            treasury_address
+    for address in [config.treasury_address, config.problem_funds_address] {
+        sqlx::query(
+            r#"
+            INSERT INTO treasury_addresses (
+                chain_id,
+                token_address,
+                treasury_address
+            )
+            VALUES ($1, $2, $3)
+            ON CONFLICT (chain_id, token_address, treasury_address) DO NOTHING
+            "#,
         )
-        VALUES ($1, $2, $3)
-        ON CONFLICT (chain_id, token_address, treasury_address) DO NOTHING
-        "#,
-    )
-    .bind(i64::try_from(config.chain_id)?)
-    .bind(config.token_address.to_string())
-    .bind(config.treasury_address.to_string())
-    .execute(&mut **tx)
-    .await?;
+        .bind(i64::try_from(config.chain_id)?)
+        .bind(config.token_address.to_string())
+        .bind(address.to_string())
+        .execute(&mut **tx)
+        .await?;
+    }
 
     Ok(())
 }

@@ -275,6 +275,13 @@ pub struct CreateCollectionCommand {
     pub from_address: EvmAddress,
     pub to_address: EvmAddress,
     pub amount_raw: Option<RawAmount>,
+    pub order_requirement: CollectionOrderRequirement,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CollectionOrderRequirement {
+    Paid,
+    ProblemFunds,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

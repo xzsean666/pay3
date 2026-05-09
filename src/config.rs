@@ -244,6 +244,7 @@ pub struct ChainConfig {
     pub token_decimals: u8,
     pub token_symbol: String,
     pub treasury_address: EvmAddress,
+    pub problem_funds_address: EvmAddress,
     pub rpc_http_urls: Vec<String>,
     pub start_block: u64,
     pub min_confirmations: u64,
@@ -507,6 +508,7 @@ impl AppConfig {
                     .unwrap_or("TOKEN")
                     .to_string(),
                 treasury_address: parse_required_address(&values, &["TREASURY_ADDRESS"])?,
+                problem_funds_address: parse_required_address(&values, &["PROBLEM_FUNDS_ADDRESS"])?,
                 rpc_http_urls: parse_required_list(&values, &["RPC_HTTP_URLS", "RPC_URLS"])?,
                 start_block: parse_required_u64(&values, &["START_BLOCK", "SCAN_FROM_BLOCK"])?,
                 min_confirmations: parse_required_u64(&values, &["MIN_CONFIRMATIONS"])?,
@@ -659,6 +661,14 @@ impl AppConfig {
                 "COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI must be <= COLLECTION_MAX_FEE_PER_GAS_WEI"
                     .to_string(),
             );
+        }
+
+        if self.chain.problem_funds_address == EvmAddress::ZERO {
+            errors.push("PROBLEM_FUNDS_ADDRESS must not be zero".to_string());
+        }
+
+        if self.chain.problem_funds_address == self.chain.treasury_address {
+            errors.push("PROBLEM_FUNDS_ADDRESS must differ from TREASURY_ADDRESS".to_string());
         }
 
         if !self.profile.is_production() {
@@ -1040,6 +1050,10 @@ mod tests {
                 "0x0000000000000000000000000000000000000002".to_string(),
             ),
             (
+                "PROBLEM_FUNDS_ADDRESS",
+                "0x0000000000000000000000000000000000000003".to_string(),
+            ),
+            (
                 "RPC_HTTP_URLS",
                 "http://localhost:8545,http://localhost:8546".to_string(),
             ),
@@ -1121,6 +1135,12 @@ mod tests {
         assert_eq!(config.chain.chain_id, 31337);
         assert_eq!(config.chain.token_decimals, 6);
         assert_eq!(config.chain.token_symbol, "USDT");
+        assert_eq!(
+            config.chain.problem_funds_address,
+            "0x0000000000000000000000000000000000000003"
+                .parse::<EvmAddress>()
+                .unwrap()
+        );
         assert_eq!(config.chain.rpc_http_urls.len(), 2);
         assert_eq!(config.chain.start_block, 1);
         assert_eq!(config.chain.min_confirmations, 12);
@@ -1387,6 +1407,21 @@ mod tests {
 
         let errors = validation_errors(&config);
         assert!(errors.iter().any(|error| error.contains("PRIORITY_FEE")));
+    }
+
+    #[test]
+    fn problem_funds_address_must_be_distinct_from_treasury() {
+        let config = config_with(&[(
+            "PROBLEM_FUNDS_ADDRESS",
+            "0x0000000000000000000000000000000000000002",
+        )]);
+
+        let errors = validation_errors(&config);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("PROBLEM_FUNDS_ADDRESS"))
+        );
     }
 
     #[test]

@@ -282,22 +282,6 @@ fn parse_evm_address(value: &str, field: &'static str) -> Result<EvmAddress, Rep
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use bigdecimal::{BigDecimal, num_bigint::BigInt};
-
-    use super::raw_amount_from_numeric;
-
-    #[test]
-    fn raw_amount_from_numeric_accepts_negative_scale_bigdecimal() {
-        let amount = BigDecimal::new(BigInt::from(166u32), -16);
-
-        let raw = raw_amount_from_numeric(amount).unwrap();
-
-        assert_eq!(raw.to_string(), "1660000000000000000");
-    }
-}
-
 fn parse_tx_hash(value: &str) -> Result<TxHash, RepositoryError> {
     value.parse().map_err(|error| {
         RepositoryError::invalid_persisted_state(format!("invalid tx_hash: {error}"))
@@ -337,5 +321,21 @@ fn payment_chain_status_str(status: PaymentChainStatus) -> &'static str {
         PaymentChainStatus::Observed => "observed",
         PaymentChainStatus::Confirmed => "confirmed",
         PaymentChainStatus::Orphaned => "orphaned",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bigdecimal::{BigDecimal, num_bigint::BigInt};
+
+    use super::raw_amount_from_numeric;
+
+    #[test]
+    fn raw_amount_from_numeric_accepts_negative_scale_bigdecimal() {
+        let amount = BigDecimal::new(BigInt::from(166u32), -16);
+
+        let raw = raw_amount_from_numeric(amount).unwrap();
+
+        assert_eq!(raw.to_string(), "1660000000000000000");
     }
 }

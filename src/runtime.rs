@@ -1,8 +1,8 @@
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, path::Path, str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use axum::Router;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use thiserror::Error;
 use tokio::task::JoinHandle;
 
@@ -28,7 +28,7 @@ use crate::{
             PgVerifiedPaymentRecorder, RepositoryError,
         },
     },
-    domain::{CollectionFees, EvmAddress},
+    domain::{CollectionFees, EvmAddress, RawAmount},
     health::{
         DependencyCheck, DependencyName, MetricsRecorder, RuntimeDependencyRegistry,
         StaticDependencyRegistry,
@@ -468,6 +468,7 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
             collection_service(&config, pool.clone(), rpc_source.clone(), signer.clone())?,
             config.chain.chain_id,
             config.chain.token_address,
+            config.chain.problem_funds_address,
             std::time::Duration::from_millis(COLLECTION_ENQUEUER_POLL_INTERVAL_MS),
             COLLECTION_ENQUEUER_BATCH_LIMIT,
         )));
@@ -518,6 +519,7 @@ fn runtime_seed_config(config: &AppConfig) -> RuntimeSeedConfig {
         chain_id: config.chain.chain_id,
         token_address: config.chain.token_address,
         treasury_address: config.chain.treasury_address,
+        problem_funds_address: config.chain.problem_funds_address,
         start_block: config.chain.start_block,
     }
 }
@@ -657,6 +659,7 @@ fn collection_service_config(config: &AppConfig) -> CollectionServiceConfig {
         config.chain.chain_id,
         config.chain.token_address,
         config.chain.treasury_address,
+        config.chain.problem_funds_address,
         CollectionFees::new(
             config.collection.gas_limit,
             config.collection.max_fee_per_gas_wei,
@@ -676,6 +679,7 @@ async fn auto_collection_enqueue_loop(
     collection_service: RuntimeCollectionService<RuntimeSigner>,
     chain_id: u64,
     token_address: EvmAddress,
+    problem_funds_address: EvmAddress,
     poll_interval: std::time::Duration,
     batch_limit: u32,
 ) {
@@ -684,11 +688,12 @@ async fn auto_collection_enqueue_loop(
 
     loop {
         interval.tick().await;
-        match enqueue_paid_orders_for_collection(
+        match enqueue_orders_for_collection(
             &pool,
             &collection_service,
             chain_id,
             token_address,
+            problem_funds_address,
             batch_limit,
         )
         .await
@@ -706,6 +711,40 @@ async fn auto_collection_enqueue_loop(
     }
 }
 
+async fn enqueue_orders_for_collection(
+    pool: &PgPool,
+    collection_service: &RuntimeCollectionService<RuntimeSigner>,
+    chain_id: u64,
+    token_address: EvmAddress,
+    problem_funds_address: EvmAddress,
+    batch_limit: u32,
+) -> Result<usize, RuntimeError> {
+    if batch_limit == 0 {
+        return Ok(0);
+    }
+
+    let mut enqueued = 0;
+    enqueued += enqueue_paid_orders_for_collection(
+        pool,
+        collection_service,
+        chain_id,
+        token_address,
+        batch_limit,
+    )
+    .await?;
+    enqueued += enqueue_problem_funds_orders_for_collection(
+        pool,
+        collection_service,
+        chain_id,
+        token_address,
+        problem_funds_address,
+        batch_limit,
+    )
+    .await?;
+
+    Ok(enqueued)
+}
+
 async fn enqueue_paid_orders_for_collection(
     pool: &PgPool,
     collection_service: &RuntimeCollectionService<RuntimeSigner>,
@@ -713,25 +752,25 @@ async fn enqueue_paid_orders_for_collection(
     token_address: EvmAddress,
     batch_limit: u32,
 ) -> Result<usize, RuntimeError> {
-    if batch_limit == 0 {
-        return Ok(0);
-    }
-
-    let order_ids =
+    let orders =
         paid_orders_without_collections(pool, chain_id, token_address, batch_limit).await?;
     let mut enqueued = 0;
-    for order_id in order_ids {
+    for order in orders {
         match collection_service
-            .create_collection(CreateCollectionInput::max(
-                order_id,
-                format!("auto-collect-{order_id}"),
-            ))
+            .create_collection(CreateCollectionInput {
+                order_id: order.order_id,
+                amount: crate::services::collections::CollectionAmount::Exact(
+                    order.paid_amount_raw,
+                ),
+                idempotency_key: format!("auto-collect-{}", order.order_id),
+                audit: Default::default(),
+            })
             .await
         {
             Ok(result) => {
                 enqueued += 1;
                 tracing::info!(
-                    order_id = %order_id,
+                    order_id = %order.order_id,
                     collection_id = %result.collection.id,
                     outcome = ?result.outcome,
                     "auto collection enqueued paid order"
@@ -739,7 +778,7 @@ async fn enqueue_paid_orders_for_collection(
             }
             Err(error) => {
                 tracing::warn!(
-                    order_id = %order_id,
+                    order_id = %order.order_id,
                     error = %error,
                     "auto collection enqueue skipped paid order"
                 );
@@ -750,19 +789,26 @@ async fn enqueue_paid_orders_for_collection(
     Ok(enqueued)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PaidCollectionCandidate {
+    order_id: uuid::Uuid,
+    paid_amount_raw: RawAmount,
+}
+
 async fn paid_orders_without_collections(
     pool: &PgPool,
     chain_id: u64,
     token_address: EvmAddress,
     limit: u32,
-) -> Result<Vec<uuid::Uuid>, RuntimeError> {
-    let rows = sqlx::query_scalar(
+) -> Result<Vec<PaidCollectionCandidate>, RuntimeError> {
+    let rows = sqlx::query(
         r#"
-        SELECT o.id
+        SELECT o.id, o.paid_amount_raw::text AS paid_amount_raw
         FROM orders o
         WHERE o.chain_id = $1
           AND o.token_address = $2
           AND o.status = 'paid'
+          AND o.paid_amount_raw > 0
           AND NOT EXISTS (
               SELECT 1
               FROM collections c
@@ -782,7 +828,170 @@ async fn paid_orders_without_collections(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows)
+    rows.into_iter()
+        .map(|row| {
+            let order_id = row.try_get("id")?;
+            let paid_amount_raw = raw_amount_from_db_text(row.try_get("paid_amount_raw")?)?;
+            Ok(PaidCollectionCandidate {
+                order_id,
+                paid_amount_raw,
+            })
+        })
+        .collect()
+}
+
+async fn enqueue_problem_funds_orders_for_collection(
+    pool: &PgPool,
+    collection_service: &RuntimeCollectionService<RuntimeSigner>,
+    chain_id: u64,
+    token_address: EvmAddress,
+    problem_funds_address: EvmAddress,
+    batch_limit: u32,
+) -> Result<usize, RuntimeError> {
+    let candidates = problem_funds_orders_ready_for_collection(
+        pool,
+        chain_id,
+        token_address,
+        problem_funds_address,
+        batch_limit,
+    )
+    .await?;
+    let mut enqueued = 0;
+
+    for candidate in candidates {
+        match collection_service
+            .create_problem_funds_collection(CreateCollectionInput::max(
+                candidate.order_id,
+                format!(
+                    "auto-problem-funds-{}-{}",
+                    candidate.order_id, candidate.problem_payment_total_raw
+                ),
+            ))
+            .await
+        {
+            Ok(result) => {
+                enqueued += 1;
+                tracing::info!(
+                    order_id = %candidate.order_id,
+                    collection_id = %result.collection.id,
+                    problem_payment_total_raw = %candidate.problem_payment_total_raw,
+                    outcome = ?result.outcome,
+                    "auto collection enqueued problem funds order"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    order_id = %candidate.order_id,
+                    problem_payment_total_raw = %candidate.problem_payment_total_raw,
+                    error = %error,
+                    "auto collection enqueue skipped problem funds order"
+                );
+            }
+        }
+    }
+
+    Ok(enqueued)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ProblemFundsCollectionCandidate {
+    order_id: uuid::Uuid,
+    problem_payment_total_raw: RawAmount,
+}
+
+async fn problem_funds_orders_ready_for_collection(
+    pool: &PgPool,
+    chain_id: u64,
+    token_address: EvmAddress,
+    problem_funds_address: EvmAddress,
+    limit: u32,
+) -> Result<Vec<ProblemFundsCollectionCandidate>, RuntimeError> {
+    let rows = sqlx::query(
+        r#"
+        WITH problem_payment_totals AS (
+            SELECT
+                o.id AS order_id,
+                SUM(p.amount_raw) AS problem_payment_total_raw
+            FROM orders o
+            JOIN payments p ON p.order_id = o.id
+            WHERE o.chain_id = $1
+              AND o.token_address = $2
+              AND p.chain_status = 'confirmed'
+              AND (
+                  o.status = 'expired'
+                  OR (
+                      o.status = 'paid'
+                      AND p.match_status IN ('late', 'outside_window')
+                  )
+              )
+            GROUP BY o.id
+        ),
+        problem_collection_totals AS (
+            SELECT
+                c.order_id,
+                COALESCE(
+                    SUM(c.amount_raw) FILTER (
+                        WHERE c.status = 'confirmed'
+                          AND c.amount_raw IS NOT NULL
+                    ),
+                    0
+                ) AS confirmed_problem_collection_total_raw,
+                BOOL_OR(c.status IN ('queued', 'transferring', 'confirming', 'replacing')) AS has_active_problem_collection
+            FROM collections c
+            WHERE c.chain_id = $1
+              AND c.token_address = $2
+              AND c.to_address = $3
+            GROUP BY c.order_id
+        )
+        SELECT
+            ppt.order_id,
+            ppt.problem_payment_total_raw::text AS problem_payment_total_raw
+        FROM problem_payment_totals ppt
+        LEFT JOIN problem_collection_totals pct ON pct.order_id = ppt.order_id
+        WHERE ppt.problem_payment_total_raw > COALESCE(pct.confirmed_problem_collection_total_raw, 0)
+          AND COALESCE(pct.has_active_problem_collection, false) = false
+          AND NOT EXISTS (
+              SELECT 1
+              FROM collections active
+              WHERE active.order_id = ppt.order_id
+                AND active.status IN ('queued', 'transferring', 'confirming', 'replacing')
+          )
+        ORDER BY ppt.order_id
+        LIMIT $4
+        "#,
+    )
+    .bind(i64::try_from(chain_id).map_err(|error| {
+        RuntimeError::Config(ConfigError::Validation {
+            errors: vec![format!("CHAIN_ID does not fit PostgreSQL bigint: {error}")],
+        })
+    })?)
+    .bind(token_address.to_lower_hex())
+    .bind(problem_funds_address.to_lower_hex())
+    .bind(i64::from(limit))
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let order_id = row.try_get("order_id")?;
+            let problem_payment_total_raw =
+                raw_amount_from_db_text(row.try_get("problem_payment_total_raw")?)?;
+            Ok(ProblemFundsCollectionCandidate {
+                order_id,
+                problem_payment_total_raw,
+            })
+        })
+        .collect()
+}
+
+fn raw_amount_from_db_text(value: String) -> Result<RawAmount, RuntimeError> {
+    RawAmount::from_str(&value).map_err(|error| {
+        RuntimeError::Repository(Box::new(RepositoryError::invalid_db_value(
+            "numeric(78,0)",
+            value,
+            format!("invalid raw amount: {error}"),
+        )))
+    })
 }
 
 fn payment_scanner_worker(
@@ -1289,6 +1498,10 @@ MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
             service_config.treasury_address,
             config.chain.treasury_address
         );
+        assert_eq!(
+            service_config.problem_funds_address,
+            config.chain.problem_funds_address
+        );
         assert_eq!(service_config.fees.gas_limit, 90_000);
         assert_eq!(
             service_config.fees.max_fee_per_gas,
@@ -1600,6 +1813,10 @@ MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
                 "TREASURY_ADDRESS",
                 "0x0000000000000000000000000000000000000002".to_string(),
             ),
+            (
+                "PROBLEM_FUNDS_ADDRESS",
+                "0x0000000000000000000000000000000000000003".to_string(),
+            ),
             ("RPC_HTTP_URLS", "http://localhost:8545".to_string()),
             ("START_BLOCK", "1".to_string()),
             ("MIN_CONFIRMATIONS", "12".to_string()),
@@ -1644,6 +1861,10 @@ MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
             (
                 "TREASURY_ADDRESS",
                 "0x0000000000000000000000000000000000000002".to_string(),
+            ),
+            (
+                "PROBLEM_FUNDS_ADDRESS",
+                "0x0000000000000000000000000000000000000003".to_string(),
             ),
             ("RPC_HTTP_URLS", "http://localhost:8545".to_string()),
             ("START_BLOCK", "1".to_string()),

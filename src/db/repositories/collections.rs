@@ -10,7 +10,10 @@ use crate::domain::{DerivationSegment, EvmAddress, RawAmount};
 
 use super::{
     error::RepositoryError,
-    types::{CollectionJob, CollectionRecord, CollectionRecordStatus, CreateCollectionCommand},
+    types::{
+        CollectionJob, CollectionOrderRequirement, CollectionRecord, CollectionRecordStatus,
+        CreateCollectionCommand,
+    },
 };
 
 const DEFAULT_CLAIM_LEASE_SECONDS: u64 = 60;
@@ -109,7 +112,7 @@ impl CollectionRepository for PgCollectionRepository {
             return Ok(existing);
         }
 
-        lock_paid_order_for_collection(&mut tx, &command).await?;
+        lock_collectable_order(&mut tx, &command).await?;
         let inserted = insert_collection(&mut tx, &command).await?;
 
         let collection = match inserted {
@@ -303,7 +306,7 @@ async fn select_collection_by_idempotency_key(
         .transpose()
 }
 
-async fn lock_paid_order_for_collection(
+async fn lock_collectable_order(
     tx: &mut Transaction<'_, Postgres>,
     command: &CreateCollectionCommand,
 ) -> Result<(), RepositoryError> {
@@ -331,11 +334,21 @@ async fn lock_paid_order_for_collection(
     .ok_or_else(|| RepositoryError::not_found("orders", command.order_id.to_string()))?;
 
     let status: String = row.try_get("status")?;
-    if status != "paid" {
-        return Err(RepositoryError::invariant_violation(format!(
-            "order {} must be paid before collection, got {status}",
-            command.order_id
-        )));
+    match command.order_requirement {
+        CollectionOrderRequirement::Paid if status == "paid" => {}
+        CollectionOrderRequirement::ProblemFunds if status == "expired" || status == "paid" => {}
+        CollectionOrderRequirement::Paid => {
+            return Err(RepositoryError::invariant_violation(format!(
+                "order {} must be paid before collection, got {status}",
+                command.order_id
+            )));
+        }
+        CollectionOrderRequirement::ProblemFunds => {
+            return Err(RepositoryError::invariant_violation(format!(
+                "order {} must be expired or paid before problem funds collection, got {status}",
+                command.order_id
+            )));
+        }
     }
 
     Ok(())
