@@ -25,3 +25,6 @@ PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 \
 PAY3_DEPLOYED_API_ENV_FILE=.env.test \
 PAY3_API_BASE_URL=https://sean-10030.002788.xyz/ \
 cargo test --test deployed_api_acceptance -- --ignored --nocapture
+
+
+bash scripts/deploy-frontend-test-cloudflare.sh --api-base-url https://sean-10030.002788.xyz/

@@ -1,6 +1,6 @@
 # Pay3 前端测试台
 
-这是一个只用于 development/staging dry-run 的静态测试页面，部署目标是 Cloudflare Wrangler Workers Assets。
+这是一个只用于 development/staging dry-run 的静态测试页面，部署目标是 Cloudflare Pages。
 
 ## 本地预览
 
@@ -24,17 +24,23 @@ pnpm run deploy
 
 ```bash
 cd frontend-test
-pnpm run deploy:page -- --api-base-url https://your-pay3-api.example
+pnpm run deploy:cloudflare -- --api-base-url https://your-pay3-api.example
+```
+
+也可以直接跑 shell 脚本：
+
+```bash
+bash scripts/deploy-frontend-test-cloudflare.sh --api-base-url https://your-pay3-api.example
 ```
 
 先 dry-run：
 
 ```bash
 cd frontend-test
-pnpm run deploy:page:dry-run
+pnpm run deploy:cloudflare -- --api-base-url https://your-pay3-api.example --dry-run
 ```
 
-这个脚本读取 `../.env.test` 里的 `JWT_SECRET`、`JWT_ISSUER`、`JWT_AUDIENCE`、`JWT_KEY_ID`，生成只含订单测试 scope 的 JWT，然后通过 `wrangler deploy --var` 注入：
+这个脚本要求后端 API URL 由命令行或 shell 环境显式传入，不会从 `.env.test` 读取 `PAY3_API_BASE_URL`。脚本读取 `../.env.test` 里的 `JWT_SECRET`、`JWT_ISSUER`、`JWT_AUDIENCE`、`JWT_KEY_ID`/`JWT_KID` 生成只含订单测试 scope 的 JWT；如果这些签名配置不存在，则会使用 `.env.test` 或 shell 里的 `PAY3_API_JWT` / `PAY3_TEST_JWT`。随后把这些值作为 Pages secret 上传，再部署 `public/`：
 
 - `PAY3_TEST_JWT`
 - `PAY3_TEST_JWT_EXPIRES_AT`
@@ -47,15 +53,15 @@ pnpm run deploy:page:dry-run
 关闭浏览器直连并不暴露 token：
 
 ```bash
-pnpm run deploy:page -- --api-base-url https://your-pay3-api.example --no-direct --hide-token
+pnpm run deploy:cloudflare -- --api-base-url https://your-pay3-api.example --no-direct --hide-token
 ```
 
 ## 直连开关
 
-默认调用模式是 Worker 代理：
+默认调用模式是 Pages Function 代理：
 
 - 页面调用同源 `/api/pay3/*`。
-- Worker 注入 `PAY3_TEST_JWT`。
+- Pages Function 注入 `PAY3_TEST_JWT`。
 - 浏览器不需要跨域访问 Pay3 API。
 
 本测试台也保留浏览器直连开关：

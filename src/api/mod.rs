@@ -19,6 +19,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use uuid::Uuid;
 
 use crate::{
@@ -546,8 +547,8 @@ struct OrderPaymentResponse {
     receive_address: String,
     child_account_id: Uuid,
     derivation_path: String,
-    expires_at: time::OffsetDateTime,
-    monitor_until: time::OffsetDateTime,
+    expires_at: String,
+    monitor_until: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -571,8 +572,8 @@ struct CollectionResponse {
     outbound_tx_id: Option<Uuid>,
     attempt_count: u32,
     error: Option<String>,
-    created_at: time::OffsetDateTime,
-    updated_at: time::OffsetDateTime,
+    created_at: String,
+    updated_at: String,
 }
 
 async fn create_order(
@@ -729,8 +730,8 @@ fn order_response(view: OrderView, config: &OrderResponseConfig) -> OrderRespons
             receive_address: view.order.receive_address.to_lower_hex(),
             child_account_id: view.order.child_account_id,
             derivation_path: view.child_account.derivation_path,
-            expires_at: view.order.expires_at,
-            monitor_until: view.order.monitor_until,
+            expires_at: format_timestamp(view.order.expires_at),
+            monitor_until: format_timestamp(view.order.monitor_until),
         },
     }
 }
@@ -748,9 +749,15 @@ fn collection_response(collection: CollectionRecord) -> CollectionResponse {
         outbound_tx_id: collection.outbound_tx_id,
         attempt_count: collection.attempt_count,
         error: collection.error,
-        created_at: collection.created_at,
-        updated_at: collection.updated_at,
+        created_at: format_timestamp(collection.created_at),
+        updated_at: format_timestamp(collection.updated_at),
     }
+}
+
+fn format_timestamp(timestamp: OffsetDateTime) -> String {
+    timestamp
+        .format(&Rfc3339)
+        .expect("OffsetDateTime should format as RFC3339")
 }
 
 fn parse_collection_amount(value: &str) -> Result<CollectionAmount, ApiError> {
@@ -1136,6 +1143,14 @@ mod tests {
         assert_eq!(response.body["payment"]["token_decimals"], 6);
         assert_eq!(response.body["payment"]["amount"], "12.34");
         assert_eq!(response.body["payment"]["amount_raw"], "12340000");
+        assert_eq!(
+            response.body["payment"]["expires_at"],
+            "2026-05-03T03:24:37Z"
+        );
+        assert_eq!(
+            response.body["payment"]["monitor_until"],
+            "2026-05-04T03:24:37Z"
+        );
         assert_eq!(
             response.body["payment"]["derivation_path"],
             "m/44'/60'/0'/0/42"
@@ -1594,6 +1609,8 @@ mod tests {
         );
         assert_eq!(response.body["attempt_count"], 2);
         assert_eq!(response.body["error"], "receipt pending");
+        assert_eq!(response.body["created_at"], "2026-05-03T03:09:37Z");
+        assert_eq!(response.body["updated_at"], "2026-05-03T03:09:37Z");
 
         assert_eq!(
             service.calls.lock().unwrap().get_ids,

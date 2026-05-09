@@ -268,7 +268,8 @@ fn raw_amount_to_numeric(amount: RawAmount) -> Result<BigDecimal, RepositoryErro
 }
 
 fn raw_amount_from_numeric(value: BigDecimal) -> Result<RawAmount, RepositoryError> {
-    RawAmount::parse_dec_str(&value.to_string()).map_err(|error| {
+    let raw = value.with_scale(0).to_string();
+    RawAmount::parse_dec_str(&raw).map_err(|error| {
         RepositoryError::invalid_persisted_state(format!(
             "database amount_raw is not uint256-compatible: {error}"
         ))
@@ -279,6 +280,22 @@ fn parse_evm_address(value: &str, field: &'static str) -> Result<EvmAddress, Rep
     value.parse().map_err(|error| {
         RepositoryError::invalid_persisted_state(format!("invalid {field}: {error}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use bigdecimal::{BigDecimal, num_bigint::BigInt};
+
+    use super::raw_amount_from_numeric;
+
+    #[test]
+    fn raw_amount_from_numeric_accepts_negative_scale_bigdecimal() {
+        let amount = BigDecimal::new(BigInt::from(166u32), -16);
+
+        let raw = raw_amount_from_numeric(amount).unwrap();
+
+        assert_eq!(raw.to_string(), "1660000000000000000");
+    }
 }
 
 fn parse_tx_hash(value: &str) -> Result<TxHash, RepositoryError> {

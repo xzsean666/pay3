@@ -319,39 +319,50 @@ where
             return self.handle_kv_reorg(lease, cursor).await;
         }
 
-        let page = self
-            .matcher
-            .match_next_payment_page(after_token_with_lookback(
-                lease.last_scanned_block,
-                scanner_lookback_blocks(matcher_config.min_confirmations),
-            ))
-            .await?;
-        if page.kv_reorg_epoch != lease.seen_kv_reorg_epoch {
-            let cursor = self.log_reader.cursor(stream).await?;
-            self.record_scanner_lag(
-                cursor.last_completed_block,
-                lease.last_scanned_block,
-                matcher_config.min_confirmations,
-            );
-            return self.handle_kv_reorg(lease, cursor).await;
-        }
+        let mut after = after_token_with_lookback(
+            lease.last_scanned_block,
+            scanner_lookback_blocks(matcher_config.min_confirmations),
+        );
+        let mut matched_payments = Vec::new();
+        let complete_to_block = loop {
+            let page = self.matcher.match_next_payment_page(after).await?;
+            if page.kv_reorg_epoch != lease.seen_kv_reorg_epoch {
+                let cursor = self.log_reader.cursor(stream).await?;
+                self.record_scanner_lag(
+                    cursor.last_completed_block,
+                    lease.last_scanned_block,
+                    matcher_config.min_confirmations,
+                );
+                return self.handle_kv_reorg(lease, cursor).await;
+            }
 
-        let Some(complete_to_block) =
-            complete_to_block_for_commit(&page, &cursor, lease.last_scanned_block)
-        else {
-            self.record_scanner_lag(
-                cursor.last_completed_block,
-                lease.last_scanned_block,
-                matcher_config.min_confirmations,
-            );
-            return Ok(PaymentScannerTickOutcome::PageIncomplete {
-                stream,
-                last_scanned_block: lease.last_scanned_block,
-                next_token: page.next_token,
-            });
-        };
+            let next_token = page.next_token;
+            let Some(complete_to_block) =
+                complete_to_block_for_commit(&page, &cursor, lease.last_scanned_block)
+            else {
+                self.record_scanner_lag(
+                    cursor.last_completed_block,
+                    lease.last_scanned_block,
+                    matcher_config.min_confirmations,
+                );
+                return Ok(PaymentScannerTickOutcome::PageIncomplete {
+                    stream,
+                    last_scanned_block: lease.last_scanned_block,
+                    next_token,
+                });
+            };
 
-        if complete_to_block <= lease.last_scanned_block {
+            matched_payments.extend(page.matched_payments);
+
+            if complete_to_block > lease.last_scanned_block {
+                break complete_to_block;
+            }
+
+            if let Some(next_token) = next_token {
+                after = Some(next_token);
+                continue;
+            }
+
             if let Some(outcome) = self.sweep_confirmations(matcher_config).await? {
                 self.record_scanner_lag(
                     cursor.last_completed_block,
@@ -370,9 +381,8 @@ where
                 last_scanned_block: lease.last_scanned_block,
                 kv_completed_block: cursor.last_completed_block,
             });
-        }
+        };
 
-        let matched_payments = page.matched_payments;
         let recompute_order_ids = recompute_order_ids(&matched_payments);
         let matched_payment_count = matched_payments.len();
         let records = self
@@ -384,7 +394,7 @@ where
                 expected_last_scanned_block: lease.last_scanned_block,
                 complete_to_block,
                 expected_seen_kv_reorg_epoch: lease.seen_kv_reorg_epoch,
-                seen_kv_reorg_epoch: page.kv_reorg_epoch,
+                seen_kv_reorg_epoch: lease.seen_kv_reorg_epoch,
                 matched_payments,
                 recompute_order_ids: recompute_order_ids.clone(),
             })
@@ -895,12 +905,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn page_that_does_not_complete_a_new_block_does_not_commit() {
+    async fn old_lookback_log_does_not_pin_scanner_cursor() {
+        let repo = FakePaymentRepository::with_lease(lease(10, 7));
+        let reader = FakeLogReader::new(cursor(12, 7, None));
+        let matcher = FakeMatcher::with_pages(vec![
+            Ok(match_page(
+                vec![matched_payment(order_id(1), 11)],
+                Some(10),
+                Some(LogPageToken::new(11, 0)),
+                7,
+            )),
+            Ok(match_page(Vec::new(), None, None, 7)),
+        ]);
+        let worker = worker(repo.clone(), matcher, reader);
+
+        let outcome = worker.tick().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            PaymentScannerTickOutcome::Committed {
+                complete_to_block: 12,
+                matched_payments: 1,
+                ..
+            }
+        ));
+        assert_eq!(repo.commits()[0].complete_to_block, 12);
+        assert_eq!(repo.commits()[0].matched_payments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn incomplete_page_does_not_commit() {
         let repo = FakePaymentRepository::with_lease(lease(10, 7));
         let reader = FakeLogReader::new(cursor(12, 7, None));
         let matcher = FakeMatcher::with_pages(vec![Ok(match_page(
             vec![matched_payment(order_id(1), 11)],
-            Some(10),
+            None,
             Some(LogPageToken::new(11, 0)),
             7,
         ))]);
@@ -910,10 +949,10 @@ mod tests {
 
         assert_eq!(
             outcome,
-            PaymentScannerTickOutcome::Idle {
+            PaymentScannerTickOutcome::PageIncomplete {
                 stream: stream(),
                 last_scanned_block: 10,
-                kv_completed_block: Some(12),
+                next_token: Some(LogPageToken::new(11, 0)),
             }
         );
         assert!(repo.commits().is_empty());

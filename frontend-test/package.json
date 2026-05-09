@@ -5,11 +5,12 @@
   "type": "module",
   "packageManager": "pnpm@10.12.1",
   "scripts": {
-    "dev": "pnpm dlx wrangler@4.90.0 dev --local --port 8788",
-    "deploy": "pnpm dlx wrangler@4.90.0 deploy",
-    "deploy:page": "node scripts/deploy-wrangler-page.mjs",
-    "deploy:page:dry-run": "node scripts/deploy-wrangler-page.mjs --dry-run",
-    "deploy:dry-run": "pnpm dlx wrangler@4.90.0 deploy --dry-run",
+    "dev": "pnpm dlx wrangler@4.90.0 pages dev public --port 8788",
+    "deploy": "bash ../scripts/deploy-frontend-test-cloudflare.sh",
+    "deploy:cloudflare": "bash ../scripts/deploy-frontend-test-cloudflare.sh",
+    "deploy:page": "bash ../scripts/deploy-frontend-test-cloudflare.sh",
+    "deploy:page:dry-run": "bash ../scripts/deploy-frontend-test-cloudflare.sh --dry-run",
+    "deploy:dry-run": "bash ../scripts/deploy-frontend-test-cloudflare.sh --dry-run",
     "token": "node scripts/create-test-jwt.mjs"
   }
 }
