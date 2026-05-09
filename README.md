@@ -1,33 +1,157 @@
 # Pay3
 
-Rust ERC20 token 收款平台。MVP 目标是用单一链、单一 token、单一默认账号跑通完整收款流程：
+Pay3 是一个用 Rust 实现的 ERC20 收款后端。它面向“订单收款”场景：系统为每个订单派生一个独立收款地址，用户向该地址转入指定 ERC20 token，后台通过链上 `Transfer` 日志确认付款，再把收款地址中的 token 归集到固定 treasury 地址。
+
+当前项目仍处于 MVP / dry-run 阶段，不应直接接入真实资金。生产环境还需要完成外部 signer、远程 JWKS、监控告警、备份恢复、RPC 切换和 runbook 演练等闭环。
+
+## 核心流程
 
 ```text
-创建订单 -> 派生收款地址 -> 用户 ERC20 转账 -> 验证付款成功 -> token collect
+创建订单
+  -> 派生唯一收款地址
+  -> 用户 ERC20 转账
+  -> 采集 Transfer logs
+  -> 匹配订单付款
+  -> 验证付款状态
+  -> token collect 到 treasury
 ```
 
-当前仓库已经进入 Rust 实现阶段，已完成基础配置/health/JWT/domain、PostgreSQL migration/repository 初版、HD wallet 地址派生边界、signer contract/fake、订单创建 service 初版、订单 API route contract、chain 纯契约/fake 与 RPC provider manager/RpcRangeSource 初版、transfer log store redb-backed runtime 初版与 retention cleanup loop、付款匹配纯 service、手动 verify service/API route contract、scanner worker tick + runtime loop + confirmation sweep + rolling lookback/lag readiness 初版、collector tick + runtime loop 初版、collect replacement 初版、collection fee/collector timeout 配置化初版、worker tick metrics/readyz 初版、Docker/Compose dry-run 工件、production JWT local JWKS/PEM guard、真实 native gas prefund check、运行时 readiness refresh、订单过期重算 loop，以及统一错误模型/429 rate limit 初版。
+关键约束：
 
-生产可用性：当前仓库仍不可用于生产接真实资金。Docker/Compose dry-run、真实 PostgreSQL 集成测试和 Anvil+mock ERC20 e2e 已补，但 production remote signer 服务、远程 JWKS 拉取、告警 dry-run、DB PITR/migration rollback/RPC 切换/KVDB rebuild/runbook 演练仍未闭环，collect finality/reorg 仍需更完整复测。MVP 出口标准已经包含 reorg/finality、collect 崩溃恢复、外部 signer、监控告警、备份恢复、runbook 演练和 e2e 测试；这些不是后续补项。
+- 单链、单 token、固定 treasury。
+- 每个订单使用一个新派生地址，地址不复用。
+- PostgreSQL 保存订单、付款、归集、审计和业务 cursor。
+- redb/KVDB 保存可从 RPC 重放的 raw Transfer logs、区块头和采集 cursor。
+- payment scanner 只读 KVDB，不直接对每个订单轮询 RPC。
+- production profile 不允许使用 mnemonic、private key 或本地 signer。
 
-生产优先约束：每个订单使用新收款地址且永不复用；归集目标固定为 treasury；production profile 不包含 mnemonic/private key/local signer；RPC provider 至少两个；KVDB raw log store 单写者。
+## 主要模块
 
-地址派生：使用 `account_index/change_index/address_index` 分段 rollover，对 API 表现为无限派生地址池。
+- `src/api`: Axum HTTP API，包含 health、readiness、metrics、订单、付款验证和归集接口。
+- `src/services`: 订单创建、付款匹配、手动验证、归集业务逻辑。
+- `src/db`: PostgreSQL migrations 和 repository 层。
+- `src/transfer_log_store`: redb-backed ERC20 Transfer log 采集与读取。
+- `src/workers`: log ingestor、payment scanner、collector 等后台循环。
+- `src/chain`: JSON-RPC provider、区块头和 Transfer log 数据源。
+- `src/signer`: fake、本地 mnemonic、远程 HTTP signer 抽象。
+- `src/wallet`: HD wallet 地址派生。
+- `frontend-test`: 用于联调的 Cloudflare Pages/Worker 前端测试页。
 
-扫链数据分工：PostgreSQL 只保存订单、派生地址、matched Pay3 payments、业务 cursor、归集和 outbound tx；raw Transfer logs、非 Pay3 logs、raw scan batches、block header cache 只进 KVDB 或内存。
+## API 概览
 
-当前验证：`cargo fmt -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`、`cargo test --locked`、`cargo audit`、`cargo build --release --locked`、`DATABASE_URL=... PAY3_ENV_FILE=.env.example docker compose --env-file .env.example config`、`PAY3_ENV_FILE=.env.example docker compose --env-file .env.example --profile local-db config` 均通过。最近一次全量测试为 180 个库测试 + 75 个 integration/contract 测试，其中包含 2 个 Anvil e2e；真实链 e2e 仍为显式手动 gate。
+基础接口：
 
-本地 Docker dry-run：默认需要传入 `DATABASE_URL`，并需要宿主机 `8545` 上有 chain id `31337` 的 Anvil/local JSON-RPC；需要跑 token 转账/归集流程时，先部署 mock ERC20 并覆盖 `TOKEN_ADDRESS`。外部数据库可用 `DATABASE_URL=... PAY3_ENV_FILE=.env.example docker compose --env-file .env.example up --build pay3`；如需 compose 内置 Postgres，使用 `PAY3_ENV_FILE=.env.example docker compose --env-file .env.example --profile local-db up --build`。本地覆盖配置可复制为 `.env` 后用 `PAY3_ENV_FILE=.env docker compose --env-file .env up --build pay3`。该 Compose 入口只用于 development/staging dry-run，不代表生产 signer、RPC、JWT key 和备份演练已经闭环。
+- `GET /healthz`: 进程存活检查。
+- `GET /readyz`: 数据库、RPC、signer、KVDB、worker 等依赖 readiness。
+- `GET /metrics`: 简单文本指标。
 
-文档入口：
+订单接口：
 
-- `Agent.md`: AI/开发协作规则和 MVP 边界。
+- `POST /v1/orders`: 创建订单，需要 JWT scope `orders:create`。
+- `GET /v1/orders/{id}`: 查询订单，需要 JWT scope `orders:read`。
+- `GET /v1/orders/by-external-id/{external_id}`: 按业务外部 ID 查询订单，需要 JWT scope `orders:read`。
+- `POST /v1/orders/{id}/verify`: 手动验证订单付款状态，需要 JWT scope `orders:verify`。
+
+归集接口：
+
+- `POST /v1/collections`: 创建归集任务，需要 JWT scope `collections:create`。
+- `GET /v1/collections/{id}`: 查询归集任务，需要 JWT scope `collections:read`。
+
+## 本地运行
+
+准备环境：
+
+```bash
+cp .env.example .env
+```
+
+默认配置面向本地 dry-run：
+
+- API 端口：`3000`
+- chain id：`31337`
+- RPC：`http://host.docker.internal:8545`
+- signer：`fake`
+- 数据库：Docker Compose `local-db` profile 内置 PostgreSQL
+
+使用 Docker Compose 启动内置 PostgreSQL 和 Pay3：
+
+```bash
+PAY3_ENV_FILE=.env docker compose --env-file .env --profile local-db up --build
+```
+
+如果使用外部 PostgreSQL，设置 `DATABASE_URL` 后启动：
+
+```bash
+PAY3_ENV_FILE=.env docker compose --env-file .env up --build pay3
+```
+
+本地直接运行 Rust 服务：
+
+```bash
+cargo run
+```
+
+## 常用开发命令
+
+```bash
+cargo fmt -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --locked
+cargo build --release --locked
+```
+
+生成本地 mnemonic：
+
+```bash
+scripts/generate-mnemonic.sh --write-env --env-file .env
+```
+
+构建预编译二进制镜像工件：
+
+```bash
+scripts/build-prebuilt-binary.sh
+```
+
+## 配置入口
+
+项目通过环境变量配置，主要配置项见 `.env.example`。
+
+常用变量：
+
+- `APP_PROFILE`: `development`、`test`、`staging` 或 `production`。
+- `RUN_ROLE`: `api`、`worker` 或 `all`。
+- `DATABASE_URL`: PostgreSQL 连接串。
+- `CHAIN_ID`: 目标链 ID。
+- `TOKEN_ADDRESS`: ERC20 token 合约地址。
+- `TOKEN_DECIMALS`: token 精度。
+- `TOKEN_SYMBOL`: token 符号。
+- `TREASURY_ADDRESS`: 归集目标地址。
+- `RPC_HTTP_URLS`: 逗号分隔的 RPC HTTP provider 列表。
+- `START_BLOCK`: Transfer log 采集起始区块。
+- `MIN_CONFIRMATIONS`: 付款确认数。
+- `SIGNER_MODE`: `fake`、`local` 或 `external`。
+- `JWT_ISSUER`、`JWT_AUDIENCE`、`JWT_SECRET`、`JWT_JWKS_JSON`、`JWT_PUBLIC_KEY_PEM`: JWT 验证配置。
+
+## 生产注意事项
+
+当前仓库已经包含较完整的 runtime、contract tests、Anvil e2e、Docker dry-run 和生产验收文档，但默认配置不代表生产可用。
+
+生产接入前至少需要确认：
+
+- 使用外部 signer，不在 Pay3 进程内保存 mnemonic/private key。
+- 使用强 JWT key material，生产环境不使用 `JWT_SECRET` dry-run 配置。
+- 配置至少两个可靠 RPC provider，并完成 provider 切换演练。
+- 为 PostgreSQL 配置备份、PITR 和 migration rollback 流程。
+- 为 KVDB rebuild、reorg、collection 卡住、RPC 异常准备 runbook。
+- 完成 `/readyz`、`/metrics`、日志、告警和链上资金流 e2e 演练。
+
+## 文档
+
 - `docs/MVP_ARCHITECTURE.md`: MVP 架构、API、数据库、模块和测试设计。
-- `docs/END_TO_END_FLOW.md`: 从订单到付款、归集的整体流程。
-- `docs/MODULE_PLAN.md`: 按模块实现、测试和联调的实施规范。
-- `docs/TRANSFER_LOG_KV_MODULE.md`: 独立 ERC20 Transfer log KVDB 采集模块。
-- `docs/PRODUCTION_READINESS.md`: MVP 生产验收审计和上线清单。
+- `docs/END_TO_END_FLOW.md`: 从订单创建到付款匹配、归集的完整流程。
+- `docs/MODULE_PLAN.md`: 模块实现、测试和联调计划。
+- `docs/TRANSFER_LOG_KV_MODULE.md`: ERC20 Transfer log KVDB 采集模块设计。
+- `docs/PRODUCTION_READINESS.md`: 生产验收审计和上线清单。
 - `docs/DEPLOYMENT.md`: 部署拓扑、worker 锁、RPC provider 和 readiness 要求。
-- `docs/RUNBOOK.md`: RPC、reorg、collection、KVDB rebuild、DB 恢复等 MVP runbook。
-- `nextsession.md`: 下一次 session 的任务交接和全局进度。
+- `docs/RUNBOOK.md`: RPC、reorg、collection、KVDB rebuild、DB 恢复等操作手册。
+- `frontend-test/README.md`: 前端测试页说明。
