@@ -259,6 +259,7 @@ async fn real_chain_order_payment_collection_flow() -> Result<(), AnyError> {
             target_mode: ScanTargetMode::LatestMinusConfirmations(0),
             rpc_max_retries: 3,
             log_source: LogSourceKind::RpcRange,
+            sparse_headers: false,
         };
         log_store.ensure_stream(stream_config).await?;
 

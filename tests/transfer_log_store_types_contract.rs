@@ -43,6 +43,7 @@ fn config(start_block: u64) -> TransferLogStreamConfig {
         target_mode: ScanTargetMode::SafeTag,
         rpc_max_retries: 3,
         log_source: LogSourceKind::RpcRange,
+        sparse_headers: false,
     }
 }
 

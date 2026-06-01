@@ -67,9 +67,6 @@ use crate::{
 };
 
 const LATE_PAYMENT_MONITOR_SECONDS: u64 = 7 * 24 * 60 * 60;
-const TRANSFER_LOG_POLL_INTERVAL_MS: u64 = 5_000;
-const TRANSFER_LOG_BATCH_SIZE_BLOCKS: u64 = 100;
-const TRANSFER_LOG_MAX_BATCH_SIZE_BLOCKS: u64 = 1_000;
 const TRANSFER_LOG_MAX_LOGS_PER_PAGE: usize = 1_000;
 const TRANSFER_LOG_MAX_UNIQUE_TO_ADDRESSES_PER_BATCH: usize = 1_000;
 const TRANSFER_LOG_MAX_DB_FALLBACK_ADDRESSES: usize = 1_000;
@@ -1398,9 +1395,9 @@ fn transfer_log_stream_config(config: &AppConfig) -> TransferLogStreamConfig {
         chain_id: config.chain.chain_id,
         token_address: config.chain.token_address,
         start_block: config.chain.start_block,
-        poll_interval_ms: TRANSFER_LOG_POLL_INTERVAL_MS,
-        batch_size_blocks: TRANSFER_LOG_BATCH_SIZE_BLOCKS,
-        max_batch_size_blocks: TRANSFER_LOG_MAX_BATCH_SIZE_BLOCKS,
+        poll_interval_ms: config.transfer_log.poll_interval_ms,
+        batch_size_blocks: config.transfer_log.batch_size_blocks,
+        max_batch_size_blocks: config.transfer_log.max_batch_size_blocks,
         max_logs_per_page: TRANSFER_LOG_MAX_LOGS_PER_PAGE,
         max_unique_to_addresses_per_batch: TRANSFER_LOG_MAX_UNIQUE_TO_ADDRESSES_PER_BATCH,
         max_db_fallback_addresses: TRANSFER_LOG_MAX_DB_FALLBACK_ADDRESSES,
@@ -1409,6 +1406,7 @@ fn transfer_log_stream_config(config: &AppConfig) -> TransferLogStreamConfig {
         target_mode: ScanTargetMode::LatestMinusConfirmations(config.chain.min_confirmations),
         rpc_max_retries: TRANSFER_LOG_RPC_MAX_RETRIES,
         log_source: LogSourceKind::RpcRange,
+        sparse_headers: config.transfer_log.sparse_headers,
     }
 }
 

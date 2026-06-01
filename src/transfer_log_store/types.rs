@@ -37,6 +37,8 @@ pub struct TransferLogStreamConfig {
     pub target_mode: ScanTargetMode,
     pub rpc_max_retries: u32,
     pub log_source: LogSourceKind,
+    #[serde(default)]
+    pub sparse_headers: bool,
 }
 
 impl TransferLogStreamConfig {

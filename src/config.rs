@@ -15,6 +15,9 @@ const DEFAULT_COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 0;
 const DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 0;
 const DEFAULT_COLLECTION_COLLECTOR_REPLACEMENT_STUCK_AFTER_SECS: u64 = 30 * 60;
 const DEFAULT_SIGNER_REMOTE_REQUEST_TIMEOUT_SECS: u64 = 15;
+const DEFAULT_TRANSFER_LOG_POLL_INTERVAL_MS: u64 = 5_000;
+const DEFAULT_TRANSFER_LOG_BATCH_SIZE_BLOCKS: u64 = 100;
+const DEFAULT_TRANSFER_LOG_MAX_BATCH_SIZE_BLOCKS: u64 = 1_000;
 const LOCAL_SIGNER_SECRET_KEYS: &[&str] = &[
     "SIGNER_MNEMONIC",
     "LOCAL_SIGNER_MNEMONIC",
@@ -64,6 +67,7 @@ pub struct AppConfig {
     pub kvdb: KvdbConfig,
     pub jwt: JwtConfig,
     pub chain: ChainConfig,
+    pub transfer_log: TransferLogConfig,
     pub collection: CollectionConfig,
     pub collector: CollectorConfig,
     pub signer: SignerConfig,
@@ -249,6 +253,25 @@ pub struct ChainConfig {
     pub start_block: u64,
     pub min_confirmations: u64,
     pub allow_full_history_replay: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransferLogConfig {
+    pub poll_interval_ms: u64,
+    pub batch_size_blocks: u64,
+    pub max_batch_size_blocks: u64,
+    pub sparse_headers: bool,
+}
+
+impl Default for TransferLogConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_ms: DEFAULT_TRANSFER_LOG_POLL_INTERVAL_MS,
+            batch_size_blocks: DEFAULT_TRANSFER_LOG_BATCH_SIZE_BLOCKS,
+            max_batch_size_blocks: DEFAULT_TRANSFER_LOG_MAX_BATCH_SIZE_BLOCKS,
+            sparse_headers: false,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -517,6 +540,31 @@ impl AppConfig {
                     &["ALLOW_FULL_HISTORY_REPLAY"],
                     false,
                 )?,
+            },
+            transfer_log: {
+                let defaults = TransferLogConfig::default();
+                TransferLogConfig {
+                    poll_interval_ms: parse_optional_u64(
+                        &values,
+                        &["TRANSFER_LOG_POLL_INTERVAL_MS"],
+                        defaults.poll_interval_ms,
+                    )?,
+                    batch_size_blocks: parse_optional_u64(
+                        &values,
+                        &["TRANSFER_LOG_BATCH_SIZE_BLOCKS", "SCAN_BATCH_SIZE"],
+                        defaults.batch_size_blocks,
+                    )?,
+                    max_batch_size_blocks: parse_optional_u64(
+                        &values,
+                        &["TRANSFER_LOG_MAX_BATCH_SIZE_BLOCKS"],
+                        defaults.max_batch_size_blocks,
+                    )?,
+                    sparse_headers: parse_optional_bool(
+                        &values,
+                        &["TRANSFER_LOG_SPARSE_HEADERS"],
+                        defaults.sparse_headers,
+                    )?,
+                }
             },
             collection: {
                 let defaults = CollectionConfig::default();

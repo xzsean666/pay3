@@ -735,11 +735,7 @@ fn complete_to_block_for_commit(
         .last_completed_block
         .map(|kv_completed| complete_to_block.min(kv_completed))
         .unwrap_or(complete_to_block);
-    if complete_to_block < last_scanned_block {
-        None
-    } else {
-        Some(complete_to_block)
-    }
+    Some(complete_to_block.max(last_scanned_block))
 }
 
 fn recompute_order_ids(payments: &[crate::db::repositories::MatchedPaymentInput]) -> Vec<Uuid> {
@@ -931,6 +927,35 @@ mod tests {
         ));
         assert_eq!(repo.commits()[0].complete_to_block, 12);
         assert_eq!(repo.commits()[0].matched_payments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn old_unmatched_lookback_log_does_not_pin_scanner_cursor() {
+        let repo = FakePaymentRepository::with_lease(lease(10, 7));
+        let reader = FakeLogReader::new(cursor(12, 7, None));
+        let matcher = FakeMatcher::with_pages(vec![
+            Ok(match_page(
+                Vec::new(),
+                Some(9),
+                Some(LogPageToken::new(9, 0)),
+                7,
+            )),
+            Ok(match_page(Vec::new(), None, None, 7)),
+        ]);
+        let worker = worker(repo.clone(), matcher.clone(), reader);
+
+        let outcome = worker.tick().await.unwrap();
+
+        assert!(matches!(
+            outcome,
+            PaymentScannerTickOutcome::Committed {
+                complete_to_block: 12,
+                matched_payments: 0,
+                ..
+            }
+        ));
+        assert_eq!(repo.commits()[0].complete_to_block, 12);
+        assert_eq!(matcher.calls(), vec![None, Some(LogPageToken::new(9, 0))]);
     }
 
     #[tokio::test]
@@ -1655,6 +1680,7 @@ mod tests {
             target_mode: ScanTargetMode::SafeTag,
             rpc_max_retries: 3,
             log_source: crate::transfer_log_store::LogSourceKind::RpcRange,
+            sparse_headers: false,
         }
     }
 }

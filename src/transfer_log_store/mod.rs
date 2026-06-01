@@ -2,7 +2,7 @@ pub mod redb_store;
 pub mod types;
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::{Arc, Mutex},
 };
@@ -15,8 +15,8 @@ pub use types::*;
 
 use crate::{
     chain::{
-        ChainBlock, ChainError, ChainHeaderReader, TransferLogCapacityLimits, TransferLogRange,
-        TransferLogSource,
+        ChainBlock, ChainError, ChainHeaderReader, TransferLog, TransferLogCapacityLimits,
+        TransferLogRange, TransferLogSource,
     },
     domain::BlockHash,
 };
@@ -188,6 +188,89 @@ impl<S> InMemoryTransferLogStore<S> {
     }
 }
 
+impl<S> InMemoryTransferLogStore<S>
+where
+    S: ChainHeaderReader + TransferLogSource + Send + Sync,
+{
+    async fn fetch_logs_with_adaptive_range(
+        &self,
+        config: &TransferLogStreamConfig,
+        from_block: u64,
+        target: u64,
+    ) -> TransferLogStoreResult<(u64, Vec<TransferLog>)> {
+        let batch_size = effective_batch_size(config);
+        let mut to_block = from_block
+            .saturating_add(batch_size.saturating_sub(1))
+            .min(target);
+        let limits = transfer_log_capacity_limits(config);
+
+        loop {
+            let range =
+                TransferLogRange::new(config.chain_id, config.token_address, from_block, to_block);
+            let block_count = to_block.saturating_sub(from_block).saturating_add(1);
+            let logs = match self.source.transfer_logs(range).await {
+                Ok(logs) => logs,
+                Err(error) if should_reduce_batch_on_error(&error) && block_count > 1 => {
+                    let next_block_count = (block_count / 2).max(1);
+                    to_block = from_block.saturating_add(next_block_count.saturating_sub(1));
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+
+            let report = transfer_log_capacity_report(range, limits, &logs);
+            if report.is_within_limits() {
+                return Ok((to_block, logs));
+            }
+
+            if block_count <= 1 {
+                return Err(TransferLogStoreError::NotReady {
+                    reason: format!(
+                        "transfer log capacity exceeded for block {from_block}: {} logs, max {}",
+                        report.log_count, report.limits.max_logs
+                    ),
+                });
+            }
+
+            let next_block_count = (block_count / 2).max(1);
+            to_block = from_block.saturating_add(next_block_count.saturating_sub(1));
+        }
+    }
+
+    async fn headers_for_batch(
+        &self,
+        config: &TransferLogStreamConfig,
+        logs: &[TransferLog],
+        from_block: u64,
+        to_block: u64,
+    ) -> TransferLogStoreResult<Vec<ChainBlock>> {
+        let mut headers_by_number = logs
+            .iter()
+            .map(|log| (log.block.number, log.block))
+            .collect::<BTreeMap<_, _>>();
+
+        let header_blocks = if config.sparse_headers {
+            let mut blocks = logs
+                .iter()
+                .map(|log| log.block.number)
+                .collect::<BTreeSet<_>>();
+            blocks.insert(to_block);
+            blocks.into_iter().collect::<Vec<_>>()
+        } else {
+            (from_block..=to_block).collect::<Vec<_>>()
+        };
+
+        for number in header_blocks {
+            if headers_by_number.contains_key(&number) {
+                continue;
+            }
+            headers_by_number.insert(number, self.source.block_by_number(number).await?);
+        }
+
+        Ok(headers_by_number.into_values().collect())
+    }
+}
+
 #[derive(Clone)]
 pub struct RedbTransferLogIngestor<S> {
     source: S,
@@ -320,22 +403,11 @@ where
         }
 
         let from_block = cursor.next_block;
-        let to_block = self
-            .capacity_checked_to_block(&config, from_block, target)
+        let (to_block, logs) = self
+            .fetch_logs_with_adaptive_range(&config, from_block, target)
             .await?;
-        let mut headers = Vec::new();
-        for number in from_block..=to_block {
-            headers.push(self.source.block_by_number(number).await?);
-        }
-
-        let logs = self
-            .source
-            .transfer_logs(TransferLogRange::new(
-                config.chain_id,
-                config.token_address,
-                from_block,
-                to_block,
-            ))
+        let headers = self
+            .headers_for_batch(&config, &logs, from_block, to_block)
             .await?;
 
         let now = self.now();
@@ -470,12 +542,12 @@ where
         }))
     }
 
-    async fn capacity_checked_to_block(
+    async fn fetch_logs_with_adaptive_range(
         &self,
         config: &TransferLogStreamConfig,
         from_block: u64,
         target: u64,
-    ) -> TransferLogStoreResult<u64> {
+    ) -> TransferLogStoreResult<(u64, Vec<TransferLog>)> {
         let batch_size = effective_batch_size(config);
         let mut to_block = from_block
             .saturating_add(batch_size.saturating_sub(1))
@@ -485,12 +557,31 @@ where
         loop {
             let range =
                 TransferLogRange::new(config.chain_id, config.token_address, from_block, to_block);
-            let report = self.source.capacity_probe(range, limits).await?;
+            let block_count = to_block.saturating_sub(from_block).saturating_add(1);
+            let logs = match self.source.transfer_logs(range).await {
+                Ok(logs) => logs,
+                Err(error) if should_reduce_batch_on_error(&error) && block_count > 1 => {
+                    let next_block_count = (block_count / 2).max(1);
+                    let next_to_block =
+                        from_block.saturating_add(next_block_count.saturating_sub(1));
+                    tracing::warn!(
+                        from_block,
+                        to_block,
+                        next_to_block,
+                        error = %error,
+                        "transfer log batch failed; retrying smaller range"
+                    );
+                    to_block = next_to_block;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+
+            let report = transfer_log_capacity_report(range, limits, &logs);
             if report.is_within_limits() {
-                return Ok(to_block);
+                return Ok((to_block, logs));
             }
 
-            let block_count = to_block.saturating_sub(from_block).saturating_add(1);
             if block_count <= 1 {
                 return Err(TransferLogStoreError::NotReady {
                     reason: format!(
@@ -501,8 +592,50 @@ where
             }
 
             let next_block_count = (block_count / 2).max(1);
-            to_block = from_block.saturating_add(next_block_count.saturating_sub(1));
+            let next_to_block = from_block.saturating_add(next_block_count.saturating_sub(1));
+            tracing::warn!(
+                from_block,
+                to_block,
+                next_to_block,
+                log_count = report.log_count,
+                max_logs = report.limits.max_logs,
+                "transfer log batch exceeded capacity; retrying smaller range"
+            );
+            to_block = next_to_block;
         }
+    }
+
+    async fn headers_for_batch(
+        &self,
+        config: &TransferLogStreamConfig,
+        logs: &[TransferLog],
+        from_block: u64,
+        to_block: u64,
+    ) -> TransferLogStoreResult<Vec<ChainBlock>> {
+        let mut headers_by_number = logs
+            .iter()
+            .map(|log| (log.block.number, log.block))
+            .collect::<BTreeMap<_, _>>();
+
+        let header_blocks = if config.sparse_headers {
+            let mut blocks = logs
+                .iter()
+                .map(|log| log.block.number)
+                .collect::<BTreeSet<_>>();
+            blocks.insert(to_block);
+            blocks.into_iter().collect::<Vec<_>>()
+        } else {
+            (from_block..=to_block).collect::<Vec<_>>()
+        };
+
+        for number in header_blocks {
+            if headers_by_number.contains_key(&number) {
+                continue;
+            }
+            headers_by_number.insert(number, self.source.block_by_number(number).await?);
+        }
+
+        Ok(headers_by_number.into_values().collect())
     }
 }
 
@@ -653,22 +786,11 @@ where
         }
 
         let from_block = cursor.next_block;
-        let to_block = from_block
-            .saturating_add(config.batch_size_blocks.saturating_sub(1))
-            .min(target);
-        let mut headers = Vec::new();
-        for number in from_block..=to_block {
-            headers.push(self.source.block_by_number(number).await?);
-        }
-
-        let logs = self
-            .source
-            .transfer_logs(TransferLogRange::new(
-                config.chain_id,
-                config.token_address,
-                from_block,
-                to_block,
-            ))
+        let (to_block, logs) = self
+            .fetch_logs_with_adaptive_range(&config, from_block, target)
+            .await?;
+        let headers = self
+            .headers_for_batch(&config, &logs, from_block, to_block)
             .await?;
 
         let now = self.now();
@@ -984,6 +1106,31 @@ fn transfer_log_capacity_limits(config: &TransferLogStreamConfig) -> TransferLog
     }
 }
 
+fn transfer_log_capacity_report(
+    range: TransferLogRange,
+    limits: TransferLogCapacityLimits,
+    logs: &[TransferLog],
+) -> crate::chain::TransferLogCapacityReport {
+    let mut block_counts = BTreeMap::<u64, usize>::new();
+    for log in logs {
+        *block_counts.entry(log.block.number).or_default() += 1;
+    }
+
+    crate::chain::TransferLogCapacityReport {
+        range,
+        log_count: logs.len(),
+        max_logs_in_single_block: block_counts.values().copied().max().unwrap_or_default(),
+        limits,
+    }
+}
+
+fn should_reduce_batch_on_error(error: &ChainError) -> bool {
+    matches!(
+        error,
+        ChainError::RpcUnavailable { .. } | ChainError::MalformedRpcResponse { .. }
+    )
+}
+
 fn stored_header(
     chain_id: u64,
     token_address: crate::domain::EvmAddress,
@@ -1113,6 +1260,74 @@ mod tests {
         assert!(
             store.block_header(stream(), 3).await.unwrap().is_some(),
             "empty log blocks must still store headers"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_sparse_headers_skip_empty_intermediate_blocks() {
+        let chain = chain()
+            .insert_block(block(4, 4))
+            .set_safe_head(crate::domain::ChainBlockRef::new(4, block_hash(4)))
+            .push_transfer_log(log(2, 0, 0x20));
+        let store = store(chain);
+        let mut config = config(2, 3);
+        config.sparse_headers = true;
+        store.ensure_stream(config).await.unwrap();
+
+        store.poll_once(stream()).await.unwrap();
+
+        assert!(store.block_header(stream(), 2).await.unwrap().is_some());
+        assert!(
+            store.block_header(stream(), 3).await.unwrap().is_none(),
+            "sparse mode should not fetch headers for empty intermediate blocks"
+        );
+        assert!(
+            store.block_header(stream(), 4).await.unwrap().is_some(),
+            "sparse mode keeps the range end header for cursor reorg checks"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_once_reduces_batch_when_rpc_rejects_large_range() {
+        let chain = chain().fail_transfer_log_ranges_over(5);
+        for number in 4..=11 {
+            chain.insert_block(block(number, number as u8));
+        }
+        chain
+            .set_safe_head(crate::domain::ChainBlockRef::new(11, block_hash(11)))
+            .push_transfer_log(log(6, 0, 0x20));
+        let store = store(chain.clone());
+        store.ensure_stream(config(2, 10)).await.unwrap();
+
+        let outcome = store.poll_once(stream()).await.unwrap();
+        let PollOutcome::Advanced {
+            from_block,
+            to_block,
+            log_count,
+            cursor,
+            ..
+        } = outcome
+        else {
+            panic!("expected advanced poll outcome");
+        };
+
+        assert_eq!(from_block, 2);
+        assert_eq!(to_block, 6);
+        assert_eq!(log_count, 1);
+        assert_eq!(cursor.next_block, 7);
+        assert!(
+            chain
+                .calls()
+                .contains(&crate::chain::FakeChainCall::TransferLogs(
+                    TransferLogRange::new(1, token(), 2, 11)
+                ))
+        );
+        assert!(
+            chain
+                .calls()
+                .contains(&crate::chain::FakeChainCall::TransferLogs(
+                    TransferLogRange::new(1, token(), 2, 6)
+                ))
         );
     }
 
@@ -1270,6 +1485,7 @@ mod tests {
             target_mode: ScanTargetMode::SafeTag,
             rpc_max_retries: 3,
             log_source: LogSourceKind::RpcRange,
+            sparse_headers: false,
         }
     }
 

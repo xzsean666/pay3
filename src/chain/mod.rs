@@ -386,6 +386,14 @@ impl FakeErc20ChainClient {
         self.clone()
     }
 
+    pub fn fail_transfer_log_ranges_over(&self, max_blocks: u64) -> Self {
+        self.state
+            .lock()
+            .expect("fake chain mutex poisoned")
+            .transfer_log_max_range_blocks = Some(max_blocks);
+        self.clone()
+    }
+
     pub fn replace_block_for_reorg(&self, block: ChainBlock) -> Self {
         let mut state = self.state.lock().expect("fake chain mutex poisoned");
         state.blocks.insert(block.number, block);
@@ -448,6 +456,7 @@ struct FakeChainState {
     balances: BTreeMap<(EvmAddress, EvmAddress), RawAmount>,
     receipts: BTreeMap<TxHash, TxReceipt>,
     next_error: Option<String>,
+    transfer_log_max_range_blocks: Option<u64>,
     broadcast_counter: u64,
     calls: Vec<FakeChainCall>,
 }
@@ -535,6 +544,17 @@ impl TransferLogSource for FakeErc20ChainClient {
         let mut state = self.state.lock().expect("fake chain mutex poisoned");
         state.calls.push(FakeChainCall::TransferLogs(range));
         state.take_error()?;
+        if let Some(max_blocks) = state.transfer_log_max_range_blocks {
+            let block_count = range
+                .to_block
+                .saturating_sub(range.from_block)
+                .saturating_add(1);
+            if block_count > max_blocks {
+                return Err(ChainError::rpc_unavailable(format!(
+                    "block range exceeds fake limit {max_blocks}"
+                )));
+            }
+        }
         if range.chain_id != state.chain_id {
             return Err(ChainError::ChainIdMismatch {
                 expected: range.chain_id,

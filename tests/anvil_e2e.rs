@@ -125,6 +125,7 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
             target_mode: ScanTargetMode::LatestMinusConfirmations(0),
             rpc_max_retries: 3,
             log_source: LogSourceKind::RpcRange,
+            sparse_headers: false,
         };
         log_store.ensure_stream(stream_config.clone()).await?;
 
@@ -419,6 +420,7 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
             target_mode: ScanTargetMode::LatestMinusConfirmations(0),
             rpc_max_retries: 3,
             log_source: LogSourceKind::RpcRange,
+            sparse_headers: false,
         };
         log_store.ensure_stream(stream_config.clone()).await?;
 
