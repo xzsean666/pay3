@@ -81,6 +81,7 @@ p {
   color: var(--muted);
 }
 
+.top-actions,
 .top-status,
 .button-row,
 .form-actions,
@@ -90,6 +91,14 @@ p {
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+.top-actions {
+  justify-content: flex-end;
+}
+
+.faucet-link {
+  text-decoration: none;
 }
 
 .badge {

@@ -117,7 +117,7 @@ function publicConfig(env) {
     directEnabled,
     exposeTestJwt: exposeToken,
     testJwt: exposeToken ? String(env.PAY3_TEST_JWT || "") : "",
-    testJwtExpiresAt: String(env.PAY3_TEST_JWT_EXPIRES_AT || ""),
+    testJwtExpiresAt: "",
   };
 }
 

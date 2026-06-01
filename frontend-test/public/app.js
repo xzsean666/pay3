@@ -692,9 +692,8 @@ function toast(message) {
 }
 
 function tokenMetaText() {
-  const expires = state.config.testJwtExpiresAt ? `过期时间：${state.config.testJwtExpiresAt}` : "未配置过期时间";
   const exposed = state.config.exposeTestJwt ? "内置 token 已暴露给页面" : "内置 token 未暴露给页面";
-  return `${exposed}。${expires}。`;
+  return `${exposed}。长期测试 token。`;
 }
 
 function statusLabel(status) {

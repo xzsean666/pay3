@@ -13,9 +13,14 @@
           <p class="eyebrow">Pay3 test console</p>
           <h1>Pay3 前端测试台</h1>
         </div>
-        <div class="top-status">
-          <span id="modeBadge" class="badge">代理模式</span>
-          <span id="connectionBadge" class="badge muted">未连接</span>
+        <div class="top-actions">
+          <a class="button faucet-link" href="https://usdt-s-faucet.pages.dev/" target="_blank" rel="noopener noreferrer">
+            USDT-S Faucet
+          </a>
+          <div class="top-status">
+            <span id="modeBadge" class="badge">代理模式</span>
+            <span id="connectionBadge" class="badge muted">未连接</span>
+          </div>
         </div>
       </header>
 
@@ -80,7 +85,7 @@
             </div>
           </div>
           <textarea id="tokenField" spellcheck="false" rows="5" placeholder="浏览器直连时会使用这里的 Bearer token"></textarea>
-          <p id="tokenMeta" class="hint">内置 token 适配 .env.example 的 development JWT 配置。</p>
+          <p id="tokenMeta" class="hint">内置长期测试 token 适配 development JWT 配置。</p>
         </div>
       </section>
 
