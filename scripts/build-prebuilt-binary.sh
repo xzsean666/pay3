@@ -7,7 +7,8 @@ cd "$repo_root"
 binary_name="pay3"
 output_path="${PAY3_PREBUILT_BINARY:-deploy/prebuilt/pay3}"
 cargo_target_dir="${CARGO_TARGET_DIR:-target}"
-cargo_args=(build --release --locked)
+cargo_jobs="${PAY3_CARGO_JOBS:-1}"
+cargo_args=(build --release --locked --jobs "$cargo_jobs")
 
 if [[ -n "${PAY3_CARGO_TARGET:-}" ]]; then
   cargo_args+=(--target "$PAY3_CARGO_TARGET")

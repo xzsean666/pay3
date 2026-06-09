@@ -1125,10 +1125,31 @@ fn transfer_log_capacity_report(
 }
 
 fn should_reduce_batch_on_error(error: &ChainError) -> bool {
-    matches!(
-        error,
-        ChainError::RpcUnavailable { .. } | ChainError::MalformedRpcResponse { .. }
-    )
+    match error {
+        ChainError::CapacityExceeded { .. } => true,
+        ChainError::RpcUnavailable { message } | ChainError::MalformedRpcResponse { message } => {
+            message_indicates_range_or_result_limit(message)
+        }
+        _ => false,
+    }
+}
+
+fn message_indicates_range_or_result_limit(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "block range",
+        "range exceeds",
+        "range too large",
+        "too many results",
+        "query returned more than",
+        "response size",
+        "payload too large",
+        "result limit",
+        "limit exceeded",
+        "exceeds fake limit",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 fn stored_header(
@@ -1329,6 +1350,23 @@ mod tests {
                     TransferLogRange::new(1, token(), 2, 6)
                 ))
         );
+    }
+
+    #[test]
+    fn batch_reduction_only_handles_range_or_result_limit_errors() {
+        assert!(should_reduce_batch_on_error(&ChainError::rpc_unavailable(
+            "block range exceeds fake limit 5"
+        )));
+        assert!(should_reduce_batch_on_error(&ChainError::rpc_unavailable(
+            "JSON-RPC error -32005 for eth_getLogs: query returned more than 10000 results"
+        )));
+
+        assert!(!should_reduce_batch_on_error(&ChainError::rpc_unavailable(
+            "all RPC providers failed eth_getLogs: rpc-1: provider rpc-1 request eth_getLogs failed: error trying to connect"
+        )));
+        assert!(!should_reduce_batch_on_error(&ChainError::rpc_unavailable(
+            "provider rpc-1 rate limited request eth_getLogs"
+        )));
     }
 
     #[tokio::test]

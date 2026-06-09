@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use alloy_primitives::U256;
 use async_trait::async_trait;
@@ -17,6 +22,9 @@ pub const ERC20_TRANSFER_TOPIC: &str =
     "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const FEE_HISTORY_BLOCK_COUNT: u64 = 5;
 const FEE_HISTORY_REWARD_PERCENTILES: [u64; 2] = [50, 90];
+const RPC_PROVIDER_BASE_COOLDOWN: Duration = Duration::from_secs(5);
+const RPC_PROVIDER_MAX_COOLDOWN: Duration = Duration::from_secs(60);
+const RPC_HTTP_USER_AGENT: &str = concat!("pay3/", env!("CARGO_PKG_VERSION"));
 
 pub type SharedJsonRpcProvider = Arc<dyn JsonRpcProvider>;
 
@@ -39,7 +47,10 @@ impl HttpJsonRpcProvider {
         Self {
             id: id.into(),
             url: url.into(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .user_agent(RPC_HTTP_USER_AGENT)
+                .build()
+                .expect("static RPC HTTP client configuration must be valid"),
         }
     }
 
@@ -50,6 +61,7 @@ impl HttpJsonRpcProvider {
     ) -> Result<Self, ChainError> {
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .user_agent(RPC_HTTP_USER_AGENT)
             .build()
             .map_err(|error| ChainError::rpc_unavailable(error.to_string()))?;
         Ok(Self {
@@ -150,7 +162,7 @@ struct JsonRpcError {
 pub struct RpcProviderManager {
     expected_chain_id: u64,
     min_provider_count: usize,
-    providers: Vec<SharedJsonRpcProvider>,
+    providers: Vec<ManagedRpcProvider>,
 }
 
 impl fmt::Debug for RpcProviderManager {
@@ -185,6 +197,8 @@ impl RpcProviderManager {
         if providers.is_empty() {
             return Err(ChainError::rpc_unavailable("no RPC providers configured"));
         }
+
+        let providers = providers.into_iter().map(ManagedRpcProvider::new).collect();
 
         Ok(Self {
             expected_chain_id,
@@ -229,29 +243,36 @@ impl RpcProviderManager {
     pub async fn validate_chain_ids(&self) -> Result<Vec<RpcProviderChainStatus>, ChainError> {
         let mut statuses = Vec::new();
         let mut errors = Vec::new();
-        for provider in &self.providers {
-            match self.provider_chain_id(provider.as_ref()).await {
+        for provider in self.provider_candidates() {
+            match self.provider_chain_id(provider.inner.as_ref()).await {
                 Ok(actual_chain_id) if actual_chain_id == self.expected_chain_id => {
+                    provider.record_success();
                     statuses.push(RpcProviderChainStatus {
                         provider_id: provider.provider_id().to_string(),
                         chain_id: actual_chain_id,
                     });
                 }
                 Ok(actual_chain_id) => {
+                    provider.record_failure();
                     return Err(ChainError::ChainIdMismatch {
                         expected: self.expected_chain_id,
                         actual: actual_chain_id,
                     });
                 }
                 Err(error) => {
+                    if is_provider_health_failure(&error) {
+                        provider.record_failure();
+                    }
                     errors.push(format!("{}: {error}", provider.provider_id()));
                 }
             }
         }
 
-        if statuses.len() != self.providers.len() {
+        if statuses.len() < self.min_provider_count {
             return Err(ChainError::rpc_unavailable(format!(
-                "RPC chain id validation failed: {}",
+                "RPC chain id validation failed: {} healthy providers, expected at least {}; {}",
+                statuses.len(),
+                self.min_provider_count,
                 errors.join("; ")
             )));
         }
@@ -322,8 +343,11 @@ impl RpcProviderManager {
         let mut blocks = Vec::new();
         let mut errors = Vec::new();
         let mut not_found_count = 0usize;
-        for provider in &self.providers {
+        let providers = self.provider_candidates();
+        let provider_count = providers.len();
+        for provider in providers {
             match provider
+                .inner
                 .request("eth_getBlockByNumber", params.clone())
                 .await
             {
@@ -332,16 +356,27 @@ impl RpcProviderManager {
                     errors.push(format!("{}: block not found", provider.provider_id()))
                 }
                 Ok(value) => match parse_block(value, provider.provider_id()) {
-                    Ok(block) => blocks.push(block),
-                    Err(error) => errors.push(format!("{}: {error}", provider.provider_id())),
+                    Ok(block) => {
+                        provider.record_success();
+                        blocks.push(block);
+                    }
+                    Err(error) => {
+                        provider.record_failure();
+                        errors.push(format!("{}: {error}", provider.provider_id()));
+                    }
                 },
                 Err(ChainError::BlockNotFound { .. }) => return Err(not_found.clone()),
-                Err(error) => errors.push(format!("{}: {error}", provider.provider_id())),
+                Err(error) => {
+                    if is_provider_health_failure(&error) {
+                        provider.record_failure();
+                    }
+                    errors.push(format!("{}: {error}", provider.provider_id()));
+                }
             }
         }
 
         if blocks.is_empty() {
-            if not_found_count == self.providers.len() {
+            if not_found_count == provider_count {
                 return Err(not_found);
             }
             if errors.is_empty() {
@@ -365,15 +400,19 @@ impl RpcProviderManager {
         params: Value,
     ) -> Result<ProviderValue, ChainError> {
         let mut errors = Vec::new();
-        for provider in &self.providers {
-            match provider.request(method, params.clone()).await {
+        for provider in self.provider_candidates() {
+            match provider.inner.request(method, params.clone()).await {
                 Ok(value) => {
+                    provider.record_success();
                     return Ok(ProviderValue {
                         provider_id: provider.provider_id().to_string(),
                         value,
                     });
                 }
                 Err(error) => {
+                    if is_provider_health_failure(&error) {
+                        provider.record_failure();
+                    }
                     errors.push(format!("{}: {error}", provider.provider_id()));
                 }
             }
@@ -384,6 +423,94 @@ impl RpcProviderManager {
             errors.join("; ")
         )))
     }
+
+    fn provider_candidates(&self) -> Vec<ManagedRpcProvider> {
+        let now = Instant::now();
+        let available = self
+            .providers
+            .iter()
+            .filter(|provider| provider.is_available(now))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if available.is_empty() {
+            return self.providers.clone();
+        }
+
+        available
+    }
+}
+
+#[derive(Clone)]
+struct ManagedRpcProvider {
+    inner: SharedJsonRpcProvider,
+    health: Arc<Mutex<RpcProviderHealth>>,
+}
+
+impl ManagedRpcProvider {
+    fn new(inner: SharedJsonRpcProvider) -> Self {
+        Self {
+            inner,
+            health: Arc::new(Mutex::new(RpcProviderHealth::default())),
+        }
+    }
+
+    fn provider_id(&self) -> &str {
+        self.inner.provider_id()
+    }
+
+    fn is_available(&self, now: Instant) -> bool {
+        self.health
+            .lock()
+            .expect("RPC provider health lock poisoned")
+            .is_available(now)
+    }
+
+    fn record_success(&self) {
+        self.health
+            .lock()
+            .expect("RPC provider health lock poisoned")
+            .record_success();
+    }
+
+    fn record_failure(&self) {
+        self.health
+            .lock()
+            .expect("RPC provider health lock poisoned")
+            .record_failure(Instant::now());
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RpcProviderHealth {
+    consecutive_failures: u32,
+    unavailable_until: Option<Instant>,
+}
+
+impl RpcProviderHealth {
+    fn is_available(&self, now: Instant) -> bool {
+        self.unavailable_until.is_none_or(|until| until <= now)
+    }
+
+    fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.unavailable_until = None;
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        self.unavailable_until = Some(now + provider_cooldown(self.consecutive_failures));
+    }
+}
+
+fn provider_cooldown(consecutive_failures: u32) -> Duration {
+    let exponent = consecutive_failures.saturating_sub(1).min(4);
+    let multiplier = 1u64 << exponent;
+    let seconds = RPC_PROVIDER_BASE_COOLDOWN
+        .as_secs()
+        .saturating_mul(multiplier)
+        .min(RPC_PROVIDER_MAX_COOLDOWN.as_secs());
+    Duration::from_secs(seconds)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +534,13 @@ fn is_missing_safe_block_error(error: &ChainError) -> bool {
             .to_string()
             .to_ascii_lowercase()
             .contains("safe block not found")
+}
+
+fn is_provider_health_failure(error: &ChainError) -> bool {
+    !matches!(
+        error,
+        ChainError::BlockNotFound { .. } | ChainError::TransactionNotFound { .. }
+    ) && !is_missing_safe_block_error(error)
 }
 
 #[derive(Clone, Debug)]
@@ -1282,6 +1416,77 @@ mod tests {
         assert_eq!(logs[0].amount_raw, RawAmount::from(7));
         assert!(p1.calls().iter().any(|call| call == "eth_getLogs"));
         assert!(p2.calls().iter().any(|call| call == "eth_getLogs"));
+    }
+
+    #[tokio::test]
+    async fn rpc_provider_manager_skips_failed_provider_during_cooldown() {
+        let token = address(0x11);
+        let p1 = Arc::new(
+            FakeRpcProvider::new("provider-1", 1)
+                .with_block(block(10, 0xaa))
+                .fail_method("eth_getLogs"),
+        );
+        let p2 = Arc::new(
+            FakeRpcProvider::new("provider-2", 1)
+                .with_block(block(10, 0xaa))
+                .with_log(rpc_log(token, address(0x22), address(0x33), 10, 0xaa, 0, 7)),
+        );
+        let source = source(vec![p1.clone(), p2.clone()]);
+
+        source
+            .transfer_logs(TransferLogRange::new(1, token, 10, 10))
+            .await
+            .unwrap();
+        source
+            .transfer_logs(TransferLogRange::new(1, token, 10, 10))
+            .await
+            .unwrap();
+
+        let p1_get_logs = p1
+            .calls()
+            .iter()
+            .filter(|call| call.as_str() == "eth_getLogs")
+            .count();
+        let p2_get_logs = p2
+            .calls()
+            .iter()
+            .filter(|call| call.as_str() == "eth_getLogs")
+            .count();
+
+        assert_eq!(p1_get_logs, 1);
+        assert_eq!(p2_get_logs, 2);
+    }
+
+    #[tokio::test]
+    async fn validate_chain_ids_allows_unavailable_extra_provider_when_minimum_is_met() {
+        let p1 = Arc::new(FakeRpcProvider::new("provider-1", 1).fail_method("eth_chainId"));
+        let p2 = Arc::new(FakeRpcProvider::new("provider-2", 1));
+        let manager = RpcProviderManager::with_min_provider_count(
+            1,
+            vec![
+                p1 as SharedJsonRpcProvider,
+                p2.clone() as SharedJsonRpcProvider,
+            ],
+            1,
+        )
+        .unwrap();
+
+        let statuses = manager.validate_chain_ids().await.unwrap();
+
+        assert_eq!(
+            statuses,
+            vec![RpcProviderChainStatus {
+                provider_id: "provider-2".to_string(),
+                chain_id: 1,
+            }]
+        );
+
+        let p2_calls = p2
+            .calls()
+            .iter()
+            .filter(|call| call.as_str() == "eth_chainId")
+            .count();
+        assert_eq!(p2_calls, 1);
     }
 
     #[tokio::test]
