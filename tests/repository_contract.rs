@@ -31,6 +31,8 @@ fn order_repository_uses_external_id_lock_and_idempotency() {
         "expires_at <= now()",
         "status IN ('pending', 'partial')",
         "recompute_orders_in_tx",
+        "order_payment_overrides",
+        "accept_problem_payment_for_owner",
     ] {
         assert!(ORDERS_REPOSITORY.contains(fragment), "missing {fragment}");
     }

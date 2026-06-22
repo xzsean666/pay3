@@ -369,6 +369,36 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
+.manual-empty {
+  margin-top: 18px;
+}
+
+.manual-action-help {
+  margin: -4px 0 0;
+}
+
+.manual-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+  gap: 22px;
+  align-items: start;
+  margin-top: 22px;
+}
+
+.manual-status-line {
+  display: grid;
+  gap: 4px;
+  margin-bottom: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcff;
+  padding: 14px;
+}
+
+.manual-status-line strong {
+  overflow-wrap: anywhere;
+}
+
 .json-output {
   min-height: 160px;
   overflow: auto;
@@ -459,6 +489,7 @@ textarea:focus {
   .settings-grid,
   .form-grid,
   .payment-layout,
+  .manual-layout,
   .status-strip {
     grid-template-columns: 1fr;
   }

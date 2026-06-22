@@ -808,6 +808,11 @@ async fn paid_orders_without_collections(
           AND o.paid_amount_raw > 0
           AND NOT EXISTS (
               SELECT 1
+              FROM order_payment_overrides opo
+              WHERE opo.order_id = o.id
+          )
+          AND NOT EXISTS (
+              SELECT 1
               FROM collections c
               WHERE c.order_id = o.id
           )

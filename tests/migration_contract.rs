@@ -9,6 +9,8 @@ const ORDER_OWNER_SUB: &str =
     include_str!("../src/db/migrations/20260507000200_order_owner_sub.sql");
 const COLLECTION_OWNER_SUB: &str =
     include_str!("../src/db/migrations/20260507000300_collection_owner_sub.sql");
+const ORDER_PAYMENT_OVERRIDES: &str =
+    include_str!("../src/db/migrations/20260622000100_order_payment_overrides.sql");
 
 #[test]
 fn migrator_embeds_initial_schema() {
@@ -22,7 +24,8 @@ fn migrator_embeds_initial_schema() {
             20260502000100,
             20260507000100,
             20260507000200,
-            20260507000300
+            20260507000300,
+            20260622000100
         ]
     );
 }
@@ -129,6 +132,23 @@ fn collection_owner_migration_scopes_reads_and_idempotency_by_owner() {
     ] {
         assert!(
             COLLECTION_OWNER_SUB.contains(fragment),
+            "missing {fragment}"
+        );
+    }
+}
+
+#[test]
+fn order_payment_override_migration_records_manual_problem_payment_acceptance() {
+    for fragment in [
+        "CREATE TABLE order_payment_overrides",
+        "order_id uuid PRIMARY KEY REFERENCES orders(id)",
+        "accepted_problem_payment_raw numeric(78, 0) NOT NULL",
+        "accepted_by text NOT NULL",
+        "CHECK (accepted_problem_payment_raw > 0)",
+        "CREATE INDEX order_payment_overrides_updated_idx",
+    ] {
+        assert!(
+            ORDER_PAYMENT_OVERRIDES.contains(fragment),
             "missing {fragment}"
         );
     }

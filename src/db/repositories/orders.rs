@@ -14,8 +14,10 @@ use super::{
     error::RepositoryError,
     payment_recompute::recompute_orders_in_tx,
     types::{
-        ChildAccountRecord, CreateOrderCommand, OrderRecord, OrderView, PaymentWindowCandidate,
-        PaymentWindowRecord,
+        ChildAccountRecord, CollectionRecordStatus, CreateOrderCommand,
+        OrderManualAcceptanceRecord, OrderPaymentDiagnostics, OrderProblemCollectionRecord,
+        OrderProblemPaymentRecord, OrderRecord, OrderView, PaymentWindowCandidate,
+        PaymentWindowRecord, parse_payment_chain_status, parse_payment_match_status,
     },
 };
 
@@ -128,6 +130,24 @@ pub trait OrderRepository: Send + Sync {
         external_id: &str,
         owner_sub: &str,
     ) -> Result<Option<OrderRecord>, RepositoryError>;
+}
+
+#[async_trait]
+pub trait OrderDiagnosticsRepository: Send + Sync {
+    async fn get_order_payment_diagnostics_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+        problem_funds_address: EvmAddress,
+    ) -> Result<Option<OrderPaymentDiagnostics>, RepositoryError>;
+
+    async fn accept_problem_payment_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+        accepted_by: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<OrderView>, RepositoryError>;
 }
 
 #[async_trait]
@@ -364,6 +384,307 @@ impl OrderRepository for PgOrderRepository {
             .map_err(db_error)?;
 
         row.map(|row| row_to_order_record(&row)).transpose()
+    }
+}
+
+#[async_trait]
+impl OrderDiagnosticsRepository for PgOrderRepository {
+    async fn get_order_payment_diagnostics_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+        problem_funds_address: EvmAddress,
+    ) -> Result<Option<OrderPaymentDiagnostics>, RepositoryError> {
+        let order_exists = sqlx::query(
+            r#"
+            SELECT 1
+            FROM orders
+            WHERE id = $1 AND owner_sub = $2
+            "#,
+        )
+        .bind(id)
+        .bind(owner_sub)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_error)?
+        .is_some();
+        if !order_exists {
+            return Ok(None);
+        }
+
+        let totals = sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) FILTER (
+                    WHERE p.match_status IN ('late', 'outside_window')
+                      AND p.chain_status <> 'orphaned'
+                ) AS problem_payment_count,
+                COALESCE(
+                    SUM(p.amount_raw) FILTER (
+                        WHERE p.match_status IN ('late', 'outside_window')
+                          AND p.chain_status <> 'orphaned'
+                    ),
+                    0
+                ) AS problem_payment_total_raw,
+                COUNT(*) FILTER (
+                    WHERE p.match_status = 'late'
+                      AND p.chain_status <> 'orphaned'
+                ) AS late_payment_count,
+                COALESCE(
+                    SUM(p.amount_raw) FILTER (
+                        WHERE p.match_status = 'late'
+                          AND p.chain_status <> 'orphaned'
+                    ),
+                    0
+                ) AS late_payment_total_raw,
+                COUNT(*) FILTER (
+                    WHERE p.match_status = 'outside_window'
+                      AND p.chain_status <> 'orphaned'
+                ) AS outside_window_payment_count,
+                COALESCE(
+                    SUM(p.amount_raw) FILTER (
+                        WHERE p.match_status = 'outside_window'
+                          AND p.chain_status <> 'orphaned'
+                    ),
+                    0
+                ) AS outside_window_payment_total_raw
+            FROM payments p
+            WHERE p.order_id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_error)?;
+
+        let latest_problem_payment = sqlx::query(
+            r#"
+            SELECT
+                p.tx_hash,
+                p.amount_raw,
+                p.block_number,
+                p.block_time,
+                p.confirmations,
+                p.match_status,
+                p.chain_status
+            FROM payments p
+            WHERE p.order_id = $1
+              AND p.match_status IN ('late', 'outside_window')
+              AND p.chain_status <> 'orphaned'
+            ORDER BY p.block_time DESC, p.block_number DESC, p.log_index DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_error)?
+        .map(row_to_order_problem_payment)
+        .transpose()?;
+
+        let problem_collection = sqlx::query(
+            r#"
+            SELECT
+                c.id,
+                c.status,
+                c.amount_raw,
+                c.outbound_tx_id,
+                c.to_address,
+                c.updated_at
+            FROM collections c
+            WHERE c.order_id = $1
+              AND c.to_address = $2
+            ORDER BY
+                CASE c.status
+                    WHEN 'confirmed' THEN 0
+                    WHEN 'confirming' THEN 1
+                    WHEN 'transferring' THEN 2
+                    WHEN 'queued' THEN 3
+                    WHEN 'replacing' THEN 4
+                    ELSE 5
+                END,
+                c.updated_at DESC,
+                c.id
+            LIMIT 1
+            "#,
+        )
+        .bind(id)
+        .bind(problem_funds_address.to_lower_hex())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_error)?
+        .map(row_to_order_problem_collection)
+        .transpose()?;
+
+        let manual_acceptance = sqlx::query(
+            r#"
+            SELECT
+                opo.accepted_problem_payment_raw,
+                opo.accepted_by,
+                opo.reason,
+                opo.created_at,
+                opo.updated_at
+            FROM order_payment_overrides opo
+            WHERE opo.order_id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_error)?
+        .map(row_to_order_manual_acceptance)
+        .transpose()?;
+
+        Ok(Some(OrderPaymentDiagnostics {
+            problem_payment_count: i64_to_u64(
+                totals.try_get("problem_payment_count").map_err(db_error)?,
+                "problem_payment_count",
+            )?,
+            problem_payment_total_raw: big_decimal_to_raw_amount(
+                totals
+                    .try_get("problem_payment_total_raw")
+                    .map_err(db_error)?,
+            )?,
+            late_payment_count: i64_to_u64(
+                totals.try_get("late_payment_count").map_err(db_error)?,
+                "late_payment_count",
+            )?,
+            late_payment_total_raw: big_decimal_to_raw_amount(
+                totals.try_get("late_payment_total_raw").map_err(db_error)?,
+            )?,
+            outside_window_payment_count: i64_to_u64(
+                totals
+                    .try_get("outside_window_payment_count")
+                    .map_err(db_error)?,
+                "outside_window_payment_count",
+            )?,
+            outside_window_payment_total_raw: big_decimal_to_raw_amount(
+                totals
+                    .try_get("outside_window_payment_total_raw")
+                    .map_err(db_error)?,
+            )?,
+            latest_problem_payment,
+            problem_collection,
+            manual_acceptance,
+        }))
+    }
+
+    async fn accept_problem_payment_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+        accepted_by: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<OrderView>, RepositoryError> {
+        let accepted_by = accepted_by.trim();
+        if accepted_by.is_empty() {
+            return Err(invalid_argument("accepted_by", "must not be empty"));
+        }
+        let reason = reason
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned);
+
+        let mut tx = self.pool.begin().await.map_err(db_error)?;
+        let Some(order) = sqlx::query(
+            r#"
+            SELECT id, expected_amount_raw
+            FROM orders
+            WHERE id = $1 AND owner_sub = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(id)
+        .bind(owner_sub)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_error)?
+        else {
+            tx.commit().await.map_err(db_error)?;
+            return Ok(None);
+        };
+
+        let expected_amount =
+            big_decimal_to_raw_amount(order.try_get("expected_amount_raw").map_err(db_error)?)?;
+        let totals = sqlx::query(
+            r#"
+            SELECT
+                COALESCE(
+                    SUM(amount_raw) FILTER (
+                        WHERE match_status = 'on_time'
+                          AND chain_status = 'confirmed'
+                    ),
+                    0
+                ) AS confirmed_on_time_total,
+                COALESCE(
+                    SUM(amount_raw) FILTER (
+                        WHERE match_status IN ('late', 'outside_window')
+                          AND chain_status = 'confirmed'
+                    ),
+                    0
+                ) AS confirmed_problem_total
+            FROM payments
+            WHERE order_id = $1
+            "#,
+        )
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(db_error)?;
+        let confirmed_on_time_total = big_decimal_to_raw_amount(
+            totals
+                .try_get("confirmed_on_time_total")
+                .map_err(db_error)?,
+        )?;
+        let confirmed_problem_total = big_decimal_to_raw_amount(
+            totals
+                .try_get("confirmed_problem_total")
+                .map_err(db_error)?,
+        )?;
+        if confirmed_problem_total.is_zero() {
+            return Err(invalid_argument(
+                "problem_payment",
+                "no confirmed late or outside_window payment is available to accept",
+            ));
+        }
+        let accepted_total = confirmed_on_time_total
+            .checked_add(confirmed_problem_total)
+            .ok_or_else(|| invalid_persisted_state("accepted payment total overflow"))?;
+        if accepted_total < expected_amount {
+            return Err(invalid_argument(
+                "problem_payment",
+                "confirmed accepted payment total is lower than expected order amount",
+            ));
+        }
+
+        sqlx::query(
+            r#"
+            INSERT INTO order_payment_overrides (
+                order_id,
+                accepted_problem_payment_raw,
+                accepted_by,
+                reason
+            )
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (order_id) DO UPDATE
+            SET accepted_problem_payment_raw = EXCLUDED.accepted_problem_payment_raw,
+                accepted_by = EXCLUDED.accepted_by,
+                reason = EXCLUDED.reason,
+                updated_at = now()
+            "#,
+        )
+        .bind(id)
+        .bind(raw_amount_to_big_decimal(confirmed_problem_total)?)
+        .bind(accepted_by)
+        .bind(reason)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_error)?;
+
+        recompute_orders_in_tx(&mut tx, BTreeSet::from([id])).await?;
+        let view = fetch_order_view_for_owner_tx(&mut tx, id, owner_sub).await?;
+        tx.commit().await.map_err(db_error)?;
+        Ok(view)
     }
 }
 
@@ -656,6 +977,22 @@ async fn fetch_order_by_external_id_tx(
     row.map(|row| row_to_order_record(&row)).transpose()
 }
 
+async fn fetch_order_view_for_owner_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    id: Uuid,
+    owner_sub: &str,
+) -> Result<Option<OrderView>, RepositoryError> {
+    let sql = format!("{ORDER_VIEW_SELECT} WHERE o.id = $1 AND o.owner_sub = $2");
+    let row = sqlx::query(&sql)
+        .bind(id)
+        .bind(owner_sub)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(db_error)?;
+
+    row.map(row_to_order_view).transpose()
+}
+
 fn row_to_order_record(row: &PgRow) -> Result<OrderRecord, RepositoryError> {
     Ok(OrderRecord {
         id: row.try_get("id").map_err(db_error)?,
@@ -728,6 +1065,71 @@ fn row_to_order_view(row: PgRow) -> Result<OrderView, RepositoryError> {
         order,
         child_account,
         payment_window,
+    })
+}
+
+fn row_to_order_problem_payment(row: PgRow) -> Result<OrderProblemPaymentRecord, RepositoryError> {
+    let tx_hash =
+        crate::domain::TxHash::from_str(&row.try_get::<String, _>("tx_hash").map_err(db_error)?)
+            .map_err(|error| {
+                RepositoryError::invalid_db_value(
+                    "payments.tx_hash",
+                    "invalid tx hash",
+                    format!("{error}"),
+                )
+            })?;
+    let match_status: String = row.try_get("match_status").map_err(db_error)?;
+    let chain_status: String = row.try_get("chain_status").map_err(db_error)?;
+
+    Ok(OrderProblemPaymentRecord {
+        tx_hash,
+        amount_raw: big_decimal_to_raw_amount(row.try_get("amount_raw").map_err(db_error)?)?,
+        block_number: i64_to_u64(
+            row.try_get("block_number").map_err(db_error)?,
+            "payments.block_number",
+        )?,
+        block_time: row.try_get("block_time").map_err(db_error)?,
+        confirmations: i64_to_u64(
+            row.try_get("confirmations").map_err(db_error)?,
+            "payments.confirmations",
+        )?,
+        match_status: parse_payment_match_status(&match_status)?,
+        chain_status: parse_payment_chain_status(&chain_status)?,
+    })
+}
+
+fn row_to_order_problem_collection(
+    row: PgRow,
+) -> Result<OrderProblemCollectionRecord, RepositoryError> {
+    let status: String = row.try_get("status").map_err(db_error)?;
+    let amount_raw = row
+        .try_get::<Option<BigDecimal>, _>("amount_raw")
+        .map_err(db_error)?
+        .map(big_decimal_to_raw_amount)
+        .transpose()?;
+
+    Ok(OrderProblemCollectionRecord {
+        id: row.try_get("id").map_err(db_error)?,
+        status: CollectionRecordStatus::try_from(status.as_str())?,
+        amount_raw,
+        outbound_tx_id: row.try_get("outbound_tx_id").map_err(db_error)?,
+        to_address: parse_evm_address(row.try_get("to_address").map_err(db_error)?)?,
+        updated_at: row.try_get("updated_at").map_err(db_error)?,
+    })
+}
+
+fn row_to_order_manual_acceptance(
+    row: PgRow,
+) -> Result<OrderManualAcceptanceRecord, RepositoryError> {
+    Ok(OrderManualAcceptanceRecord {
+        accepted_problem_payment_raw: big_decimal_to_raw_amount(
+            row.try_get("accepted_problem_payment_raw")
+                .map_err(db_error)?,
+        )?,
+        accepted_by: row.try_get("accepted_by").map_err(db_error)?,
+        reason: row.try_get("reason").map_err(db_error)?,
+        created_at: row.try_get("created_at").map_err(db_error)?,
+        updated_at: row.try_get("updated_at").map_err(db_error)?,
     })
 }
 
@@ -868,6 +1270,10 @@ fn db_error(error: sqlx::Error) -> RepositoryError {
 
 fn invalid_persisted_state(message: impl Into<String>) -> RepositoryError {
     RepositoryError::invariant_violation(message)
+}
+
+fn invalid_argument(field: &'static str, message: impl Into<String>) -> RepositoryError {
+    RepositoryError::invalid_argument(field, message)
 }
 
 fn not_found(entity: &'static str, key: &str) -> RepositoryError {

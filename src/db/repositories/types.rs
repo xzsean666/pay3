@@ -96,6 +96,49 @@ pub struct OrderView {
     pub payment_window: PaymentWindowRecord,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderPaymentDiagnostics {
+    pub problem_payment_count: u64,
+    pub problem_payment_total_raw: RawAmount,
+    pub late_payment_count: u64,
+    pub late_payment_total_raw: RawAmount,
+    pub outside_window_payment_count: u64,
+    pub outside_window_payment_total_raw: RawAmount,
+    pub latest_problem_payment: Option<OrderProblemPaymentRecord>,
+    pub problem_collection: Option<OrderProblemCollectionRecord>,
+    pub manual_acceptance: Option<OrderManualAcceptanceRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderProblemPaymentRecord {
+    pub tx_hash: TxHash,
+    pub amount_raw: RawAmount,
+    pub block_number: u64,
+    pub block_time: OffsetDateTime,
+    pub confirmations: u64,
+    pub match_status: PaymentMatchStatus,
+    pub chain_status: PaymentChainStatus,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderProblemCollectionRecord {
+    pub id: Uuid,
+    pub status: CollectionRecordStatus,
+    pub amount_raw: Option<RawAmount>,
+    pub outbound_tx_id: Option<Uuid>,
+    pub to_address: EvmAddress,
+    pub updated_at: OffsetDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OrderManualAcceptanceRecord {
+    pub accepted_problem_payment_raw: RawAmount,
+    pub accepted_by: String,
+    pub reason: Option<String>,
+    pub created_at: OffsetDateTime,
+    pub updated_at: OffsetDateTime,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaymentWindowCandidate {
     pub order_id: Uuid,

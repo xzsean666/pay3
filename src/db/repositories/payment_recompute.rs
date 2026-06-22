@@ -47,15 +47,24 @@ pub async fn recompute_orders_in_tx(
             FROM payments p
             JOIN locked_orders o ON o.id = p.order_id
             GROUP BY p.order_id
+        ),
+        manual_acceptances AS (
+            SELECT
+                opo.order_id,
+                opo.accepted_problem_payment_raw
+            FROM order_payment_overrides opo
+            JOIN locked_orders o ON o.id = opo.order_id
         )
         SELECT
             o.id,
             o.expected_amount_raw,
             o.expires_at,
             COALESCE(pt.confirmed_on_time_total, 0) AS confirmed_on_time_total,
-            COALESCE(pt.non_orphaned_on_time_total, 0) AS non_orphaned_on_time_total
+            COALESCE(pt.non_orphaned_on_time_total, 0) AS non_orphaned_on_time_total,
+            COALESCE(ma.accepted_problem_payment_raw, 0) AS accepted_problem_payment_raw
         FROM locked_orders o
         LEFT JOIN payment_totals pt ON pt.order_id = o.id
+        LEFT JOIN manual_acceptances ma ON ma.order_id = o.id
         ORDER BY o.id
         "#,
     )
@@ -83,11 +92,17 @@ pub async fn recompute_orders_in_tx(
         let non_orphaned_on_time_total: BigDecimal = row
             .try_get("non_orphaned_on_time_total")
             .map_err(RepositoryError::Database)?;
+        let accepted_problem_payment_raw: BigDecimal = row
+            .try_get("accepted_problem_payment_raw")
+            .map_err(RepositoryError::Database)?;
+        let confirmed_accepted_total =
+            confirmed_on_time_total.clone() + accepted_problem_payment_raw.clone();
+        let non_orphaned_accepted_total = non_orphaned_on_time_total + accepted_problem_payment_raw;
 
         let status = recompute_status_from_totals(
             &expected_amount,
-            &confirmed_on_time_total,
-            &non_orphaned_on_time_total,
+            &confirmed_accepted_total,
+            &non_orphaned_accepted_total,
             now >= expires_at,
         );
 
@@ -101,7 +116,7 @@ pub async fn recompute_orders_in_tx(
             "#,
         )
         .bind(order_id)
-        .bind(confirmed_on_time_total)
+        .bind(confirmed_accepted_total)
         .bind(order_status_str(status))
         .execute(&mut **tx)
         .await

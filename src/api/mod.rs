@@ -25,11 +25,15 @@ use uuid::Uuid;
 use crate::{
     auth::{
         AuthError, COLLECTIONS_CREATE_SCOPE, COLLECTIONS_READ_SCOPE, JwtVerifier,
-        ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE, Principal,
+        ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE, ORDERS_VERIFY_SCOPE, Principal,
     },
     config::AppConfig,
-    db::repositories::{CollectionRecord, CollectionRecordStatus, OrderView, RepositoryError},
-    domain::{OrderStatus, TokenAmount},
+    db::repositories::{
+        CollectionRecord, CollectionRecordStatus, OrderManualAcceptanceRecord,
+        OrderPaymentDiagnostics, OrderProblemCollectionRecord, OrderProblemPaymentRecord,
+        OrderView, RepositoryError,
+    },
+    domain::{EvmAddress, OrderStatus, PaymentChainStatus, TokenAmount},
     error::ApiError,
     health::{
         DependencyCheck, DependencyName, DependencyRegistry, HealthzResponse, MetricsRecorder,
@@ -215,6 +219,7 @@ impl FixedWindowRateLimiter {
 pub struct OrderResponseConfig {
     pub token_decimals: u8,
     pub token_symbol: String,
+    pub problem_funds_address: EvmAddress,
 }
 
 impl OrderResponseConfig {
@@ -222,6 +227,7 @@ impl OrderResponseConfig {
         Self {
             token_decimals: config.chain.token_decimals,
             token_symbol: config.chain.token_symbol.clone(),
+            problem_funds_address: config.chain.problem_funds_address,
         }
     }
 }
@@ -245,6 +251,21 @@ pub trait OrderApiService: Send + Sync {
         owner_sub: &str,
         external_id: &str,
     ) -> Result<Option<OrderView>, OrderServiceError>;
+
+    async fn get_order_payment_diagnostics(
+        &self,
+        owner_sub: &str,
+        id: Uuid,
+        problem_funds_address: EvmAddress,
+    ) -> Result<Option<OrderPaymentDiagnostics>, OrderServiceError>;
+
+    async fn accept_problem_payment(
+        &self,
+        owner_sub: &str,
+        id: Uuid,
+        accepted_by: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<OrderView>, OrderServiceError>;
 }
 
 #[async_trait]
@@ -264,7 +285,8 @@ pub trait CollectionApiService: Send + Sync {
 #[async_trait]
 impl<R, D, H, C, I> OrderApiService for OrderService<R, D, H, C, I>
 where
-    R: crate::db::repositories::OrderRepository,
+    R: crate::db::repositories::OrderRepository
+        + crate::db::repositories::OrderDiagnosticsRepository,
     D: crate::wallet::AddressDeriver,
     H: crate::services::orders::OrderChainHeadReader,
     C: crate::services::orders::Clock,
@@ -292,6 +314,32 @@ where
         external_id: &str,
     ) -> Result<Option<OrderView>, OrderServiceError> {
         OrderService::get_order_by_external_id_for_owner(self, external_id, owner_sub).await
+    }
+
+    async fn get_order_payment_diagnostics(
+        &self,
+        owner_sub: &str,
+        id: Uuid,
+        problem_funds_address: EvmAddress,
+    ) -> Result<Option<OrderPaymentDiagnostics>, OrderServiceError> {
+        OrderService::get_order_payment_diagnostics_for_owner(
+            self,
+            id,
+            owner_sub,
+            problem_funds_address,
+        )
+        .await
+    }
+
+    async fn accept_problem_payment(
+        &self,
+        owner_sub: &str,
+        id: Uuid,
+        accepted_by: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<OrderView>, OrderServiceError> {
+        OrderService::accept_problem_payment_for_owner(self, id, owner_sub, accepted_by, reason)
+            .await
     }
 }
 
@@ -464,6 +512,10 @@ fn router_from_state(state: ApiState) -> Router {
                 "/v1/orders/by-external-id/{external_id}",
                 get(get_order_by_external_id),
             )
+            .route(
+                "/v1/orders/{id}/accept-problem-payment",
+                post(accept_problem_payment),
+            )
             .route("/v1/orders/{id}", get(get_order));
     }
 
@@ -527,12 +579,20 @@ struct CreateOrderRequest {
     metadata: Option<Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptProblemPaymentRequest {
+    #[serde(default)]
+    reason: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct OrderResponse {
     id: Uuid,
     external_id: String,
     status: OrderStatus,
     payment: OrderPaymentResponse,
+    diagnostics: OrderPaymentDiagnosticsResponse,
 }
 
 #[derive(Debug, Serialize)]
@@ -549,6 +609,63 @@ struct OrderPaymentResponse {
     derivation_path: String,
     expires_at: String,
     monitor_until: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OrderPaymentDiagnosticsResponse {
+    state: OrderPaymentDiagnosticState,
+    problem_payment_count: u64,
+    problem_payment_total_raw: String,
+    late_payment_count: u64,
+    late_payment_total_raw: String,
+    outside_window_payment_count: u64,
+    outside_window_payment_total_raw: String,
+    latest_problem_payment: Option<OrderProblemPaymentResponse>,
+    problem_collection: Option<OrderProblemCollectionResponse>,
+    manual_acceptance: Option<OrderManualAcceptanceResponse>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OrderPaymentDiagnosticState {
+    AwaitingPayment,
+    NoIssue,
+    ExpiredNoPayment,
+    ProblemPaymentObserved,
+    ProblemPaymentConfirmed,
+    ProblemFundsCollecting,
+    ProblemFundsCollected,
+    ProblemPaymentAccepted,
+}
+
+#[derive(Debug, Serialize)]
+struct OrderProblemPaymentResponse {
+    tx_hash: String,
+    amount_raw: String,
+    block_number: u64,
+    block_time: String,
+    confirmations: u64,
+    match_status: crate::domain::PaymentMatchStatus,
+    chain_status: PaymentChainStatus,
+}
+
+#[derive(Debug, Serialize)]
+struct OrderProblemCollectionResponse {
+    id: Uuid,
+    status: CollectionRecordStatus,
+    amount_raw: Option<String>,
+    outbound_tx_id: Option<Uuid>,
+    to_address: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct OrderManualAcceptanceResponse {
+    accepted_problem_payment_raw: String,
+    accepted_by: String,
+    reason: Option<String>,
+    created_at: String,
+    updated_at: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -609,7 +726,9 @@ async fn create_order(
         CreateOrderServiceOutcome::Created => StatusCode::CREATED,
         CreateOrderServiceOutcome::Existing => StatusCode::OK,
     };
-    let response = order_response(result.view, config);
+    let diagnostics =
+        order_payment_diagnostics(&state, &principal.subject, result.view.order.id, config).await?;
+    let response = order_response(result.view, config, diagnostics);
 
     Ok((status, Json(response)))
 }
@@ -631,7 +750,10 @@ async fn get_order(
         return Err(ApiError::not_found("order not found"));
     };
 
-    Ok(Json(order_response(view, config)))
+    let diagnostics =
+        order_payment_diagnostics(&state, &principal.subject, view.order.id, config).await?;
+
+    Ok(Json(order_response(view, config, diagnostics)))
 }
 
 async fn get_order_by_external_id(
@@ -650,7 +772,39 @@ async fn get_order_by_external_id(
         return Err(ApiError::not_found("order not found"));
     };
 
-    Ok(Json(order_response(view, config)))
+    let diagnostics =
+        order_payment_diagnostics(&state, &principal.subject, view.order.id, config).await?;
+
+    Ok(Json(order_response(view, config, diagnostics)))
+}
+
+async fn accept_problem_payment(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    payload: Result<Json<AcceptProblemPaymentRequest>, JsonRejection>,
+) -> Result<Json<OrderResponse>, ApiError> {
+    let principal = require_scope(&state, &headers, ORDERS_VERIFY_SCOPE)?;
+    let id = parse_order_id(&id)?;
+    let Json(payload) = payload.map_err(json_rejection)?;
+    let config = state.order_response_config()?;
+    let Some(view) = state
+        .orders()?
+        .accept_problem_payment(
+            &principal.subject,
+            id,
+            &principal.subject,
+            payload.reason.as_deref(),
+        )
+        .await
+        .map_err(order_service_error_to_api)?
+    else {
+        return Err(ApiError::not_found("order not found"));
+    };
+    let diagnostics =
+        order_payment_diagnostics(&state, &principal.subject, view.order.id, config).await?;
+
+    Ok(Json(order_response(view, config, diagnostics)))
 }
 
 async fn create_collection(
@@ -713,8 +867,27 @@ async fn not_found() -> ApiError {
     ApiError::not_found("route not found")
 }
 
-fn order_response(view: OrderView, config: &OrderResponseConfig) -> OrderResponse {
+async fn order_payment_diagnostics(
+    state: &ApiState,
+    owner_sub: &str,
+    order_id: Uuid,
+    config: &OrderResponseConfig,
+) -> Result<OrderPaymentDiagnostics, ApiError> {
+    Ok(state
+        .orders()?
+        .get_order_payment_diagnostics(owner_sub, order_id, config.problem_funds_address)
+        .await
+        .map_err(order_service_error_to_api)?
+        .unwrap_or_default())
+}
+
+fn order_response(
+    view: OrderView,
+    config: &OrderResponseConfig,
+    diagnostics: OrderPaymentDiagnostics,
+) -> OrderResponse {
     let amount = TokenAmount::from_raw(view.order.expected_amount_raw, config.token_decimals);
+    let diagnostic_state = payment_diagnostic_state(view.order.status, &diagnostics);
     OrderResponse {
         id: view.order.id,
         external_id: view.order.external_id,
@@ -733,6 +906,107 @@ fn order_response(view: OrderView, config: &OrderResponseConfig) -> OrderRespons
             expires_at: format_timestamp(view.order.expires_at),
             monitor_until: format_timestamp(view.order.monitor_until),
         },
+        diagnostics: OrderPaymentDiagnosticsResponse {
+            state: diagnostic_state,
+            problem_payment_count: diagnostics.problem_payment_count,
+            problem_payment_total_raw: diagnostics.problem_payment_total_raw.to_string(),
+            late_payment_count: diagnostics.late_payment_count,
+            late_payment_total_raw: diagnostics.late_payment_total_raw.to_string(),
+            outside_window_payment_count: diagnostics.outside_window_payment_count,
+            outside_window_payment_total_raw: diagnostics
+                .outside_window_payment_total_raw
+                .to_string(),
+            latest_problem_payment: diagnostics
+                .latest_problem_payment
+                .map(problem_payment_response),
+            problem_collection: diagnostics
+                .problem_collection
+                .map(problem_collection_response),
+            manual_acceptance: diagnostics
+                .manual_acceptance
+                .map(manual_acceptance_response),
+        },
+    }
+}
+
+fn payment_diagnostic_state(
+    order_status: OrderStatus,
+    diagnostics: &OrderPaymentDiagnostics,
+) -> OrderPaymentDiagnosticState {
+    if diagnostics.manual_acceptance.is_some() {
+        return OrderPaymentDiagnosticState::ProblemPaymentAccepted;
+    }
+
+    if let Some(collection) = &diagnostics.problem_collection {
+        if collection.status == CollectionRecordStatus::Confirmed {
+            return OrderPaymentDiagnosticState::ProblemFundsCollected;
+        }
+        if matches!(
+            collection.status,
+            CollectionRecordStatus::Queued
+                | CollectionRecordStatus::Transferring
+                | CollectionRecordStatus::Confirming
+                | CollectionRecordStatus::Replacing
+        ) {
+            return OrderPaymentDiagnosticState::ProblemFundsCollecting;
+        }
+    }
+
+    if diagnostics.problem_payment_count > 0 {
+        let latest_confirmed = diagnostics
+            .latest_problem_payment
+            .as_ref()
+            .is_some_and(|payment| payment.chain_status == PaymentChainStatus::Confirmed);
+        return if latest_confirmed {
+            OrderPaymentDiagnosticState::ProblemPaymentConfirmed
+        } else {
+            OrderPaymentDiagnosticState::ProblemPaymentObserved
+        };
+    }
+
+    match order_status {
+        OrderStatus::Pending | OrderStatus::Partial | OrderStatus::Confirming => {
+            OrderPaymentDiagnosticState::AwaitingPayment
+        }
+        OrderStatus::Expired => OrderPaymentDiagnosticState::ExpiredNoPayment,
+        OrderStatus::Paid => OrderPaymentDiagnosticState::NoIssue,
+    }
+}
+
+fn problem_payment_response(payment: OrderProblemPaymentRecord) -> OrderProblemPaymentResponse {
+    OrderProblemPaymentResponse {
+        tx_hash: payment.tx_hash.to_lower_hex(),
+        amount_raw: payment.amount_raw.to_string(),
+        block_number: payment.block_number,
+        block_time: format_timestamp(payment.block_time),
+        confirmations: payment.confirmations,
+        match_status: payment.match_status,
+        chain_status: payment.chain_status,
+    }
+}
+
+fn problem_collection_response(
+    collection: OrderProblemCollectionRecord,
+) -> OrderProblemCollectionResponse {
+    OrderProblemCollectionResponse {
+        id: collection.id,
+        status: collection.status,
+        amount_raw: collection.amount_raw.map(|amount| amount.to_string()),
+        outbound_tx_id: collection.outbound_tx_id,
+        to_address: collection.to_address.to_lower_hex(),
+        updated_at: format_timestamp(collection.updated_at),
+    }
+}
+
+fn manual_acceptance_response(
+    acceptance: OrderManualAcceptanceRecord,
+) -> OrderManualAcceptanceResponse {
+    OrderManualAcceptanceResponse {
+        accepted_problem_payment_raw: acceptance.accepted_problem_payment_raw.to_string(),
+        accepted_by: acceptance.accepted_by,
+        reason: acceptance.reason,
+        created_at: format_timestamp(acceptance.created_at),
+        updated_at: format_timestamp(acceptance.updated_at),
     }
 }
 
@@ -931,13 +1205,18 @@ mod tests {
     use crate::{
         auth::{
             Audience, COLLECTIONS_CREATE_SCOPE, COLLECTIONS_READ_SCOPE, Claims, JwtVerifier,
-            ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE,
+            ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE, ORDERS_VERIFY_SCOPE,
         },
         db::repositories::{
-            ChildAccountRecord, CollectionRecord, CollectionRecordStatus, OrderRecord, OrderView,
-            PaymentWindowRecord, RepositoryError,
+            ChildAccountRecord, CollectionRecord, CollectionRecordStatus,
+            OrderManualAcceptanceRecord, OrderPaymentDiagnostics, OrderProblemCollectionRecord,
+            OrderProblemPaymentRecord, OrderRecord, OrderView, PaymentWindowRecord,
+            RepositoryError,
         },
-        domain::{BlockHash, ChainBlockRef, DerivationSegment, EvmAddress, OrderStatus, RawAmount},
+        domain::{
+            BlockHash, ChainBlockRef, DerivationSegment, EvmAddress, OrderStatus,
+            PaymentChainStatus, PaymentMatchStatus, RawAmount, TxHash,
+        },
         health::{DependencyCheck, DependencyName, StaticDependencyRegistry},
         services::collections::{
             CollectionAmount, CollectionServiceError, CreateCollectionInput,
@@ -1063,6 +1342,7 @@ mod tests {
                 OrderResponseConfig {
                     token_decimals: 6,
                     token_symbol: "USDT".to_string(),
+                    problem_funds_address: evm_address(0x99),
                 },
             )
             .with_rate_limit_per_minute(Some(1));
@@ -1252,6 +1532,181 @@ mod tests {
         assert_eq!(
             response.body["payment"]["receive_address"],
             evm_address(0x77).to_string()
+        );
+        assert_eq!(response.body["diagnostics"]["state"], "awaiting_payment");
+        assert_eq!(response.body["diagnostics"]["problem_payment_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn get_order_returns_problem_payment_diagnostics() {
+        let mut view = order_view(
+            Uuid::from_u128(30),
+            "merchant-order-30",
+            RawAmount::from(1_000_000),
+        );
+        view.order.status = OrderStatus::Expired;
+        let diagnostics = OrderPaymentDiagnostics {
+            problem_payment_count: 1,
+            problem_payment_total_raw: RawAmount::from(1_000_000),
+            late_payment_count: 1,
+            late_payment_total_raw: RawAmount::from(1_000_000),
+            outside_window_payment_count: 0,
+            outside_window_payment_total_raw: RawAmount::ZERO,
+            latest_problem_payment: Some(OrderProblemPaymentRecord {
+                tx_hash: TxHash::from_bytes([0x42; 32]),
+                amount_raw: RawAmount::from(1_000_000),
+                block_number: 12_345,
+                block_time: OffsetDateTime::from_unix_timestamp(1_777_777_777).unwrap()
+                    + Duration::minutes(30),
+                confirmations: 42,
+                match_status: PaymentMatchStatus::Late,
+                chain_status: PaymentChainStatus::Confirmed,
+            }),
+            problem_collection: Some(OrderProblemCollectionRecord {
+                id: Uuid::from_u128(31),
+                status: CollectionRecordStatus::Confirmed,
+                amount_raw: Some(RawAmount::from(1_000_000)),
+                outbound_tx_id: Some(Uuid::from_u128(32)),
+                to_address: evm_address(0x99),
+                updated_at: OffsetDateTime::from_unix_timestamp(1_777_777_777).unwrap()
+                    + Duration::minutes(31),
+            }),
+            manual_acceptance: None,
+        };
+        let service = Arc::new(FakeOrderApiService::with_order_diagnostics(
+            view,
+            diagnostics,
+        ));
+
+        let response = request_json_with_app(
+            orders_app(service),
+            Method::GET,
+            "/v1/orders/00000000-0000-0000-0000-00000000001e",
+            Value::Null,
+            Some(token(ORDERS_READ_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body["status"], "expired");
+        assert_eq!(
+            response.body["diagnostics"]["state"],
+            "problem_funds_collected"
+        );
+        assert_eq!(response.body["diagnostics"]["problem_payment_count"], 1);
+        assert_eq!(
+            response.body["diagnostics"]["problem_payment_total_raw"],
+            "1000000"
+        );
+        assert_eq!(response.body["diagnostics"]["late_payment_count"], 1);
+        assert_eq!(
+            response.body["diagnostics"]["latest_problem_payment"]["match_status"],
+            "late"
+        );
+        assert_eq!(
+            response.body["diagnostics"]["latest_problem_payment"]["chain_status"],
+            "confirmed"
+        );
+        assert_eq!(
+            response.body["diagnostics"]["problem_collection"]["status"],
+            "confirmed"
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_problem_payment_requires_verify_scope() {
+        let service = Arc::new(FakeOrderApiService::with_order(order_view(
+            Uuid::from_u128(33),
+            "merchant-order-33",
+            RawAmount::from(1_000_000),
+        )));
+
+        let response = request_json_with_app(
+            orders_app(service.clone()),
+            Method::POST,
+            "/v1/orders/00000000-0000-0000-0000-000000000021/accept-problem-payment",
+            json!({"reason": "merchant approved late payment"}),
+            Some(token(ORDERS_READ_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::FORBIDDEN);
+        assert_eq!(response.body["error"]["code"], "forbidden");
+        assert!(
+            service
+                .calls
+                .lock()
+                .unwrap()
+                .accept_problem_payments
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn accept_problem_payment_returns_paid_order_with_manual_diagnostics() {
+        let mut view = order_view(
+            Uuid::from_u128(34),
+            "merchant-order-34",
+            RawAmount::from(1_000_000),
+        );
+        view.order.status = OrderStatus::Expired;
+        let diagnostics = OrderPaymentDiagnostics {
+            problem_payment_count: 1,
+            problem_payment_total_raw: RawAmount::from(1_000_000),
+            late_payment_count: 1,
+            late_payment_total_raw: RawAmount::from(1_000_000),
+            outside_window_payment_count: 0,
+            outside_window_payment_total_raw: RawAmount::ZERO,
+            latest_problem_payment: Some(OrderProblemPaymentRecord {
+                tx_hash: TxHash::from_bytes([0x43; 32]),
+                amount_raw: RawAmount::from(1_000_000),
+                block_number: 12_346,
+                block_time: OffsetDateTime::from_unix_timestamp(1_777_777_777).unwrap()
+                    + Duration::minutes(30),
+                confirmations: 42,
+                match_status: PaymentMatchStatus::Late,
+                chain_status: PaymentChainStatus::Confirmed,
+            }),
+            problem_collection: None,
+            manual_acceptance: None,
+        };
+        let service = Arc::new(FakeOrderApiService::with_order_diagnostics(
+            view,
+            diagnostics,
+        ));
+
+        let response = request_json_with_app(
+            orders_app(service.clone()),
+            Method::POST,
+            "/v1/orders/00000000-0000-0000-0000-000000000022/accept-problem-payment",
+            json!({"reason": "merchant approved late payment"}),
+            Some(token(ORDERS_VERIFY_SCOPE)),
+        )
+        .await;
+
+        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.body["status"], "paid");
+        assert_eq!(response.body["payment"]["paid_amount_raw"], "1000000");
+        assert_eq!(
+            response.body["diagnostics"]["state"],
+            "problem_payment_accepted"
+        );
+        assert_eq!(
+            response.body["diagnostics"]["manual_acceptance"]["accepted_problem_payment_raw"],
+            "1000000"
+        );
+        assert_eq!(
+            response.body["diagnostics"]["manual_acceptance"]["reason"],
+            "merchant approved late payment"
+        );
+        assert_eq!(
+            service.calls.lock().unwrap().accept_problem_payments,
+            vec![(
+                "merchant-1".to_string(),
+                Uuid::from_u128(34),
+                "merchant-1".to_string(),
+                Some("merchant approved late payment".to_string())
+            )]
         );
     }
 
@@ -1714,6 +2169,7 @@ mod tests {
             OrderResponseConfig {
                 token_decimals: 6,
                 token_symbol: "USDT".to_string(),
+                problem_funds_address: evm_address(0x99),
             },
         )
     }
@@ -1845,6 +2301,7 @@ mod tests {
         create_result: Mutex<Option<Result<CreateOrderResult, OrderServiceError>>>,
         orders: Mutex<BTreeMap<Uuid, OrderView>>,
         orders_by_external_id: Mutex<BTreeMap<String, Uuid>>,
+        diagnostics: Mutex<BTreeMap<Uuid, OrderPaymentDiagnostics>>,
         calls: Mutex<FakeOrderApiCalls>,
     }
 
@@ -1874,6 +2331,16 @@ mod tests {
                 ..Self::default()
             }
         }
+
+        fn with_order_diagnostics(view: OrderView, diagnostics: OrderPaymentDiagnostics) -> Self {
+            let service = Self::with_order(view.clone());
+            service
+                .diagnostics
+                .lock()
+                .unwrap()
+                .insert(view.order.id, diagnostics);
+            service
+        }
     }
 
     #[derive(Default)]
@@ -1881,6 +2348,8 @@ mod tests {
         create_inputs: Vec<(String, CreateOrderInput)>,
         get_ids: Vec<(String, Uuid)>,
         get_external_ids: Vec<(String, String)>,
+        get_diagnostics: Vec<(String, Uuid)>,
+        accept_problem_payments: Vec<(String, Uuid, String, Option<String>)>,
     }
 
     #[async_trait]
@@ -1950,6 +2419,75 @@ mod tests {
                 .get(&id)
                 .filter(|view| view.order.owner_sub == owner_sub)
                 .cloned())
+        }
+
+        async fn get_order_payment_diagnostics(
+            &self,
+            owner_sub: &str,
+            id: Uuid,
+            _problem_funds_address: EvmAddress,
+        ) -> Result<Option<OrderPaymentDiagnostics>, OrderServiceError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .get_diagnostics
+                .push((owner_sub.to_string(), id));
+            let owner_matches = self
+                .orders
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|view| view.order.owner_sub == owner_sub);
+            if !owner_matches {
+                return Ok(None);
+            }
+            Ok(Some(
+                self.diagnostics
+                    .lock()
+                    .unwrap()
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default(),
+            ))
+        }
+
+        async fn accept_problem_payment(
+            &self,
+            owner_sub: &str,
+            id: Uuid,
+            accepted_by: &str,
+            reason: Option<&str>,
+        ) -> Result<Option<OrderView>, OrderServiceError> {
+            self.calls.lock().unwrap().accept_problem_payments.push((
+                owner_sub.to_string(),
+                id,
+                accepted_by.to_string(),
+                reason.map(ToOwned::to_owned),
+            ));
+            let mut orders = self.orders.lock().unwrap();
+            let Some(view) = orders.get_mut(&id) else {
+                return Ok(None);
+            };
+            if view.order.owner_sub != owner_sub {
+                return Ok(None);
+            }
+            view.order.status = OrderStatus::Paid;
+            view.order.paid_amount_raw = view.order.expected_amount_raw;
+            let mut diagnostics = self.diagnostics.lock().unwrap();
+            let diagnostics = diagnostics.entry(id).or_default();
+            let accepted_raw = if diagnostics.problem_payment_total_raw.is_zero() {
+                view.order.expected_amount_raw
+            } else {
+                diagnostics.problem_payment_total_raw
+            };
+            diagnostics.manual_acceptance = Some(OrderManualAcceptanceRecord {
+                accepted_problem_payment_raw: accepted_raw,
+                accepted_by: accepted_by.to_string(),
+                reason: reason.map(ToOwned::to_owned),
+                created_at: OffsetDateTime::from_unix_timestamp(1_777_777_777).unwrap(),
+                updated_at: OffsetDateTime::from_unix_timestamp(1_777_777_777).unwrap(),
+            });
+            Ok(Some(view.clone()))
         }
     }
 

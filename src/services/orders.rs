@@ -11,7 +11,8 @@ use uuid::Uuid;
 use crate::{
     db::repositories::{
         AllocatedDerivation, CreateOrderCommand, CreateOrderOutcome, NewChildAccount,
-        NewPaymentWindow, OrderRepository, OrderView, RepositoryError,
+        NewPaymentWindow, OrderDiagnosticsRepository, OrderPaymentDiagnostics, OrderRepository,
+        OrderView, RepositoryError,
     },
     domain::{ChainBlockRef, EvmAddress, RawAmount},
     wallet::{AddressDeriver, DeriveAddressRequest, HdWallet, WalletError},
@@ -397,6 +398,37 @@ where
             .get_order_view(order_id)
             .await?
             .ok_or(OrderServiceError::OrderViewMissing { order_id })
+    }
+}
+
+impl<R, D, H, C, I> OrderService<R, D, H, C, I>
+where
+    R: OrderDiagnosticsRepository,
+{
+    pub async fn get_order_payment_diagnostics_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+        problem_funds_address: EvmAddress,
+    ) -> Result<Option<OrderPaymentDiagnostics>, OrderServiceError> {
+        self.repository
+            .get_order_payment_diagnostics_for_owner(id, owner_sub, problem_funds_address)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn accept_problem_payment_for_owner(
+        &self,
+        id: Uuid,
+        owner_sub: &str,
+        accepted_by: &str,
+        reason: Option<&str>,
+    ) -> Result<Option<OrderView>, OrderServiceError> {
+        let owner_sub = normalize_owner_sub(owner_sub)?;
+        self.repository
+            .accept_problem_payment_for_owner(id, &owner_sub, accepted_by, reason)
+            .await
+            .map_err(Into::into)
     }
 }
 

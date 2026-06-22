@@ -16,6 +16,7 @@ const state = {
   qrMode: "uri",
   token: "",
   order: null,
+  manualOrder: null,
   verifyResult: null,
   logs: [],
   pollTimer: null,
@@ -33,6 +34,7 @@ async function init() {
   await loadRuntimeConfig();
   loadPrefs();
   applyConfigToControls();
+  await refreshStoredOrder();
   renderAll();
   setTab("config");
   setInterval(renderCountdown, 1000);
@@ -80,7 +82,22 @@ function collectEls() {
     "lastPollText",
     "autoVerify",
     "verifyOnceBtn",
+    "acceptProblemPaymentBtn",
     "verifyResult",
+    "manualUseCurrentOrderBtn",
+    "manualRefreshBtn",
+    "manualOrderId",
+    "manualExternalId",
+    "manualReason",
+    "manualLoadByIdBtn",
+    "manualLoadByExternalIdBtn",
+    "manualAcceptProblemPaymentBtn",
+    "manualActionHelp",
+    "manualEmptyState",
+    "manualView",
+    "manualStatusText",
+    "manualDetails",
+    "manualJson",
     "successEmpty",
     "successView",
     "successDetails",
@@ -137,7 +154,13 @@ function bindEvents() {
     toast("轮询已停止");
   });
   els.verifyOnceBtn.addEventListener("click", verifyOnce);
+  els.acceptProblemPaymentBtn.addEventListener("click", acceptProblemPayment);
   els.autoVerify.addEventListener("change", savePrefs);
+  els.manualUseCurrentOrderBtn.addEventListener("click", useCurrentOrderForManual);
+  els.manualRefreshBtn.addEventListener("click", refreshManualOrder);
+  els.manualLoadByIdBtn.addEventListener("click", loadManualOrderById);
+  els.manualLoadByExternalIdBtn.addEventListener("click", loadManualOrderByExternalId);
+  els.manualAcceptProblemPaymentBtn.addEventListener("click", acceptManualProblemPayment);
 
   els.createAnotherBtn.addEventListener("click", () => {
     stopPolling();
@@ -252,6 +275,21 @@ function setCallMode(mode) {
   renderTopStatus();
 }
 
+async function refreshStoredOrder() {
+  if (!state.order?.id) {
+    return;
+  }
+
+  try {
+    state.order = await apiRequest(`/v1/orders/${state.order.id}`);
+    syncManualOrderFromCurrent();
+    state.lastPollAt = new Date();
+    savePrefs();
+  } catch (error) {
+    log("order", "Failed to refresh stored order", serializeError(error));
+  }
+}
+
 function seedCreateForm() {
   els.externalId.value = newExternalId();
   els.metadata.value = JSON.stringify({ source: "frontend-test", channel: "wrangler" }, null, 2);
@@ -340,6 +378,7 @@ async function pollOrder({ verifyFirst = els.autoVerify.checked } = {}) {
     }
 
     state.order = await apiRequest(`/v1/orders/${state.order.id}`);
+    syncManualOrderFromCurrent();
     state.lastPollAt = new Date();
     savePrefs();
     renderAll();
@@ -365,6 +404,151 @@ async function verifyOnce({ quiet = false } = {}) {
     toast("verify 已完成");
   }
   return result;
+}
+
+async function acceptProblemPayment() {
+  if (!state.order?.id) {
+    toast("还没有订单可处理");
+    return;
+  }
+  const acceptState = problemPaymentAcceptState(state.order);
+  if (!acceptState.canAccept) {
+    toast(acceptState.reason);
+    return;
+  }
+
+  try {
+    setBusy(els.acceptProblemPaymentBtn, true, "处理中");
+    state.order = await apiRequest(`/v1/orders/${state.order.id}/accept-problem-payment`, {
+      method: "POST",
+      body: { reason: "frontend-test manual accept problem payment" },
+    });
+    syncManualOrderFromCurrent();
+    state.lastPollAt = new Date();
+    savePrefs();
+    renderAll();
+    toast("已接受问题付款");
+    if (state.order.status === "paid") {
+      handlePaid();
+    }
+  } catch (error) {
+    showError(error);
+  } finally {
+    setBusy(els.acceptProblemPaymentBtn, false, "接受问题付款");
+    renderWait();
+  }
+}
+
+function useCurrentOrderForManual() {
+  if (!state.order?.id) {
+    toast("当前还没有订单");
+    return;
+  }
+  setManualOrder(state.order);
+  renderAll();
+  toast("已载入当前订单");
+}
+
+async function refreshManualOrder() {
+  const orderId = state.manualOrder?.id || els.manualOrderId.value.trim();
+  if (orderId) {
+    await loadManualOrderByPath(`/v1/orders/${encodeURIComponent(orderId)}`, els.manualRefreshBtn, "刷新", "订单已刷新");
+    return;
+  }
+
+  const externalId = els.manualExternalId.value.trim();
+  if (externalId) {
+    await loadManualOrderByPath(
+      `/v1/orders/by-external-id/${encodeURIComponent(externalId)}`,
+      els.manualRefreshBtn,
+      "刷新",
+      "订单已刷新",
+    );
+    return;
+  }
+
+  toast("先填写订单 ID 或 external_id");
+}
+
+async function loadManualOrderById() {
+  const orderId = els.manualOrderId.value.trim();
+  if (!orderId) {
+    toast("先填写订单 ID");
+    return;
+  }
+  await loadManualOrderByPath(
+    `/v1/orders/${encodeURIComponent(orderId)}`,
+    els.manualLoadByIdBtn,
+    "按订单 ID 查询",
+    "订单已载入",
+  );
+}
+
+async function loadManualOrderByExternalId() {
+  const externalId = els.manualExternalId.value.trim();
+  if (!externalId) {
+    toast("先填写 external_id");
+    return;
+  }
+  await loadManualOrderByPath(
+    `/v1/orders/by-external-id/${encodeURIComponent(externalId)}`,
+    els.manualLoadByExternalIdBtn,
+    "按 external_id 查询",
+    "订单已载入",
+  );
+}
+
+async function loadManualOrderByPath(path, button, idleLabel, successMessage) {
+  try {
+    setBusy(button, true, "查询中");
+    const order = await apiRequest(path);
+    setManualOrder(order);
+    renderAll();
+    toast(successMessage);
+  } catch (error) {
+    showError(error);
+  } finally {
+    setBusy(button, false, idleLabel);
+  }
+}
+
+async function acceptManualProblemPayment() {
+  const order = state.manualOrder;
+  if (!order?.id) {
+    toast("先载入订单");
+    return;
+  }
+  const acceptState = problemPaymentAcceptState(order);
+  if (!acceptState.canAccept) {
+    toast(acceptState.reason);
+    return;
+  }
+
+  const sameCurrentOrder = state.order?.id === order.id;
+  const reason = els.manualReason.value.trim() || "frontend-test manual accept problem payment";
+  try {
+    setBusy(els.manualAcceptProblemPaymentBtn, true, "处理中");
+    const updated = await apiRequest(`/v1/orders/${order.id}/accept-problem-payment`, {
+      method: "POST",
+      body: { reason },
+    });
+    setManualOrder(updated);
+    if (sameCurrentOrder) {
+      state.order = updated;
+      state.lastPollAt = new Date();
+      if (updated.status === "paid") {
+        stopPolling();
+      }
+      savePrefs();
+    }
+    renderAll();
+    toast("已接受问题付款");
+  } catch (error) {
+    showError(error);
+  } finally {
+    setBusy(els.manualAcceptProblemPaymentBtn, false, "接受问题付款");
+    renderManual();
+  }
 }
 
 function startPolling() {
@@ -408,6 +592,7 @@ function renderAll() {
   renderTopStatus();
   renderPayment();
   renderWait();
+  renderManual();
   renderSuccess();
   renderLogs();
 }
@@ -417,13 +602,14 @@ function renderTopStatus() {
   els.modeBadge.className = state.useProxy ? "badge" : "badge warn";
   const statusParts = [];
   if (state.order?.id) {
-    statusParts.push(statusLabel(state.order.status));
+    statusParts.push(orderStatusLabel(state.order));
   }
   if (state.pollTimer) {
     statusParts.push("轮询中");
   }
   els.connectionBadge.textContent = statusParts.join(" / ") || "未连接";
-  els.connectionBadge.className = state.order?.status === "paid" ? "badge ok" : "badge muted";
+  els.connectionBadge.className =
+    state.order?.status === "paid" ? "badge ok" : hasProblemDiagnostics(state.order) ? "badge warn" : "badge muted";
 }
 
 function renderPayment() {
@@ -441,27 +627,40 @@ function renderPayment() {
   els.qrPayload.value = qrData;
   els.qrImage.src = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&margin=10&format=svg&data=${encodeURIComponent(qrData)}`;
   els.paymentDetails.innerHTML = detailRows([
-    ["订单 ID", state.order.id],
-    ["external_id", state.order.external_id],
-    ["状态", statusLabel(state.order.status)],
-    ["链 ID", state.order.payment.chain_id],
-    ["Token", `${state.order.payment.token_symbol} (${state.order.payment.token_address})`],
-    ["金额", `${state.order.payment.amount} ${state.order.payment.token_symbol}`],
-    ["amount_raw", state.order.payment.amount_raw],
-    ["paid_amount_raw", state.order.payment.paid_amount_raw],
-    ["收款地址", state.order.payment.receive_address],
-    ["过期时间", formatDate(state.order.payment.expires_at)],
-    ["监控到", formatDate(state.order.payment.monitor_until)],
-  ]);
+    ...orderDetailRows(state.order),
+  ].concat(diagnosticRows(state.order)));
 }
 
 function renderWait() {
   const order = state.order;
-  els.orderStatusText.textContent = order ? statusLabel(order.status) : "未创建";
+  els.orderStatusText.textContent = order ? orderStatusLabel(order) : "未创建";
   els.paidRawText.textContent = order?.payment?.paid_amount_raw || "0";
   els.lastPollText.textContent = state.lastPollAt ? state.lastPollAt.toLocaleTimeString() : "-";
   els.verifyResult.textContent = state.verifyResult ? JSON.stringify(state.verifyResult, null, 2) : "";
+  renderProblemPaymentAcceptButton(els.acceptProblemPaymentBtn, order);
   renderCountdown();
+}
+
+function renderManual() {
+  const order = state.manualOrder;
+  const hasOrder = Boolean(order);
+  els.manualEmptyState.classList.toggle("hidden", hasOrder);
+  els.manualView.classList.toggle("hidden", !hasOrder);
+  const acceptState = renderProblemPaymentAcceptButton(els.manualAcceptProblemPaymentBtn, order);
+  els.manualActionHelp.textContent = acceptState.reason;
+
+  if (!hasOrder) {
+    els.manualStatusText.textContent = "-";
+    els.manualDetails.innerHTML = "";
+    els.manualJson.textContent = "";
+    return;
+  }
+
+  els.manualStatusText.textContent = orderStatusLabel(order);
+  els.manualDetails.innerHTML = detailRows(
+    orderDetailRows(order).concat([["人工处理", manualActionLabel(order)]], diagnosticRows(order)),
+  );
+  els.manualJson.textContent = JSON.stringify(order, null, 2);
 }
 
 function renderSuccess() {
@@ -475,7 +674,7 @@ function renderSuccess() {
   els.successDetails.innerHTML = detailRows([
     ["订单 ID", state.order.id],
     ["external_id", state.order.external_id],
-    ["状态", statusLabel(state.order.status)],
+    ["状态", orderStatusLabel(state.order)],
     ["金额", `${state.order.payment.amount} ${state.order.payment.token_symbol}`],
     ["paid_amount_raw", state.order.payment.paid_amount_raw],
     ["收款地址", state.order.payment.receive_address],
@@ -632,6 +831,46 @@ function detailRows(rows) {
     .join("");
 }
 
+function orderDetailRows(order) {
+  if (!order?.payment) {
+    return [
+      ["订单 ID", order?.id],
+      ["external_id", order?.external_id],
+      ["状态", orderStatusLabel(order)],
+    ];
+  }
+
+  return [
+    ["订单 ID", order.id],
+    ["external_id", order.external_id],
+    ["状态", orderStatusLabel(order)],
+    ["链 ID", order.payment.chain_id],
+    ["Token", `${order.payment.token_symbol} (${order.payment.token_address})`],
+    ["金额", `${order.payment.amount} ${order.payment.token_symbol}`],
+    ["amount_raw", order.payment.amount_raw],
+    ["paid_amount_raw", order.payment.paid_amount_raw],
+    ["收款地址", order.payment.receive_address],
+    ["过期时间", formatDate(order.payment.expires_at)],
+    ["监控到", formatDate(order.payment.monitor_until)],
+  ];
+}
+
+function setManualOrder(order) {
+  state.manualOrder = order;
+  if (order?.id) {
+    els.manualOrderId.value = order.id;
+  }
+  if (order?.external_id) {
+    els.manualExternalId.value = order.external_id;
+  }
+}
+
+function syncManualOrderFromCurrent() {
+  if (state.order?.id && state.manualOrder?.id === state.order.id) {
+    setManualOrder(state.order);
+  }
+}
+
 function setTab(tab) {
   document.querySelectorAll("[data-tab]").forEach((button) => {
     button.classList.toggle("active", button.dataset.tab === tab);
@@ -696,6 +935,22 @@ function tokenMetaText() {
   return `${exposed}。长期测试 token。`;
 }
 
+function orderStatusLabel(order) {
+  if (!order) {
+    return "未知";
+  }
+  const base = statusLabel(order.status);
+  const diagnostics = order.diagnostics;
+  if (!diagnostics?.state) {
+    return base;
+  }
+  const diagnostic = diagnosticStateLabel(diagnostics.state);
+  if (!diagnostic || diagnostics.state === "awaiting_payment" || diagnostics.state === "no_issue") {
+    return base;
+  }
+  return `${base} / ${diagnostic}`;
+}
+
 function statusLabel(status) {
   const labels = {
     pending: "待支付",
@@ -703,6 +958,165 @@ function statusLabel(status) {
     confirming: "确认中",
     paid: "已支付",
     expired: "已过期",
+  };
+  return labels[status] || status || "未知";
+}
+
+function diagnosticStateLabel(state) {
+  const labels = {
+    awaiting_payment: "等待付款",
+    no_issue: "正常",
+    expired_no_payment: "已过期，未收到付款",
+    problem_payment_observed: "收到问题付款，等待确认",
+    problem_payment_confirmed: "收到已确认问题付款",
+    problem_funds_collecting: "问题资金归集中",
+    problem_funds_collected: "迟到付款已归集",
+    problem_payment_accepted: "人工已接受问题付款",
+  };
+  return labels[state] || state || "";
+}
+
+function hasProblemDiagnostics(order) {
+  return [
+    "problem_payment_observed",
+    "problem_payment_confirmed",
+    "problem_funds_collecting",
+    "problem_funds_collected",
+    "problem_payment_accepted",
+  ].includes(order?.diagnostics?.state);
+}
+
+function canAcceptProblemPayment(order) {
+  return hasProblemDiagnostics(order) && order?.status !== "paid" && !order?.diagnostics?.manual_acceptance;
+}
+
+function problemPaymentAcceptState(order) {
+  if (canAcceptProblemPayment(order)) {
+    return {
+      canAccept: true,
+      label: "接受问题付款",
+      reason: "检测到可人工接受的问题付款，确认后会把订单标记为已支付。",
+    };
+  }
+  if (!order) {
+    return { canAccept: false, label: "接受问题付款", reason: "先载入订单。" };
+  }
+  if (order?.diagnostics?.manual_acceptance) {
+    return {
+      canAccept: false,
+      label: "已人工接受",
+      reason: "这笔订单已经人工接受过问题付款，不能重复处理。",
+    };
+  }
+  if (order.status === "paid") {
+    return { canAccept: false, label: "订单已支付", reason: "这笔订单已经是已支付状态，无需人工接受。" };
+  }
+  if (!hasProblemDiagnostics(order)) {
+    return { canAccept: false, label: "无问题付款", reason: "当前订单没有可人工接受的问题付款诊断。" };
+  }
+  return { canAccept: false, label: "不可处理", reason: "当前诊断状态还不能人工接受，请先等待链上确认或刷新订单。" };
+}
+
+function renderProblemPaymentAcceptButton(button, order) {
+  const acceptState = problemPaymentAcceptState(order);
+  button.disabled = !acceptState.canAccept;
+  button.textContent = acceptState.label;
+  button.title = acceptState.reason;
+  return acceptState;
+}
+
+function manualActionLabel(order) {
+  if (!order) {
+    return "未载入";
+  }
+  if (canAcceptProblemPayment(order)) {
+    return "可接受问题付款";
+  }
+  if (order.status === "paid") {
+    return "订单已是已支付";
+  }
+  if (order?.diagnostics?.manual_acceptance) {
+    return "已人工接受";
+  }
+  if (!hasProblemDiagnostics(order)) {
+    return "没有问题付款诊断";
+  }
+  return "当前状态不能人工接受";
+}
+
+function diagnosticRows(order) {
+  const diagnostics = order?.diagnostics;
+  if (!diagnostics) {
+    return [];
+  }
+
+  const rows = [["诊断状态", diagnosticStateLabel(diagnostics.state)]];
+  if (Number(diagnostics.problem_payment_count || 0) > 0) {
+    rows.push(["问题付款总额 raw", diagnostics.problem_payment_total_raw]);
+    rows.push(["late 付款", `${diagnostics.late_payment_count} 笔 / ${diagnostics.late_payment_total_raw} raw`]);
+    rows.push([
+      "outside_window 付款",
+      `${diagnostics.outside_window_payment_count} 笔 / ${diagnostics.outside_window_payment_total_raw} raw`,
+    ]);
+  }
+
+  const payment = diagnostics.latest_problem_payment;
+  if (payment) {
+    rows.push(["最新问题付款 tx", payment.tx_hash]);
+    rows.push(["最新问题付款状态", `${paymentStatusLabel(payment.match_status)} / ${chainStatusLabel(payment.chain_status)}`]);
+    rows.push(["最新问题付款区块", payment.block_number]);
+    rows.push(["最新问题付款时间", formatDate(payment.block_time)]);
+    rows.push(["最新问题付款确认数", payment.confirmations]);
+  }
+
+  const collection = diagnostics.problem_collection;
+  if (collection) {
+    rows.push(["问题资金归集状态", collectionStatusLabel(collection.status)]);
+    rows.push(["问题资金归集金额 raw", collection.amount_raw || "max"]);
+    rows.push(["问题资金归集 outbound", collection.outbound_tx_id || "-"]);
+    rows.push(["问题资金归集地址", collection.to_address]);
+    rows.push(["问题资金归集更新时间", formatDate(collection.updated_at)]);
+  }
+
+  const acceptance = diagnostics.manual_acceptance;
+  if (acceptance) {
+    rows.push(["人工接受金额 raw", acceptance.accepted_problem_payment_raw]);
+    rows.push(["人工接受人", acceptance.accepted_by]);
+    rows.push(["人工接受原因", acceptance.reason || "-"]);
+    rows.push(["人工接受时间", formatDate(acceptance.updated_at)]);
+  }
+
+  return rows;
+}
+
+function paymentStatusLabel(status) {
+  const labels = {
+    on_time: "按时",
+    late: "迟到",
+    outside_window: "窗口外",
+  };
+  return labels[status] || status || "未知";
+}
+
+function chainStatusLabel(status) {
+  const labels = {
+    observed: "已观察",
+    confirmed: "已确认",
+    orphaned: "已孤立",
+  };
+  return labels[status] || status || "未知";
+}
+
+function collectionStatusLabel(status) {
+  const labels = {
+    queued: "已排队",
+    transferring: "转账中",
+    confirming: "确认中",
+    confirmed: "已确认",
+    failed: "失败",
+    dropped: "已丢弃",
+    replacing: "替换中",
+    replaced: "已替换",
   };
   return labels[status] || status || "未知";
 }

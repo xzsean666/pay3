@@ -13,8 +13,8 @@ pub use audit::{AuditRepository, PgAuditRepository};
 pub use collections::{CollectionRepository, PgCollectionRepository};
 pub use error::{RepositoryError, RepositoryResult};
 pub use orders::{
-    AllocatedDerivation, CreateOrderOutcome, ExpiredOrderRepository, OrderRepository,
-    PaymentWindowCandidateRepository, PgOrderRepository,
+    AllocatedDerivation, CreateOrderOutcome, ExpiredOrderRepository, OrderDiagnosticsRepository,
+    OrderRepository, PaymentWindowCandidateRepository, PgOrderRepository,
 };
 pub use outbound::{OutboundRepository, PgOutboundRepository};
 pub use payments::{PaymentRepository, PgPaymentRepository};

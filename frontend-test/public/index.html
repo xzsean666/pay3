@@ -29,6 +29,7 @@
         <button class="tab" type="button" data-tab="create">创建订单</button>
         <button class="tab" type="button" data-tab="pay">二维码</button>
         <button class="tab" type="button" data-tab="wait">等待支付</button>
+        <button class="tab" type="button" data-tab="manual">人工处理</button>
         <button class="tab" type="button" data-tab="success">成功页</button>
         <button class="tab" type="button" data-tab="logs">日志</button>
       </nav>
@@ -189,9 +190,56 @@
             <span>轮询前自动调用 verify</span>
           </label>
           <button id="verifyOnceBtn" type="button" class="button">手动 verify</button>
+          <button id="acceptProblemPaymentBtn" type="button" class="button">接受问题付款</button>
         </div>
 
         <pre id="verifyResult" class="json-output"></pre>
+      </section>
+
+      <section id="panel-manual" class="panel" data-panel="manual">
+        <div class="panel-head">
+          <div>
+            <h2>人工处理</h2>
+            <p>查询问题订单，确认迟到或窗口外付款后手动标记为已支付。</p>
+          </div>
+          <div class="button-row">
+            <button id="manualUseCurrentOrderBtn" type="button" class="button">载入当前订单</button>
+            <button id="manualRefreshBtn" type="button" class="button">刷新</button>
+          </div>
+        </div>
+
+        <div class="form-grid">
+          <label class="field">
+            <span>订单 ID</span>
+            <input id="manualOrderId" autocomplete="off" placeholder="0620d6bb-..." />
+          </label>
+          <label class="field">
+            <span>external_id</span>
+            <input id="manualExternalId" autocomplete="off" placeholder="frontend-test-..." />
+          </label>
+          <label class="field span-2">
+            <span>处理原因</span>
+            <textarea id="manualReason" rows="3" spellcheck="false">frontend-test manual accept problem payment</textarea>
+          </label>
+          <div class="form-actions span-2">
+            <button id="manualLoadByIdBtn" type="button" class="button">按订单 ID 查询</button>
+            <button id="manualLoadByExternalIdBtn" type="button" class="button">按 external_id 查询</button>
+            <button id="manualAcceptProblemPaymentBtn" type="button" class="button primary">接受问题付款</button>
+          </div>
+          <p id="manualActionHelp" class="manual-action-help span-2 hint">先载入订单。</p>
+        </div>
+
+        <div id="manualEmptyState" class="empty-state manual-empty">还没有载入订单。</div>
+        <div id="manualView" class="manual-layout hidden">
+          <div>
+            <div class="manual-status-line">
+              <span class="label">当前处理订单</span>
+              <strong id="manualStatusText">-</strong>
+            </div>
+            <dl id="manualDetails" class="detail-list"></dl>
+          </div>
+          <pre id="manualJson" class="json-output"></pre>
+        </div>
       </section>
 
       <section id="panel-success" class="panel" data-panel="success">
