@@ -5,7 +5,7 @@
 #!/deploy/prebuilt/README.md
 frontend-test/.wrangler/
 frontend-test/node_modules/
-
+envs/
 # Local/editor files
 .DS_Store
 Thumbs.db
