@@ -1,12 +1,12 @@
 use crate::{
-    chain::ChainHeaderReader,
+    chain::{ChainHeaderReader, TransferLogRange, TransferLogSource},
     db::repositories::{OrderRepository, PaymentRecord},
     domain::{PaymentFact, recompute_order_status},
     services::{
         orders::Clock,
-        payments::{StoredPaymentMatchInput, match_stored_transfer_logs},
+        payments::match_transfer_logs,
     },
-    transfer_log_store::{StreamId, TransferLogReader},
+    transfer_log_store::StreamId,
 };
 use uuid::Uuid;
 
@@ -15,20 +15,20 @@ use super::{
     manual_status_from_order_status, recorder::VerifiedPaymentRecorder,
 };
 
-pub struct ManualOrderVerifyService<O, R, L, H, C> {
+pub struct ManualOrderVerifyService<O, R, S, H, C> {
     orders: O,
     recorder: R,
-    log_reader: L,
+    log_source: S,
     head_reader: H,
     clock: C,
     config: ManualVerifyConfig,
 }
 
-impl<O, R, L, H, C> ManualOrderVerifyService<O, R, L, H, C> {
+impl<O, R, S, H, C> ManualOrderVerifyService<O, R, S, H, C> {
     pub const fn new(
         orders: O,
         recorder: R,
-        log_reader: L,
+        log_source: S,
         head_reader: H,
         clock: C,
         config: ManualVerifyConfig,
@@ -36,7 +36,7 @@ impl<O, R, L, H, C> ManualOrderVerifyService<O, R, L, H, C> {
         Self {
             orders,
             recorder,
-            log_reader,
+            log_source,
             head_reader,
             clock,
             config,
@@ -44,11 +44,11 @@ impl<O, R, L, H, C> ManualOrderVerifyService<O, R, L, H, C> {
     }
 }
 
-impl<O, R, L, H, C> ManualOrderVerifyService<O, R, L, H, C>
+impl<O, R, S, H, C> ManualOrderVerifyService<O, R, S, H, C>
 where
     O: OrderRepository,
     R: VerifiedPaymentRecorder,
-    L: TransferLogReader,
+    S: TransferLogSource,
     H: ChainHeaderReader,
     C: Clock,
 {
@@ -64,18 +64,20 @@ where
             .await?
             .ok_or(ManualVerifyError::OrderNotFound { order_id })?;
         let stream = StreamId::new(view.order.chain_id, view.order.token_address);
-        let cursor = self.log_reader.cursor(stream).await?;
         let from_block = view.payment_window.window_from_block.number;
-        let complete_to_block = cursor
-            .last_completed_block
-            .filter(|block| *block >= from_block)
-            .ok_or(ManualVerifyError::CoverageInsufficient { order_id })?;
+        let head = self.head_reader.latest_head().await?;
+        if head.number < from_block {
+            return Err(ManualVerifyError::CoverageInsufficient { order_id });
+        }
+        let complete_to_block = head.number;
 
-        let read_limit = self.config.max_logs_per_order.saturating_add(1);
-        let logs = self
-            .log_reader
-            .logs_in_range(stream, from_block, complete_to_block, read_limit)
-            .await?;
+        let range = TransferLogRange::new(
+            stream.chain_id,
+            stream.token_address,
+            from_block,
+            complete_to_block,
+        );
+        let logs = self.log_source.transfer_logs(range).await?;
         if logs.len() > self.config.max_logs_per_order {
             return Err(ManualVerifyError::LogLimitExceeded {
                 order_id,
@@ -83,20 +85,16 @@ where
             });
         }
 
-        let head = self.head_reader.latest_head().await?;
-        let match_page = match_stored_transfer_logs(
+        let candidate = candidate_from_order_view(&view);
+        let matched_payments = match_transfer_logs(
             stream,
             self.config.min_confirmations,
-            StoredPaymentMatchInput {
-                logs,
-                candidates: vec![candidate_from_order_view(&view)],
-                head,
-                next_token: None,
-                complete_to_block: Some(complete_to_block),
-                kv_reorg_epoch: cursor.reorg_epoch,
-            },
+            logs,
+            vec![candidate],
+            head,
         );
-        for payment in &match_page.matched_payments {
+
+        for payment in &matched_payments {
             let canonical_block = self
                 .head_reader
                 .block_by_number(payment.block_number)
@@ -109,10 +107,10 @@ where
                 });
             }
         }
-        let matched_count = match_page.matched_payments.len() as u64;
+        let matched_count = matched_payments.len() as u64;
         let records = self
             .recorder
-            .record_verified_payments(order_id, match_page.matched_payments)
+            .record_verified_payments(order_id, matched_payments)
             .await?;
         let decision = recompute_order_status(
             view.order.expected_amount_raw,

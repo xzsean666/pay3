@@ -18,28 +18,25 @@ flowchart TD
 
     subgraph ServiceLayer["业务服务层 (Services)"]
         OrderSvc["OrderService\n- Canonical Request Hash\n- HD Address Allocation\n- Window Management"]
-        VerifySvc["ManualOrderVerifyService\n- KV Range Lookup\n- Match Recomputation"]
+        VerifySvc["ManualOrderVerifyService\n- RPC Direct Scan\n- Match Recomputation"]
         PaymentSvc["PaymentMatching (Pure Logic)\n- On-time / Late Classification\n- Canonical Matching"]
         CollectSvc["CollectionService\n- Treasury-Only Target\n- Prefunded Gas Check\n- Nonce & Sign Persist"]
     end
 
     subgraph WorkerLayer["异步后台 Worker (Workers)"]
-        IngestorLoop["TransferLogIngestor\n- Poll RPC Transfer Logs\n- Capacity Probe\n- Reorg Rewind"]
-        ScannerLoop["PaymentScanner\n- Lease & CAS Cursors\n- Paged Match from KV\n- Confirmation Sweep"]
+        ScannerLoop["PaymentScanner\n- Lease & CAS Cursors\n- Direct RPC Log Scan\n- Memory Window Match\n- Confirmation Sweep"]
         CollectorLoop["CollectionCollector\n- Replay Signed Outbound\n- Broadcast Raw Tx\n- Receipt Sweep & Replace"]
         ExpiryLoop["OrderExpiry\n- Expire Unpaid Orders"]
-        RetentionLoop["RetentionCleanup\n- Clean Outdated KV Logs"]
     end
 
-    subgraph StorageLayer["双存储架构 (Dual Storage)"]
-        Postgres[("PostgreSQL (唯一资金真相源)\n- orders / child_accounts\n- payment_windows / payments\n- collections / account_nonces\n- outbound_transactions\n- chain_cursors / audit_events")]
-        RedbKV[("redb KVDB (可重建原始事件缓存)\n- transfer_logs\n- block_headers\n- range_manifests\n- kv_cursors (reorg_epoch)")]
+    subgraph StorageLayer["持久化真相层 (PostgreSQL)"]
+        Postgres[("PostgreSQL (唯一资金真相源，100% 无状态运行时)\n- orders / child_accounts\n- payment_windows / payments\n- collections / account_nonces\n- outbound_transactions\n- chain_cursors / audit_events")]
     end
 
     subgraph InfraLayer["底层基础设施与外设适配 (Infrastructure)"]
         HDWallet["HD Wallet (BIP44/Rollover)"]
         SignerAdapter["SignerProvider (KMS / Remote HTTP / Fake)"]
-        RpcManager["RpcProviderManager (Failover + Capacity Probe)"]
+        RpcManager["RpcProviderManager (Atomic Round-Robin + Multi-tier CD + Retry)"]
     end
 
     ApiLayer --> OrderSvc
@@ -50,17 +47,13 @@ flowchart TD
     OrderSvc --> HDWallet
     OrderSvc --> RpcManager
 
-    VerifySvc --> RedbKV
+    VerifySvc --> RpcManager
     VerifySvc --> Postgres
     VerifySvc --> PaymentSvc
 
-    IngestorLoop --> RpcManager
-    IngestorLoop --> RedbKV
-
-    ScannerLoop --> RedbKV
+    ScannerLoop --> RpcManager
     ScannerLoop --> Postgres
     ScannerLoop --> PaymentSvc
-    ScannerLoop --> RpcManager
 
     CollectorLoop --> CollectSvc
     CollectorLoop --> Postgres
@@ -75,29 +68,26 @@ flowchart TD
 系统内部各模块的职责与依赖关系严格限定：
 
 ```text
-api -> services -> repositories / transfer_log_store / chain / wallet / signer / outbound
+api -> services -> repositories / chain / wallet / signer / outbound
 services -> domain
 repositories -> domain
 chain / signer / outbound -> domain (仅引用基础值对象)
-transfer_log_store -> chain + redb + domain (仅引用值对象)
 ```
 
 ### 绝对禁止的依赖越界：
 - `api` 严禁直接拼装或执行 SQL，必须通过 `services` 或 `repositories`。
 - `db` 严禁调用外部区块链 RPC 或签名器。
 - `chain` 严禁感知任何 API 协议或 HTTP DTO。
-- `services/payments` 严禁直接发起 `eth_getLogs`，必须通过 `transfer_log_store::TransferLogReader` 读取本地 KV。
-- `transfer_log_store` 严禁查询 PostgreSQL，不感知订单或支付窗口。
-- 本地 KV（redb）绝不可作为资金状态来源，绝不保存私钥或敏感 Secret。
+- 业务资金状态严格由 PostgreSQL 事务维护，禁止引入本地临时持久化文件。
+- 绝不保存私钥或敏感 Secret 在非加密存储中。
 
 ---
 
-## 3. 双存储职责划分 (Dual-Storage Strategy)
+## 3. 存储与无状态设计 (100% Stateless Container Runtime)
 
-| 存储引擎 | 定位 | 保存内容 | 故障/丢失后果 |
+| 存储引擎 | 定位 | 保存内容 | 运维与可靠性 |
 | :--- | :--- | :--- | :--- |
-| **PostgreSQL** | **唯一权威资金真相源** | 订单状态、关联子地址、支付窗口、已匹配到 Pay3 的 payments、业务扫描游标 `chain_cursors`、归集单、Nonce 预留、Outbound 事务、资金审计事件。 | 不可丢失，需开启 WAL、归档与 PITR 备份保障。 |
-| **redb (KVDB)** | **可重建原始数据缓存** | 对应链与代币的全量原始 ERC20 `Transfer` 日志、区块头缓存、扫描 Range Manifest、KV 游标及 `reorg_epoch`。 | 可随时从链上 RPC 重新同步拉取与回放，不影响已有资金记账。 |
+| **PostgreSQL** | **唯一权威资金真相源** | 订单状态、关联子地址、支付窗口、已匹配到 Pay3 的 payments、业务扫描游标 `chain_cursors`、归集单、Nonce 预留、Outbound 事务、资金审计事件。 | 不可丢失，需开启 WAL、归档与 PITR 备份保障。应用容器不挂载任何数据卷，100% 无状态启动与水平部署。 |
 
 ---
 
@@ -111,20 +101,13 @@ transfer_log_store -> chain + redb + domain (仅引用值对象)
 5. 派生生成唯一的 `receive_address`。
 6. 开启事务落盘 `child_accounts`、`orders`、`payment_windows`。一个地址永久属于该订单，数据库级别强制唯一约束。
 
-### 4.2 ERC20 日志摄入与容量防护 (Transfer Log Ingestion)
-1. `transfer_log_ingestor` 定时从 KV 游标的 `next_block` 开始拉取事件。
-2. 拉取前通过 `TransferLogSource::capacity_probe` 探测近期区块日志密度。若单块超阈值或超出服务能力，触发 Fail-Closed，不推进游标并拉响告警。
-3. 滚动比对前置区块 Hash。若检测到链分叉（Reorg），触发 KV 回滚：删除分叉块及后续 headers/logs，递增 `reorg_epoch`。
-4. 原子写入 redb：保存区块头、raw logs、更新 KV 游标。
-
-### 4.3 扫链匹配与确认 (Payment Scanner & Confirmation)
-1. `workers/scanner` 获取 PostgreSQL `chain_cursors` 的排他 Lease。
-2. 检查当前 KV `reorg_epoch`。若发现新 epoch，调用 Repository 回退业务游标，将分叉影响的支付标记为 `orphaned` 并重算受影响订单。
-3. 分页调用 `TransferLogReader::logs_page` 顺序消费 KV 日志。
-4. 结合 `PaymentWindowLookup`（内存活跃订单缓存 + PostgreSQL 批量 Fallback）识别本平台目标地址。
-5. 匹配支付记录并判断时效（`on_time`、`late`、`outside_window`）。
-6. 单事务提交匹配的支付记录、更新订单金额与状态、推进 PostgreSQL 游标。
-7. 空闲 Tick 执行 Confirmation Sweep：校验 stored block hash 仍然为规范链块（canonical），满足 `MIN_CONFIRMATIONS` 后推进为 `confirmed`。
+### 4.2 直连扫链匹配与确认 (Direct-to-Postgres Payment Scanner & Confirmation)
+1. `workers/scanner` 获取 PostgreSQL `chain_cursors` 的排他 Lease 与 CAS 检查。
+2. 通过 `RpcRangeSource`（带负载均衡与智能熔断）直接调用 `eth_getLogs` 批量拉取区间内的 Transfer 事件。
+3. 结合 `PaymentWindowLookup`（内存活跃订单缓存 + PostgreSQL 批量 Fallback）在内存中快速比对本平台活跃收款地址。
+4. 匹配支付记录并判断时效（`on_time`、`late`、`outside_window`），未命中本平台的非相关交易直接丢弃，不落盘。
+5. 单事务提交命中的支付记录、更新订单金额与状态、推进 PostgreSQL 游标。
+6. 空闲 Tick 执行 Confirmation Sweep：校验 stored block hash 仍然为规范链块（canonical），满足 `MIN_CONFIRMATIONS` 后推进为 `confirmed`。
 
 ### 4.4 资金归集与崩溃恢复 (Collection & Outbound Lifecycle)
 1. 调用方请求 `POST /v1/collections`（仅限 `collections:create` scope）。

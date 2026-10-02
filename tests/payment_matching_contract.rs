@@ -1,146 +1,75 @@
-pub mod chain {
-    pub use pay3::chain::*;
-}
-
-pub mod db {
-    pub use pay3::db::*;
-}
-
-pub mod domain {
-    pub use pay3::domain::*;
-}
-
-pub mod transfer_log_store {
-    pub use pay3::transfer_log_store::*;
-}
-
-#[allow(dead_code)]
-#[path = "../src/services/payment_windows.rs"]
-mod payment_windows;
-
-pub mod services {
-    pub mod payment_windows {
-        pub use crate::payment_windows::*;
-    }
-}
-
-#[allow(dead_code)]
-#[path = "../src/services/payments.rs"]
-mod payments;
-
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use pay3::{
-    chain::{ChainBlock, ChainError, ChainHeaderReader},
+    chain::{
+        ChainBlock, ChainError, ChainHeaderReader, TransferLog, TransferLogCapacityLimits,
+        TransferLogCapacityReport, TransferLogRange, TransferLogSource,
+    },
     db::repositories::PaymentWindowCandidate,
     domain::{
         BlockHash, ChainBlockRef, EvmAddress, OrderStatus, PaymentChainStatus, PaymentMatchStatus,
         RawAmount, TxHash,
     },
-    transfer_log_store::{
-        LogPageToken, LogsPage, ScanTargetMode, StoredBlockHeader, StoredTransferLog, StreamId,
-        TransferLogCursor, TransferLogReader, TransferLogStoreError,
+    services::{
+        payment_windows::{PaymentWindowLookup, PaymentWindowLookupError},
+        payments::{PaymentMatcher, PaymentMatchingConfig},
     },
+    transfer_log_store::StreamId,
 };
-use payment_windows::{PaymentWindowLookup, PaymentWindowLookupError};
-use payments::{PaymentMatcher, PaymentMatchingConfig, PaymentRejectionReason, RejectedPaymentLog};
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
-type LogReaderCall = (Option<LogPageToken>, usize);
 type LookupCall = (u64, EvmAddress, Vec<EvmAddress>);
 
 #[derive(Clone, Debug)]
-struct FakeLogReader {
-    stream: StreamId,
-    logs: Arc<Vec<StoredTransferLog>>,
-    complete_to_block: Option<u64>,
-    reorg_epoch: u64,
-    calls: Arc<Mutex<Vec<LogReaderCall>>>,
+struct FakeTransferLogSource {
+    logs: Arc<Vec<TransferLog>>,
+    calls: Arc<Mutex<Vec<TransferLogRange>>>,
 }
 
-impl FakeLogReader {
-    fn new(stream: StreamId, logs: Vec<StoredTransferLog>) -> Self {
+impl FakeTransferLogSource {
+    fn new(logs: Vec<TransferLog>) -> Self {
         Self {
-            stream,
             logs: Arc::new(logs),
-            complete_to_block: Some(99),
-            reorg_epoch: 7,
             calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
-    fn calls(&self) -> Vec<LogReaderCall> {
+    fn calls(&self) -> Vec<TransferLogRange> {
         self.calls
             .lock()
-            .expect("reader calls lock poisoned")
+            .expect("source calls lock poisoned")
             .clone()
     }
 }
 
 #[async_trait]
-impl TransferLogReader for FakeLogReader {
-    async fn cursor(&self, _stream: StreamId) -> Result<TransferLogCursor, TransferLogStoreError> {
-        Ok(TransferLogCursor {
-            stream: self.stream,
-            start_block: 1,
-            next_block: 100,
-            last_completed_block: self.complete_to_block,
-            last_completed_hash: None,
-            target_mode: ScanTargetMode::SafeTag,
-            reorg_epoch: self.reorg_epoch,
-            last_reorg_from: None,
-            last_reorg_at: None,
-            writer_epoch: 1,
-            updated_at: now(),
-        })
-    }
-
-    async fn block_header(
-        &self,
-        _stream: StreamId,
-        _block: u64,
-    ) -> Result<Option<StoredBlockHeader>, TransferLogStoreError> {
-        Ok(None)
-    }
-
-    async fn logs_in_range(
-        &self,
-        _stream: StreamId,
-        _from: u64,
-        _to: u64,
-        _max_logs: usize,
-    ) -> Result<Vec<StoredTransferLog>, TransferLogStoreError> {
-        Ok(Vec::new())
-    }
-
-    async fn logs_page(
-        &self,
-        stream: StreamId,
-        after: Option<LogPageToken>,
-        limit: usize,
-    ) -> Result<LogsPage, TransferLogStoreError> {
+impl TransferLogSource for FakeTransferLogSource {
+    async fn transfer_logs(&self, range: TransferLogRange) -> Result<Vec<TransferLog>, ChainError> {
         self.calls
             .lock()
-            .expect("reader calls lock poisoned")
-            .push((after, limit));
-
-        let logs = self
+            .expect("source calls lock poisoned")
+            .push(range);
+        Ok(self
             .logs
             .iter()
-            .filter(|log| after.is_none_or(|token| token.includes_log_exclusively(log)))
-            .take(limit)
+            .filter(|log| log.block.number >= range.from_block && log.block.number <= range.to_block)
             .cloned()
-            .collect::<Vec<_>>();
-        let next_token = logs.last().map(LogPageToken::from_log);
+            .collect())
+    }
 
-        Ok(LogsPage::new(
-            stream,
-            logs,
-            next_token,
-            self.complete_to_block,
-        ))
+    async fn capacity_probe(
+        &self,
+        range: TransferLogRange,
+        limits: TransferLogCapacityLimits,
+    ) -> Result<TransferLogCapacityReport, ChainError> {
+        Ok(TransferLogCapacityReport {
+            range,
+            log_count: 0,
+            max_logs_in_single_block: 0,
+            limits,
+        })
     }
 }
 
@@ -220,48 +149,46 @@ impl ChainHeaderReader for FakeHeadReader {
 }
 
 #[tokio::test]
-async fn payment_matching_passes_page_token_and_batches_unique_to_addresses() {
+async fn payment_matching_batches_unique_to_addresses() {
     let stream = stream();
-    let first = stored_log(stream, 10, 1, address(10), 10);
-    let second_same_to = stored_log(stream, 11, 2, address(10), 11);
-    let third = stored_log(stream, 12, 3, address(20), 12);
-    let after = Some(LogPageToken::new(9, 9));
-    let reader = FakeLogReader::new(
-        stream,
-        vec![first.clone(), second_same_to.clone(), third.clone()],
-    );
+    let first = transfer_log(stream, 10, 1, address(10), 10);
+    let second_same_to = transfer_log(stream, 11, 2, address(10), 11);
+    let third = transfer_log(stream, 12, 3, address(20), 12);
+    let source = FakeTransferLogSource::new(vec![first.clone(), second_same_to.clone(), third.clone()]);
     let lookup = FakeWindowLookup::with_candidates(vec![
         candidate(1, stream, address(10), 1, 20),
         candidate(2, stream, address(20), 1, 20),
     ]);
 
-    let page = matcher(reader.clone(), lookup.clone(), 3, 2, 10)
-        .match_next_page(after)
+    let matched = matcher(source.clone(), lookup.clone(), 20, 10)
+        .match_range(10, 12)
         .await
         .unwrap();
 
-    assert_eq!(reader.calls(), vec![(after, 2)]);
+    assert_eq!(
+        source.calls(),
+        vec![TransferLogRange::new(
+            stream.chain_id,
+            stream.token_address,
+            10,
+            12
+        )]
+    );
     assert_eq!(
         lookup.calls(),
-        vec![(stream.chain_id, stream.token_address, vec![address(10)],)],
-        "lookup input must contain only unique addresses in the current page"
+        vec![(stream.chain_id, stream.token_address, vec![address(10), address(20)])],
+        "lookup input must contain only unique addresses across logs in the range"
     );
-    assert_eq!(
-        page.next_token,
-        Some(LogPageToken::from_log(&second_same_to))
-    );
-    assert_eq!(page.complete_to_block, Some(99));
-    assert_eq!(page.kv_reorg_epoch, 7);
-    assert_eq!(page.matched_payments.len(), 2);
+    assert_eq!(matched.len(), 3);
 }
 
 #[tokio::test]
 async fn payment_matching_classifies_on_time_late_and_outside_window_by_block_timestamp() {
     let stream = stream();
     let logs = vec![
-        stored_log(stream, 10, 1, address(10), 10),
-        stored_log(stream, 11, 2, address(20), 16),
-        stored_log(stream, 12, 3, address(30), 40),
+        transfer_log(stream, 10, 1, address(10), 10),
+        transfer_log(stream, 11, 2, address(20), 16),
+        transfer_log(stream, 12, 3, address(30), 40),
     ];
     let lookup = FakeWindowLookup::with_candidates(vec![
         candidate(1, stream, address(10), 10, 15),
@@ -269,13 +196,12 @@ async fn payment_matching_classifies_on_time_late_and_outside_window_by_block_ti
         candidate(3, stream, address(30), 20, 30),
     ]);
 
-    let page = matcher(FakeLogReader::new(stream, logs), lookup, 20, 10, 10)
-        .match_next_page(None)
+    let matched = matcher(FakeTransferLogSource::new(logs), lookup, 20, 10)
+        .match_range(10, 12)
         .await
         .unwrap();
 
-    let statuses = page
-        .matched_payments
+    let statuses = matched
         .iter()
         .map(|payment| payment.match_status)
         .collect::<Vec<_>>();
@@ -288,7 +214,7 @@ async fn payment_matching_classifies_on_time_late_and_outside_window_by_block_ti
         ]
     );
     assert_eq!(
-        page.matched_payments[1].block_time,
+        matched[1].block_time,
         now() + Duration::seconds(16)
     );
 }
@@ -296,31 +222,30 @@ async fn payment_matching_classifies_on_time_late_and_outside_window_by_block_ti
 #[tokio::test]
 async fn payment_matching_marks_observed_until_required_confirmations_are_reached() {
     let stream = stream();
-    let logs = vec![stored_log(stream, 10, 1, address(10), 10)];
+    let logs = vec![transfer_log(stream, 10, 1, address(10), 10)];
     let lookup = FakeWindowLookup::with_candidates(vec![candidate(1, stream, address(10), 1, 20)]);
 
     let observed = matcher(
-        FakeLogReader::new(stream, logs.clone()),
+        FakeTransferLogSource::new(logs.clone()),
         lookup.clone(),
         11,
-        10,
         3,
     )
-    .match_next_page(None)
+    .match_range(10, 10)
     .await
     .unwrap();
-    assert_eq!(observed.matched_payments[0].confirmations, 2);
+    assert_eq!(observed[0].confirmations, 2);
     assert_eq!(
-        observed.matched_payments[0].chain_status,
+        observed[0].chain_status,
         PaymentChainStatus::Observed
     );
 
-    let confirmed = matcher(FakeLogReader::new(stream, logs), lookup, 11, 10, 2)
-        .match_next_page(None)
+    let confirmed = matcher(FakeTransferLogSource::new(logs), lookup, 11, 2)
+        .match_range(10, 10)
         .await
         .unwrap();
     assert_eq!(
-        confirmed.matched_payments[0].chain_status,
+        confirmed[0].chain_status,
         PaymentChainStatus::Confirmed
     );
 }
@@ -328,19 +253,17 @@ async fn payment_matching_marks_observed_until_required_confirmations_are_reache
 #[tokio::test]
 async fn payment_matching_does_not_generate_payments_without_candidates() {
     let stream = stream();
-    let page = matcher(
-        FakeLogReader::new(stream, vec![stored_log(stream, 10, 1, address(10), 10)]),
+    let matched = matcher(
+        FakeTransferLogSource::new(vec![transfer_log(stream, 10, 1, address(10), 10)]),
         FakeWindowLookup::default(),
         20,
-        10,
         1,
     )
-    .match_next_page(None)
+    .match_range(10, 10)
     .await
     .unwrap();
 
-    assert!(page.matched_payments.is_empty());
-    assert!(page.rejected.is_empty());
+    assert!(matched.is_empty());
 }
 
 #[tokio::test]
@@ -355,59 +278,46 @@ async fn payment_matching_filters_candidate_chain_and_token_mismatches() {
         ..candidate(2, stream, address(10), 1, 20)
     };
 
-    let page = matcher(
-        FakeLogReader::new(stream, vec![stored_log(stream, 10, 1, address(10), 10)]),
+    let matched = matcher(
+        FakeTransferLogSource::new(vec![transfer_log(stream, 10, 1, address(10), 10)]),
         FakeWindowLookup::with_candidates(vec![bad_chain, bad_token]),
         20,
-        10,
         1,
     )
-    .match_next_page(None)
+    .match_range(10, 10)
     .await
     .unwrap();
 
-    assert!(page.matched_payments.is_empty());
-    assert!(page.rejected.is_empty());
+    assert!(matched.is_empty());
 }
 
 #[tokio::test]
-async fn payment_matching_rejects_ambiguous_candidates_for_the_same_log() {
+async fn payment_matching_ignores_ambiguous_candidates_for_the_same_log() {
     let stream = stream();
-    let page = matcher(
-        FakeLogReader::new(stream, vec![stored_log(stream, 10, 1, address(10), 10)]),
+    let matched = matcher(
+        FakeTransferLogSource::new(vec![transfer_log(stream, 10, 1, address(10), 10)]),
         FakeWindowLookup::with_candidates(vec![
             candidate(1, stream, address(10), 1, 20),
             candidate(2, stream, address(10), 1, 20),
         ]),
         20,
-        10,
         1,
     )
-    .match_next_page(None)
+    .match_range(10, 10)
     .await
     .unwrap();
 
-    assert!(page.matched_payments.is_empty());
-    assert_eq!(
-        page.rejected,
-        vec![RejectedPaymentLog {
-            tx_hash: tx_hash(1),
-            log_index: 1,
-            to_address: address(10),
-            reason: PaymentRejectionReason::AmbiguousCandidates,
-        }]
-    );
+    assert!(matched.is_empty());
 }
 
 fn matcher(
-    reader: FakeLogReader,
+    source: FakeTransferLogSource,
     lookup: FakeWindowLookup,
     head_number: u64,
-    page_limit: usize,
     min_confirmations: u64,
-) -> PaymentMatcher<FakeLogReader, FakeWindowLookup, FakeHeadReader> {
+) -> PaymentMatcher<FakeTransferLogSource, FakeWindowLookup, FakeHeadReader> {
     PaymentMatcher::new(
-        reader,
+        source,
         lookup,
         FakeHeadReader {
             head: ChainBlockRef::new(head_number, block_hash(250)),
@@ -415,7 +325,7 @@ fn matcher(
         PaymentMatchingConfig {
             stream: stream(),
             min_confirmations,
-            page_limit,
+            page_limit: 100,
             max_unique_to_addresses_per_batch: 10,
         },
     )
@@ -444,27 +354,27 @@ fn candidate(
     }
 }
 
-fn stored_log(
+fn transfer_log(
     stream: StreamId,
     block_number: u64,
     log_index: u64,
     to_address: EvmAddress,
     block_second: i64,
-) -> StoredTransferLog {
-    StoredTransferLog {
+) -> TransferLog {
+    TransferLog {
         chain_id: stream.chain_id,
         token_address: stream.token_address,
-        block_number,
-        block_hash: block_hash(block_number as u8),
-        block_timestamp: now() + Duration::seconds(block_second),
+        block: ChainBlock::new(
+            block_number,
+            block_hash(block_number as u8),
+            block_hash(block_number.saturating_sub(1) as u8),
+            now() + Duration::seconds(block_second),
+        ),
         tx_hash: tx_hash(log_index as u8),
-        tx_index: Some(0),
         log_index,
         from_address: address(200),
         to_address,
         amount_raw: RawAmount::from(100),
-        removed: false,
-        observed_at: now() + Duration::hours(1),
     }
 }
 

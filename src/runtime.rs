@@ -1,4 +1,4 @@
-use std::{fs, path::Path, str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc};
 
 use async_trait::async_trait;
 use axum::Router;
@@ -9,21 +9,18 @@ use tokio::task::JoinHandle;
 use crate::{
     api::{self, OrderResponseConfig},
     auth::JwtVerifier,
-    chain::{
-        ChainError, ChainHeaderReader, RpcRangeSource, TransferLogCapacityLimits, TransferLogRange,
-        TransferLogSource,
-    },
+    chain::{ChainError, RpcRangeSource, TransferLogCapacityLimits, TransferLogRange},
     config::{
         AppConfig, ConfigError, JwtAlgorithm, JwtKeySource, RuntimeRole, SignerMode,
         WorkerEnableConfig,
     },
     db::{
         migrations::{
-            MIGRATOR, MigrationBootstrapError, RuntimeSeedConfig, run_schema_migrations,
-            seed_runtime_config,
+            run_schema_migrations, seed_runtime_config, MigrationBootstrapError,
+            RuntimeSeedConfig, MIGRATOR,
         },
         repositories::{
-            ExpiredOrderRepository, PaymentRepository, PgAuditRepository, PgCollectionRepository,
+            ExpiredOrderRepository, PgAuditRepository, PgCollectionRepository,
             PgOrderRepository, PgOutboundRepository, PgPaymentRepository,
             PgVerifiedPaymentRecorder, RepositoryError,
         },
@@ -47,10 +44,7 @@ use crate::{
         DeterministicFakeSigner, LocalMnemonicSigner, RemoteHttpSigner, SignedTx, SignerError,
         SignerProvider, UnsignedTx,
     },
-    transfer_log_store::{
-        LogSourceKind, RedbTransferLogIngestor, ScanTargetMode, StreamId, TransferLogIngestor,
-        TransferLogReader, TransferLogStoreError, TransferLogStreamConfig,
-    },
+    transfer_log_store::StreamId,
     wallet::{AddressDeriver, DeterministicFakeDeriver, HdWallet, WalletError},
     workers::collector::{
         CollectionCollectorConfig, CollectionCollectorError, CollectionCollectorWorker,
@@ -60,10 +54,6 @@ use crate::{
         PaymentScannerConfig, PaymentScannerError, PaymentScannerWorker,
         spawn_payment_scanner_loop_with_metrics,
     },
-    workers::transfer_log_ingestor::{
-        TransferLogIngestorLoopConfig, TransferLogIngestorLoopError,
-        spawn_transfer_log_ingestor_loop_with_metrics,
-    },
 };
 
 const LATE_PAYMENT_MONITOR_SECONDS: u64 = 7 * 24 * 60 * 60;
@@ -71,8 +61,6 @@ const TRANSFER_LOG_MAX_LOGS_PER_PAGE: usize = 1_000;
 const TRANSFER_LOG_MAX_UNIQUE_TO_ADDRESSES_PER_BATCH: usize = 1_000;
 const TRANSFER_LOG_MAX_DB_FALLBACK_ADDRESSES: usize = 1_000;
 const TRANSFER_LOG_CAPACITY_PROBE_BLOCKS: u64 = 100;
-const TRANSFER_LOG_RPC_MAX_RETRIES: u32 = 3;
-const TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS: u64 = 60_000;
 const PAYMENT_SCANNER_POLL_INTERVAL_MS: u64 = 5_000;
 const PAYMENT_SCANNER_LEASE_SECONDS: i64 = 30;
 const COLLECTION_ENQUEUER_POLL_INTERVAL_MS: u64 = 5_000;
@@ -104,14 +92,13 @@ type RuntimeCollectionService<S> = CollectionService<
 type RuntimePaymentWindowLookup =
     WatchSetPaymentWindowLookup<RepositoryPaymentWindowLookup<PgOrderRepository>>;
 type RuntimePaymentMatcher = PaymentMatcher<
-    RedbTransferLogIngestor<RpcRangeSource>,
+    RpcRangeSource,
     RuntimePaymentWindowLookup,
     RpcRangeSource,
 >;
 type RuntimePaymentScannerWorker = PaymentScannerWorker<
     PgPaymentRepository,
     RuntimePaymentMatcher,
-    RedbTransferLogIngestor<RpcRangeSource>,
     RpcRangeSource,
     SystemClock,
 >;
@@ -198,12 +185,6 @@ pub enum RuntimeError {
     Chain(Box<ChainError>),
 
     #[error(transparent)]
-    TransferLogStore(Box<TransferLogStoreError>),
-
-    #[error(transparent)]
-    TransferLogIngestorLoop(Box<TransferLogIngestorLoopError>),
-
-    #[error(transparent)]
     PaymentScanner(Box<PaymentScannerError>),
 
     #[error(transparent)]
@@ -228,18 +209,6 @@ pub enum RuntimeError {
 impl From<ChainError> for RuntimeError {
     fn from(error: ChainError) -> Self {
         Self::Chain(Box::new(error))
-    }
-}
-
-impl From<TransferLogStoreError> for RuntimeError {
-    fn from(error: TransferLogStoreError) -> Self {
-        Self::TransferLogStore(Box::new(error))
-    }
-}
-
-impl From<TransferLogIngestorLoopError> for RuntimeError {
-    fn from(error: TransferLogIngestorLoopError) -> Self {
-        Self::TransferLogIngestorLoop(Box::new(error))
     }
 }
 
@@ -359,7 +328,6 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
     run_schema_migrations(&pool).await?;
     seed_runtime_config(&pool, &runtime_seed_config(&config)).await?;
 
-    ensure_kvdb_parent(&config.kvdb.path)?;
     let rpc_source = RpcRangeSource::from_http_urls(
         config.chain.chain_id,
         &config.chain.rpc_http_urls,
@@ -371,60 +339,22 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
     ensure_runtime_signer_health(&signer).await?;
     let metrics = MetricsRecorder::default();
 
-    let log_store = RedbTransferLogIngestor::open(rpc_source.clone(), &config.kvdb.path)?;
-    let stream_config = transfer_log_stream_config(&config);
-    let stream = stream_config.stream_id();
-    log_store.ensure_stream(stream_config.clone()).await?;
-    let retention_repository = PgOrderRepository::new(pool.clone());
-    let kvdb_retention_repository = retention_repository.clone();
-    let payment_repository = PgPaymentRepository::new(pool.clone());
+    let stream = StreamId::new(config.chain.chain_id, config.chain.token_address);
     let static_dependencies = StaticDependencyRegistry::all_healthy();
     refresh_migration_dependency_status(&static_dependencies, &pool).await;
     let dependency_registry =
         RuntimeDependencyRegistry::new(static_dependencies.clone(), metrics.clone());
-    let kvdb_readiness = KvdbReadinessResources {
-        dependencies: static_dependencies.clone(),
-        metrics: metrics.clone(),
-        retention_repository: kvdb_retention_repository,
-        payment_repository,
-        log_store: log_store.clone(),
-        stream,
-        reorg_lookback_blocks: stream_config.reorg_lookback_blocks,
-        manual_rebuild_floor_block: config.kvdb.manual_rebuild_floor_block,
-    };
-    update_kvdb_dependency_status(&kvdb_readiness).await?;
     let readiness = RuntimeReadinessResources {
-        kvdb: kvdb_readiness,
+        dependencies: static_dependencies.clone(),
         pool: pool.clone(),
         rpc_source: rpc_source.clone(),
+        stream,
         signer: signer.clone(),
     };
     refresh_runtime_dependency_status(&readiness).await;
     let mut background_tasks = BackgroundTasks::new();
     let workers = &config.runtime.workers;
     let runtime_workers_enabled = config.runtime.workers_enabled();
-    if runtime_workers_enabled && workers.transfer_log_ingestor {
-        background_tasks.push(spawn_transfer_log_ingestor_loop_with_metrics(
-            log_store.clone(),
-            TransferLogIngestorLoopConfig::new(
-                stream,
-                std::time::Duration::from_millis(stream_config.poll_interval_ms),
-                config.chain.min_confirmations.saturating_mul(2),
-            ),
-            metrics.clone(),
-        )?);
-    }
-    if runtime_workers_enabled && workers.transfer_log_retention {
-        background_tasks.push(tokio::spawn(transfer_log_retention_loop(
-            retention_repository,
-            log_store.clone(),
-            stream,
-            stream_config.start_block,
-            stream_config.reorg_lookback_blocks,
-            config.kvdb.manual_rebuild_floor_block,
-            std::time::Duration::from_millis(TRANSFER_LOG_RETENTION_POLL_INTERVAL_MS),
-        )));
-    }
     if config.runtime.api_enabled() && workers.runtime_readiness {
         background_tasks.push(tokio::spawn(runtime_readiness_loop(
             readiness,
@@ -440,7 +370,7 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
     }
     if runtime_workers_enabled && workers.payment_scanner {
         background_tasks.push(spawn_payment_scanner_loop_with_metrics(
-            payment_scanner_worker(&config, pool.clone(), log_store.clone(), rpc_source.clone()),
+            payment_scanner_worker(&config, pool.clone(), rpc_source.clone()),
             std::time::Duration::from_millis(PAYMENT_SCANNER_POLL_INTERVAL_MS),
             metrics.clone(),
         )?);
@@ -485,7 +415,7 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
     let order_verify = Arc::new(ManualOrderVerifyService::new(
         PgOrderRepository::new(pool.clone()),
         PgVerifiedPaymentRecorder::new(pool),
-        log_store,
+        rpc_source.clone(),
         rpc_source,
         SystemClock,
         ManualVerifyConfig::new(
@@ -999,7 +929,6 @@ fn raw_amount_from_db_text(value: String) -> Result<RawAmount, RuntimeError> {
 fn payment_scanner_worker(
     config: &AppConfig,
     pool: PgPool,
-    log_store: RedbTransferLogIngestor<RpcRangeSource>,
     rpc_source: RpcRangeSource,
 ) -> RuntimePaymentScannerWorker {
     let stream = StreamId::new(config.chain.chain_id, config.chain.token_address);
@@ -1008,7 +937,7 @@ fn payment_scanner_worker(
         TRANSFER_LOG_MAX_DB_FALLBACK_ADDRESSES,
     );
     let matcher = PaymentMatcher::new(
-        log_store.clone(),
+        rpc_source.clone(),
         WatchSetPaymentWindowLookup::new(fallback),
         rpc_source.clone(),
         PaymentMatchingConfig {
@@ -1022,14 +951,15 @@ fn payment_scanner_worker(
     PaymentScannerWorker::new(
         PgPaymentRepository::new(pool),
         matcher,
-        log_store,
         rpc_source,
         SystemClock,
         PaymentScannerConfig::new(
             format!("payment-scanner-{}", std::process::id()),
             stream,
             time::Duration::seconds(PAYMENT_SCANNER_LEASE_SECONDS),
-        ),
+        )
+        .with_batch_size_blocks(config.transfer_log.batch_size_blocks)
+        .with_max_batch_size_blocks(config.transfer_log.max_batch_size_blocks),
     )
 }
 
@@ -1042,86 +972,27 @@ where
 }
 
 #[derive(Clone)]
-struct KvdbReadinessResources {
-    dependencies: StaticDependencyRegistry,
-    metrics: MetricsRecorder,
-    retention_repository: PgOrderRepository,
-    payment_repository: PgPaymentRepository,
-    log_store: RedbTransferLogIngestor<RpcRangeSource>,
-    stream: StreamId,
-    reorg_lookback_blocks: u64,
-    manual_rebuild_floor_block: Option<u64>,
-}
-
-#[derive(Clone)]
 struct RuntimeReadinessResources<S> {
-    kvdb: KvdbReadinessResources,
+    dependencies: StaticDependencyRegistry,
     pool: PgPool,
     rpc_source: RpcRangeSource,
+    stream: StreamId,
     signer: S,
-}
-
-async fn update_kvdb_dependency_status(
-    resources: &KvdbReadinessResources,
-) -> Result<(), RuntimeError> {
-    let stream = resources.stream;
-    let scan_cursor_state = resources
-        .payment_repository
-        .scan_cursor_state(stream.chain_id, stream.token_address)
-        .await?;
-    let retention_floor_block = resources
-        .retention_repository
-        .retention_floor_block(
-            stream.chain_id,
-            stream.token_address,
-            resources.reorg_lookback_blocks,
-            resources.manual_rebuild_floor_block,
-        )
-        .await?;
-    let log_cursor = resources.log_store.cursor(stream).await?;
-    resources
-        .metrics
-        .record_kvdb_state(log_cursor.last_completed_block, retention_floor_block);
-
-    let dependency = kvdb_dependency_check(
-        stream,
-        scan_cursor_state.as_ref(),
-        &log_cursor,
-        retention_floor_block,
-    );
-    resources.dependencies.set_status(dependency);
-    Ok(())
 }
 
 async fn refresh_runtime_dependency_status<S>(resources: &RuntimeReadinessResources<S>)
 where
     S: SignerProvider,
 {
-    refresh_db_dependency_status(&resources.kvdb.dependencies, &resources.pool).await;
-    refresh_migration_dependency_status(&resources.kvdb.dependencies, &resources.pool).await;
+    refresh_db_dependency_status(&resources.dependencies, &resources.pool).await;
+    refresh_migration_dependency_status(&resources.dependencies, &resources.pool).await;
     refresh_rpc_dependency_status(
-        &resources.kvdb.dependencies,
+        &resources.dependencies,
         &resources.rpc_source,
-        resources.kvdb.stream,
+        resources.stream,
     )
     .await;
-    refresh_signer_dependency_status(&resources.kvdb.dependencies, &resources.signer).await;
-
-    if let Err(error) = update_kvdb_dependency_status(&resources.kvdb).await {
-        tracing::warn!(
-            chain_id = resources.kvdb.stream.chain_id,
-            token_address = %resources.kvdb.stream.token_address,
-            error = %error,
-            "kvdb readiness refresh failed"
-        );
-        resources
-            .kvdb
-            .dependencies
-            .set_status(DependencyCheck::failed(
-                DependencyName::Kvdb,
-                error.to_string(),
-            ));
-    }
+    refresh_signer_dependency_status(&resources.dependencies, &resources.signer).await;
 }
 
 async fn refresh_migration_dependency_status(
@@ -1260,186 +1131,13 @@ async fn order_expiry_loop(
     }
 }
 
-fn kvdb_dependency_check(
-    stream: StreamId,
-    scan_cursor_state: Option<&crate::db::repositories::ScanCursorState>,
-    log_cursor: &crate::transfer_log_store::TransferLogCursor,
-    retention_floor_block: Option<u64>,
-) -> DependencyCheck {
-    let Some(scan_cursor_state) = scan_cursor_state else {
-        return DependencyCheck::failed(
-            DependencyName::Kvdb,
-            format!(
-                "scan cursor state missing for {} / {}",
-                stream.chain_id, stream.token_address
-            ),
-        );
-    };
-
-    let Some(retention_floor_block) = retention_floor_block else {
-        return DependencyCheck::failed(DependencyName::Kvdb, "retention floor unavailable");
-    };
-
-    let completed_block = log_cursor
-        .last_completed_block
-        .unwrap_or_else(|| log_cursor.start_block.saturating_sub(1));
-    if log_cursor.reorg_epoch != scan_cursor_state.seen_kv_reorg_epoch {
-        return DependencyCheck::failed(
-            DependencyName::Kvdb,
-            format!(
-                "kv reorg epoch mismatch: kv {} scanner {}",
-                log_cursor.reorg_epoch, scan_cursor_state.seen_kv_reorg_epoch
-            ),
-        );
-    }
-
-    if completed_block < retention_floor_block {
-        return DependencyCheck::failed(
-            DependencyName::Kvdb,
-            format!(
-                "kvdb coverage ends at block {}, retention floor requires {}",
-                completed_block, retention_floor_block
-            ),
-        );
-    }
-
-    DependencyCheck::healthy(DependencyName::Kvdb)
-}
-
-async fn transfer_log_retention_loop<S>(
-    repository: PgOrderRepository,
-    log_store: RedbTransferLogIngestor<S>,
-    stream: StreamId,
-    start_block: u64,
-    reorg_lookback_blocks: u64,
-    manual_rebuild_floor_block: Option<u64>,
-    poll_interval: std::time::Duration,
-) where
-    S: ChainHeaderReader + TransferLogSource + Send + Sync + 'static,
-{
-    let mut interval = tokio::time::interval(poll_interval);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_pruned_floor = start_block;
-
-    loop {
-        interval.tick().await;
-
-        match repository
-            .retention_floor_block(
-                stream.chain_id,
-                stream.token_address,
-                reorg_lookback_blocks,
-                manual_rebuild_floor_block,
-            )
-            .await
-        {
-            Ok(Some(floor_block)) if floor_block > last_pruned_floor => {
-                if floor_block <= start_block {
-                    tracing::debug!(
-                        chain_id = stream.chain_id,
-                        token_address = %stream.token_address,
-                        floor_block,
-                        start_block,
-                        "transfer log retention floor is at or before the stream start block"
-                    );
-                    continue;
-                }
-
-                match log_store.prune_before_block(stream, floor_block) {
-                    Ok(()) => {
-                        last_pruned_floor = floor_block;
-                        tracing::info!(
-                            chain_id = stream.chain_id,
-                            token_address = %stream.token_address,
-                            floor_block,
-                            start_block,
-                            "transfer log retention pruned"
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            chain_id = stream.chain_id,
-                            token_address = %stream.token_address,
-                            floor_block,
-                            error = %error,
-                            "transfer log retention prune failed"
-                        );
-                    }
-                }
-            }
-            Ok(Some(floor_block)) => {
-                tracing::debug!(
-                    chain_id = stream.chain_id,
-                    token_address = %stream.token_address,
-                    floor_block,
-                    last_pruned_floor,
-                    "transfer log retention floor unchanged"
-                );
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    chain_id = stream.chain_id,
-                    token_address = %stream.token_address,
-                    "transfer log retention floor unavailable"
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    chain_id = stream.chain_id,
-                    token_address = %stream.token_address,
-                    error = %error,
-                    "transfer log retention floor lookup failed"
-                );
-            }
-        }
-    }
-}
-
-fn transfer_log_stream_config(config: &AppConfig) -> TransferLogStreamConfig {
-    TransferLogStreamConfig {
-        chain_id: config.chain.chain_id,
-        token_address: config.chain.token_address,
-        start_block: config.chain.start_block,
-        poll_interval_ms: config.transfer_log.poll_interval_ms,
-        batch_size_blocks: config.transfer_log.batch_size_blocks,
-        max_batch_size_blocks: config.transfer_log.max_batch_size_blocks,
-        max_logs_per_page: TRANSFER_LOG_MAX_LOGS_PER_PAGE,
-        max_unique_to_addresses_per_batch: TRANSFER_LOG_MAX_UNIQUE_TO_ADDRESSES_PER_BATCH,
-        max_db_fallback_addresses: TRANSFER_LOG_MAX_DB_FALLBACK_ADDRESSES,
-        capacity_probe_blocks: TRANSFER_LOG_CAPACITY_PROBE_BLOCKS,
-        reorg_lookback_blocks: reorg_lookback_blocks(config.chain.min_confirmations),
-        target_mode: ScanTargetMode::LatestMinusConfirmations(config.chain.min_confirmations),
-        rpc_max_retries: TRANSFER_LOG_RPC_MAX_RETRIES,
-        log_source: LogSourceKind::RpcRange,
-        sparse_headers: config.transfer_log.sparse_headers,
-    }
-}
-
-fn reorg_lookback_blocks(min_confirmations: u64) -> u64 {
-    min_confirmations.saturating_mul(2).max(12)
-}
-
 fn min_rpc_provider_count(config: &AppConfig) -> usize {
     if config.profile.is_production() { 2 } else { 1 }
 }
 
-fn ensure_kvdb_parent(path: &Path) -> Result<(), RuntimeError> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
-    if parent.as_os_str().is_empty() {
-        return Ok(());
-    }
-    fs::create_dir_all(parent)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use axum::{
         Router,
@@ -1463,27 +1161,6 @@ MC4CAQAwBQYDK2VwBCIEIGrD/e7uKYqSY4twDEsRfMMuLSrODf14dpTiTK6K1YI0
     const ED_PUBLIC_KEY_PEM: &str = r#"-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
 -----END PUBLIC KEY-----"#;
-
-    #[test]
-    fn transfer_log_stream_config_uses_confirmed_target() {
-        let config = test_config(&[
-            ("MIN_CONFIRMATIONS", "12"),
-            ("START_BLOCK", "42"),
-            ("SIGNER_MODE", "fake"),
-        ]);
-
-        let stream = transfer_log_stream_config(&config);
-
-        assert_eq!(stream.chain_id, 31337);
-        assert_eq!(stream.token_address, config.chain.token_address);
-        assert_eq!(stream.start_block, 42);
-        assert_eq!(
-            stream.target_mode,
-            ScanTargetMode::LatestMinusConfirmations(12)
-        );
-        assert_eq!(stream.reorg_lookback_blocks, 24);
-        assert_eq!(stream.log_source, LogSourceKind::RpcRange);
-    }
 
     #[test]
     fn collection_service_config_uses_app_config_collection_fees() {
@@ -1913,15 +1590,5 @@ MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
             scopes: None,
             scp: None,
         }
-    }
-
-    #[test]
-    fn ensure_kvdb_parent_creates_missing_directory() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let path = temp.path().join("nested").join("pay3.redb");
-
-        ensure_kvdb_parent(&PathBuf::from(&path)).expect("parent directory should be created");
-
-        assert!(path.parent().expect("parent").exists());
     }
 }

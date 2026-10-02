@@ -27,10 +27,7 @@ use pay3::{
         payment_windows::RepositoryPaymentWindowLookup,
         payments::{PaymentMatcher, PaymentMatchingConfig},
     },
-    transfer_log_store::{
-        LogSourceKind, PollOutcome, RedbTransferLogIngestor, ScanTargetMode, StreamId,
-        TransferLogIngestor, TransferLogStreamConfig,
-    },
+    transfer_log_store::StreamId,
     wallet::HdWallet,
     workers::{
         collector::{
@@ -40,7 +37,6 @@ use pay3::{
     },
 };
 use sqlx::{Connection, Executor, PgConnection, PgPool, postgres::PgPoolOptions};
-use tempfile::TempDir;
 use time::Duration as TimeDuration;
 use uuid::Uuid;
 
@@ -107,28 +103,6 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
         )
         .await?;
 
-        let kvdb_dir = TempDir::new()?;
-        let kvdb_path = kvdb_dir.path().join("transfer-log.redb");
-        let log_store = RedbTransferLogIngestor::open(rpc_source.clone(), &kvdb_path)?;
-        let stream_config = TransferLogStreamConfig {
-            chain_id,
-            token_address,
-            start_block,
-            poll_interval_ms: 250,
-            batch_size_blocks: 1,
-            max_batch_size_blocks: 32,
-            max_logs_per_page: 100,
-            max_unique_to_addresses_per_batch: 100,
-            max_db_fallback_addresses: 100,
-            capacity_probe_blocks: 1,
-            reorg_lookback_blocks: 1,
-            target_mode: ScanTargetMode::LatestMinusConfirmations(0),
-            rpc_max_retries: 3,
-            log_source: LogSourceKind::RpcRange,
-            sparse_headers: false,
-        };
-        log_store.ensure_stream(stream_config.clone()).await?;
-
         let order_service = OrderService::new(
             OrderServiceConfig::new(chain_id, token_address, 24 * 60 * 60),
             order_repo.clone(),
@@ -137,7 +111,7 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
         )?;
 
         let payment_matcher = PaymentMatcher::new(
-            log_store.clone(),
+            rpc_source.clone(),
             RepositoryPaymentWindowLookup::new(order_repo.clone(), 100),
             rpc_source.clone(),
             PaymentMatchingConfig {
@@ -150,7 +124,6 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
         let scanner = PaymentScannerWorker::new(
             payment_repo,
             payment_matcher,
-            log_store.clone(),
             rpc_source.clone(),
             SystemClock,
             PaymentScannerConfig::new("scanner-e2e", stream, TimeDuration::seconds(30))
@@ -229,19 +202,6 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
         )
         .await?;
         wait_for_receipt(&rpc_source, payment_tx_hash).await?;
-
-        let poll_outcome = log_store.poll_once(stream).await?;
-        match poll_outcome {
-            PollOutcome::Advanced {
-                stream: actual_stream,
-                log_count,
-                ..
-            } => {
-                assert_eq!(actual_stream, stream);
-                assert_eq!(log_count, 1);
-            }
-            other => panic!("expected advanced poll outcome, got {other:?}"),
-        }
 
         let scan_outcome = scanner.tick().await?;
         match scan_outcome {
@@ -402,28 +362,6 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
         )
         .await?;
 
-        let kvdb_dir = TempDir::new()?;
-        let kvdb_path = kvdb_dir.path().join("transfer-log.redb");
-        let log_store = RedbTransferLogIngestor::open(rpc_source.clone(), &kvdb_path)?;
-        let stream_config = TransferLogStreamConfig {
-            chain_id,
-            token_address,
-            start_block,
-            poll_interval_ms: 250,
-            batch_size_blocks: 1,
-            max_batch_size_blocks: 32,
-            max_logs_per_page: 100,
-            max_unique_to_addresses_per_batch: 100,
-            max_db_fallback_addresses: 100,
-            capacity_probe_blocks: 1,
-            reorg_lookback_blocks: 1,
-            target_mode: ScanTargetMode::LatestMinusConfirmations(0),
-            rpc_max_retries: 3,
-            log_source: LogSourceKind::RpcRange,
-            sparse_headers: false,
-        };
-        log_store.ensure_stream(stream_config.clone()).await?;
-
         let order_service = OrderService::new(
             OrderServiceConfig::new(chain_id, token_address, 24 * 60 * 60),
             order_repo.clone(),
@@ -432,7 +370,7 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
         )?;
 
         let payment_matcher = PaymentMatcher::new(
-            log_store.clone(),
+            rpc_source.clone(),
             RepositoryPaymentWindowLookup::new(order_repo.clone(), 100),
             rpc_source.clone(),
             PaymentMatchingConfig {
@@ -445,7 +383,6 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
         let scanner = PaymentScannerWorker::new(
             payment_repo,
             payment_matcher,
-            log_store.clone(),
             rpc_source.clone(),
             SystemClock,
             PaymentScannerConfig::new("scanner-e2e", stream, TimeDuration::seconds(30))
@@ -524,19 +461,6 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
         )
         .await?;
         wait_for_receipt(&rpc_source, payment_tx_hash).await?;
-
-        let poll_outcome = log_store.poll_once(stream).await?;
-        match poll_outcome {
-            PollOutcome::Advanced {
-                stream: actual_stream,
-                log_count,
-                ..
-            } => {
-                assert_eq!(actual_stream, stream);
-                assert_eq!(log_count, 1);
-            }
-            other => panic!("expected advanced poll outcome, got {other:?}"),
-        }
 
         let scan_outcome = scanner.tick().await?;
         match scan_outcome {

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::{
-    chain::ChainHeaderReader,
+    chain::{ChainHeaderReader, TransferLogSource},
     db::repositories::OrderRepository,
     services::{
         orders::Clock,
@@ -10,7 +10,6 @@ use crate::{
             VerifiedPaymentRecorder,
         },
     },
-    transfer_log_store::TransferLogReader,
 };
 
 use super::verify::{
@@ -18,11 +17,11 @@ use super::verify::{
 };
 
 #[async_trait]
-impl<O, R, L, H, C> OrderVerifyApiService for ManualOrderVerifyService<O, R, L, H, C>
+impl<O, R, S, H, C> OrderVerifyApiService for ManualOrderVerifyService<O, R, S, H, C>
 where
     O: OrderRepository,
     R: VerifiedPaymentRecorder,
-    L: TransferLogReader,
+    S: TransferLogSource,
     H: ChainHeaderReader,
     C: Clock,
 {

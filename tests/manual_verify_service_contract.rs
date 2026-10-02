@@ -40,7 +40,7 @@ async fn manual_verify_requires_kv_coverage_for_the_order_window_start() {
         FakeOrderRepository::with_view(order_view(RawAmount::from(100))),
         recorder.clone(),
         reader.clone(),
-        20,
+        9,
         2,
     )
     .verify_order(order_id())
@@ -51,7 +51,7 @@ async fn manual_verify_requires_kv_coverage_for_the_order_window_start() {
         error,
         ManualVerifyError::CoverageInsufficient { .. }
     ));
-    assert_eq!(reader.calls(), vec![LogReaderCall::Cursor(stream())]);
+    assert!(reader.calls().is_empty());
     assert!(recorder.calls().is_empty());
 }
 
@@ -83,12 +83,11 @@ async fn manual_verify_matches_order_logs_records_payments_and_reports_confirmed
     assert_eq!(
         reader.calls(),
         vec![
-            LogReaderCall::Cursor(stream()),
             LogReaderCall::LogsInRange {
                 stream: stream(),
                 from: 10,
                 to: 12,
-                max_logs: 21,
+                max_logs: 1000,
             },
         ]
     );

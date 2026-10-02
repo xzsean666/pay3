@@ -97,11 +97,10 @@ pub enum DependencyName {
 impl DependencyName {
     // Startup/static dependencies. Runtime worker dependencies are added by
     // RuntimeDependencyRegistry from live worker telemetry.
-    pub const ALL: [DependencyName; 6] = [
+    pub const ALL: [DependencyName; 5] = [
         DependencyName::Db,
         DependencyName::Migration,
         DependencyName::RpcChainId,
-        DependencyName::Kvdb,
         DependencyName::Signer,
         DependencyName::WorkerLease,
     ];

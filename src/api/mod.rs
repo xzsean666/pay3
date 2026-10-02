@@ -1252,7 +1252,6 @@ mod tests {
             "db",
             "migration",
             "rpc_chain_id",
-            "kvdb",
             "signer",
             "worker_lease",
         ] {
@@ -1291,8 +1290,8 @@ mod tests {
     async fn metrics_exposes_build_latency_and_readyz_dependency_status() {
         let registry = StaticDependencyRegistry::all_healthy();
         registry.set_status(DependencyCheck::failed(
-            DependencyName::Kvdb,
-            "kvdb open failure",
+            DependencyName::Signer,
+            "signer failure",
         ));
 
         let app = router_with_registry(registry);
@@ -1313,7 +1312,7 @@ mod tests {
         assert!(body.contains("pay3_build_info"));
         assert!(body.contains("pay3_http_request_latency_seconds_count"));
         assert!(body.contains("pay3_readyz_dependency_status{dependency=\"db\"} 1"));
-        assert!(body.contains("pay3_readyz_dependency_status{dependency=\"kvdb\"} 0"));
+        assert!(body.contains("pay3_readyz_dependency_status{dependency=\"signer\"} 0"));
     }
 
     #[tokio::test]

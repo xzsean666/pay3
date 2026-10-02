@@ -1,9 +1,8 @@
-//! Payment scanner worker tick over persisted KV transfer logs.
+//! Payment scanner worker tick directly over RPC chain events and Postgres state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration as StdDuration, Instant};
 
-use async_trait::async_trait;
 use thiserror::Error;
 use time::Duration;
 use tokio::task::JoinHandle;
@@ -13,56 +12,28 @@ use crate::{
     chain::{ChainError, ChainHeaderReader},
     db::repositories::{
         CommitScannedBatch, ConfirmObservedPaymentsBatch, PaymentConfirmationCandidate,
-        PaymentRecord, PaymentRepository, RepositoryError, ScanCursorLease,
+        PaymentRecord, PaymentRepository, RepositoryError,
     },
     domain::{BlockHash, ChainBlockRef},
     health::{MetricsRecorder, WorkerName},
     services::{
         orders::Clock,
-        payment_windows::PaymentWindowLookup,
-        payments::{PaymentMatchPage, PaymentMatcher, PaymentMatchingConfig, PaymentMatchingError},
+        payments::{PaymentMatchingConfig, PaymentMatchingError, PaymentRangeMatcher},
     },
-    transfer_log_store::{
-        LogPageToken, StreamId, TransferLogCursor, TransferLogReader, TransferLogStoreError,
-    },
+    transfer_log_store::{StreamId, TransferLogStoreError},
 };
 
 const DEFAULT_CONFIRMATION_SWEEP_LIMIT: usize = 1_000;
-
-#[async_trait]
-pub trait PaymentPageMatcher: Send + Sync {
-    fn config(&self) -> PaymentMatchingConfig;
-
-    async fn match_next_payment_page(
-        &self,
-        after: Option<LogPageToken>,
-    ) -> Result<PaymentMatchPage, PaymentMatchingError>;
-}
-
-#[async_trait]
-impl<L, W, H> PaymentPageMatcher for PaymentMatcher<L, W, H>
-where
-    L: TransferLogReader,
-    W: PaymentWindowLookup,
-    H: ChainHeaderReader,
-{
-    fn config(&self) -> PaymentMatchingConfig {
-        self.config()
-    }
-
-    async fn match_next_payment_page(
-        &self,
-        after: Option<LogPageToken>,
-    ) -> Result<PaymentMatchPage, PaymentMatchingError> {
-        self.match_next_page(after).await
-    }
-}
+const DEFAULT_BATCH_SIZE_BLOCKS: u64 = 100;
+const DEFAULT_MAX_BATCH_SIZE_BLOCKS: u64 = 500;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PaymentScannerConfig {
     pub worker_id: String,
     pub stream: StreamId,
     pub lease_duration: Duration,
+    pub batch_size_blocks: u64,
+    pub max_batch_size_blocks: u64,
     pub confirmation_sweep_limit: usize,
 }
 
@@ -72,8 +43,20 @@ impl PaymentScannerConfig {
             worker_id: worker_id.into(),
             stream,
             lease_duration,
+            batch_size_blocks: DEFAULT_BATCH_SIZE_BLOCKS,
+            max_batch_size_blocks: DEFAULT_MAX_BATCH_SIZE_BLOCKS,
             confirmation_sweep_limit: DEFAULT_CONFIRMATION_SWEEP_LIMIT,
         }
+    }
+
+    pub const fn with_batch_size_blocks(mut self, batch_size: u64) -> Self {
+        self.batch_size_blocks = batch_size;
+        self
+    }
+
+    pub const fn with_max_batch_size_blocks(mut self, max_batch_size: u64) -> Self {
+        self.max_batch_size_blocks = max_batch_size;
+        self
     }
 
     pub const fn with_confirmation_sweep_limit(mut self, limit: usize) -> Self {
@@ -103,6 +86,13 @@ impl PaymentScannerConfig {
             });
         }
 
+        if self.batch_size_blocks == 0 {
+            return Err(PaymentScannerError::InvalidConfig {
+                field: "batch_size_blocks",
+                message: "must be greater than zero".to_string(),
+            });
+        }
+
         if self.stream != matcher_config.stream {
             return Err(PaymentScannerError::InvalidConfig {
                 field: "stream",
@@ -128,12 +118,7 @@ pub enum PaymentScannerTickOutcome {
     Idle {
         stream: StreamId,
         last_scanned_block: u64,
-        kv_completed_block: Option<u64>,
-    },
-    PageIncomplete {
-        stream: StreamId,
-        last_scanned_block: u64,
-        next_token: Option<LogPageToken>,
+        target_block: u64,
     },
     Committed {
         stream: StreamId,
@@ -220,21 +205,19 @@ impl From<TransferLogStoreError> for PaymentScannerError {
     }
 }
 
-pub struct PaymentScannerWorker<R, M, L, H, C> {
+pub struct PaymentScannerWorker<R, M, H, C> {
     repository: R,
     matcher: M,
-    log_reader: L,
     head_reader: H,
     clock: C,
     config: PaymentScannerConfig,
     metrics: Option<MetricsRecorder>,
 }
 
-impl<R, M, L, H, C> PaymentScannerWorker<R, M, L, H, C> {
+impl<R, M, H, C> PaymentScannerWorker<R, M, H, C> {
     pub const fn new(
         repository: R,
         matcher: M,
-        log_reader: L,
         head_reader: H,
         clock: C,
         config: PaymentScannerConfig,
@@ -242,7 +225,6 @@ impl<R, M, L, H, C> PaymentScannerWorker<R, M, L, H, C> {
         Self {
             repository,
             matcher,
-            log_reader,
             head_reader,
             clock,
             config,
@@ -256,17 +238,16 @@ impl<R, M, L, H, C> PaymentScannerWorker<R, M, L, H, C> {
     }
 }
 
-impl<R, M, L, H, C> PaymentScannerWorker<R, M, L, H, C>
+impl<R, M, H, C> PaymentScannerWorker<R, M, H, C>
 where
     R: PaymentRepository,
-    M: PaymentPageMatcher,
-    L: TransferLogReader,
+    M: PaymentRangeMatcher,
     H: ChainHeaderReader,
     C: Clock,
 {
     fn record_scanner_lag(
         &self,
-        kv_completed_block: Option<u64>,
+        target_block: u64,
         scanner_block: u64,
         min_confirmations: u64,
     ) {
@@ -274,8 +255,7 @@ where
             return;
         };
 
-        let completed_block = kv_completed_block.unwrap_or(scanner_block);
-        let lag_blocks = completed_block.saturating_sub(scanner_block);
+        let lag_blocks = target_block.saturating_sub(scanner_block);
         metrics.record_worker_lag(
             WorkerName::PaymentScanner,
             lag_blocks,
@@ -309,82 +289,45 @@ where
             });
         };
 
-        let cursor = self.log_reader.cursor(stream).await?;
-        if cursor.reorg_epoch != lease.seen_kv_reorg_epoch {
-            self.record_scanner_lag(
-                cursor.last_completed_block,
-                lease.last_scanned_block,
-                matcher_config.min_confirmations,
-            );
-            return self.handle_kv_reorg(lease, cursor).await;
-        }
+        let canonical_head = self.head_reader.latest_head().await?;
+        let target_block = canonical_head.number;
 
-        let mut after = after_token_with_lookback(
-            lease.last_scanned_block,
-            scanner_lookback_blocks(matcher_config.min_confirmations),
-        );
-        let mut matched_payments = Vec::new();
-        let complete_to_block = loop {
-            let page = self.matcher.match_next_payment_page(after).await?;
-            if page.kv_reorg_epoch != lease.seen_kv_reorg_epoch {
-                let cursor = self.log_reader.cursor(stream).await?;
-                self.record_scanner_lag(
-                    cursor.last_completed_block,
-                    lease.last_scanned_block,
-                    matcher_config.min_confirmations,
-                );
-                return self.handle_kv_reorg(lease, cursor).await;
-            }
-
-            let next_token = page.next_token;
-            let Some(complete_to_block) =
-                complete_to_block_for_commit(&page, &cursor, lease.last_scanned_block)
-            else {
-                self.record_scanner_lag(
-                    cursor.last_completed_block,
-                    lease.last_scanned_block,
-                    matcher_config.min_confirmations,
-                );
-                return Ok(PaymentScannerTickOutcome::PageIncomplete {
-                    stream,
-                    last_scanned_block: lease.last_scanned_block,
-                    next_token,
-                });
-            };
-
-            matched_payments.extend(page.matched_payments);
-
-            if complete_to_block > lease.last_scanned_block {
-                break complete_to_block;
-            }
-
-            if let Some(next_token) = next_token {
-                after = Some(next_token);
-                continue;
-            }
-
+        if lease.last_scanned_block >= target_block {
             if let Some(outcome) = self.sweep_confirmations(matcher_config).await? {
                 self.record_scanner_lag(
-                    cursor.last_completed_block,
+                    target_block,
                     lease.last_scanned_block,
                     matcher_config.min_confirmations,
                 );
                 return Ok(outcome);
             }
             self.record_scanner_lag(
-                cursor.last_completed_block,
+                target_block,
                 lease.last_scanned_block,
                 matcher_config.min_confirmations,
             );
             return Ok(PaymentScannerTickOutcome::Idle {
                 stream,
                 last_scanned_block: lease.last_scanned_block,
-                kv_completed_block: cursor.last_completed_block,
+                target_block,
             });
-        };
+        }
 
+        let from_block = lease.last_scanned_block + 1;
+        let batch_size = self
+            .config
+            .batch_size_blocks
+            .min(self.config.max_batch_size_blocks)
+            .max(1);
+        let to_block = from_block
+            .saturating_add(batch_size)
+            .saturating_sub(1)
+            .min(target_block);
+
+        let matched_payments = self.matcher.match_range(from_block, to_block).await?;
         let recompute_order_ids = recompute_order_ids(&matched_payments);
         let matched_payment_count = matched_payments.len();
+
         let records = self
             .repository
             .commit_scanned_batch(CommitScannedBatch {
@@ -392,7 +335,7 @@ where
                 token_address: stream.token_address,
                 worker_id: self.config.worker_id.clone(),
                 expected_last_scanned_block: lease.last_scanned_block,
-                complete_to_block,
+                complete_to_block: to_block,
                 expected_seen_kv_reorg_epoch: lease.seen_kv_reorg_epoch,
                 seen_kv_reorg_epoch: lease.seen_kv_reorg_epoch,
                 matched_payments,
@@ -401,56 +344,42 @@ where
             .await?;
 
         self.record_scanner_lag(
-            cursor.last_completed_block,
-            complete_to_block,
+            target_block,
+            to_block,
             matcher_config.min_confirmations,
         );
 
         Ok(PaymentScannerTickOutcome::Committed {
             stream,
-            complete_to_block,
+            complete_to_block: to_block,
             matched_payments: matched_payment_count,
             recompute_order_ids,
             records,
         })
     }
 
-    async fn handle_kv_reorg(
+    pub async fn handle_reorg(
         &self,
-        lease: ScanCursorLease,
-        cursor: TransferLogCursor,
+        epoch: u64,
+        last_reorg_from: u64,
     ) -> Result<PaymentScannerTickOutcome, PaymentScannerError> {
         let stream = self.config.stream;
-        if cursor.reorg_epoch < lease.seen_kv_reorg_epoch {
-            return Err(PaymentScannerError::KvReorgEpochRegression {
-                stream,
-                seen_epoch: lease.seen_kv_reorg_epoch,
-                kv_epoch: cursor.reorg_epoch,
-            });
-        }
-
-        let last_reorg_from =
-            cursor
-                .last_reorg_from
-                .ok_or(PaymentScannerError::MissingKvReorgBlock {
-                    epoch: cursor.reorg_epoch,
-                })?;
-
         self.repository
             .handle_kv_reorg_epoch(
                 stream.chain_id,
                 stream.token_address,
-                cursor.reorg_epoch,
+                epoch,
                 last_reorg_from,
             )
             .await?;
 
         Ok(PaymentScannerTickOutcome::KvReorgHandled {
             stream,
-            epoch: cursor.reorg_epoch,
+            epoch,
             last_reorg_from,
         })
     }
+
 
     async fn sweep_confirmations(
         &self,
@@ -588,14 +517,13 @@ where
     }
 }
 
-pub fn spawn_payment_scanner_loop<R, M, L, H, C>(
-    worker: PaymentScannerWorker<R, M, L, H, C>,
+pub fn spawn_payment_scanner_loop<R, M, H, C>(
+    worker: PaymentScannerWorker<R, M, H, C>,
     poll_interval: StdDuration,
 ) -> Result<JoinHandle<()>, PaymentScannerError>
 where
     R: PaymentRepository + 'static,
-    M: PaymentPageMatcher + 'static,
-    L: TransferLogReader + 'static,
+    M: PaymentRangeMatcher + 'static,
     H: ChainHeaderReader + 'static,
     C: Clock + 'static,
 {
@@ -609,15 +537,14 @@ where
     Ok(tokio::spawn(worker.run_forever(poll_interval)))
 }
 
-pub fn spawn_payment_scanner_loop_with_metrics<R, M, L, H, C>(
-    worker: PaymentScannerWorker<R, M, L, H, C>,
+pub fn spawn_payment_scanner_loop_with_metrics<R, M, H, C>(
+    worker: PaymentScannerWorker<R, M, H, C>,
     poll_interval: StdDuration,
     metrics: MetricsRecorder,
 ) -> Result<JoinHandle<()>, PaymentScannerError>
 where
     R: PaymentRepository + 'static,
-    M: PaymentPageMatcher + 'static,
-    L: TransferLogReader + 'static,
+    M: PaymentRangeMatcher + 'static,
     H: ChainHeaderReader + 'static,
     C: Clock + 'static,
 {
@@ -658,28 +585,14 @@ fn log_tick_outcome(outcome: &PaymentScannerTickOutcome) {
         PaymentScannerTickOutcome::Idle {
             stream,
             last_scanned_block,
-            kv_completed_block,
+            target_block,
         } => {
             tracing::debug!(
                 chain_id = stream.chain_id,
                 token_address = %stream.token_address,
                 last_scanned_block,
-                kv_completed_block = ?kv_completed_block,
+                target_block,
                 "payment scanner idle"
-            );
-        }
-        PaymentScannerTickOutcome::PageIncomplete {
-            stream,
-            last_scanned_block,
-            next_token,
-        } => {
-            tracing::debug!(
-                chain_id = stream.chain_id,
-                token_address = %stream.token_address,
-                last_scanned_block,
-                next_token_block = next_token.map(|token| token.block_number),
-                next_token_log_index = next_token.map(|token| token.log_index),
-                "payment scanner page incomplete"
             );
         }
         PaymentScannerTickOutcome::Committed {
@@ -718,26 +631,6 @@ fn log_tick_outcome(outcome: &PaymentScannerTickOutcome) {
     }
 }
 
-fn complete_to_block_for_commit(
-    page: &PaymentMatchPage,
-    cursor: &TransferLogCursor,
-    last_scanned_block: u64,
-) -> Option<u64> {
-    let complete_to_block = match page.complete_to_block {
-        Some(block) => block,
-        None if page.matched_payments.is_empty() && page.rejected.is_empty() => {
-            cursor.last_completed_block?
-        }
-        None => return None,
-    };
-
-    let complete_to_block = cursor
-        .last_completed_block
-        .map(|kv_completed| complete_to_block.min(kv_completed))
-        .unwrap_or(complete_to_block);
-    Some(complete_to_block.max(last_scanned_block))
-}
-
 fn recompute_order_ids(payments: &[crate::db::repositories::MatchedPaymentInput]) -> Vec<Uuid> {
     payments
         .iter()
@@ -764,18 +657,6 @@ fn max_confirmable_block(canonical_head: ChainBlockRef, min_confirmations: u64) 
     }
 }
 
-fn after_token_with_lookback(
-    last_scanned_block: u64,
-    lookback_blocks: u64,
-) -> Option<LogPageToken> {
-    let start_block = last_scanned_block.saturating_sub(lookback_blocks.saturating_sub(1));
-    if start_block <= 1 {
-        None
-    } else {
-        Some(LogPageToken::new(start_block - 1, u64::MAX))
-    }
-}
-
 fn scanner_lookback_blocks(min_confirmations: u64) -> u64 {
     min_confirmations.saturating_mul(2).max(12)
 }
@@ -793,32 +674,30 @@ mod tests {
     use super::*;
     use crate::{
         chain::ChainBlock,
-        db::repositories::{MatchedPaymentInput, PaymentWindowCandidate, ScanCursorState},
+        db::repositories::{
+            MatchedPaymentInput, PaymentWindowCandidate, ScanCursorLease, ScanCursorState,
+        },
         domain::{
             BlockHash, ChainBlockRef, EvmAddress, PaymentChainStatus, PaymentMatchStatus,
             RawAmount, TxHash,
         },
-        services::orders::Clock,
-        transfer_log_store::{
-            LogsPage, ScanTargetMode, StoredBlockHeader, StoredTransferLog, TransferLogStreamConfig,
+        services::{
+            orders::Clock,
+            payments::{PaymentMatchingConfig, PaymentMatchingError, PaymentRangeMatcher},
         },
+        transfer_log_store::{ScanTargetMode, TransferLogStreamConfig},
     };
 
     #[tokio::test]
     async fn tick_claims_matches_and_commits_batch() {
         let repo = FakePaymentRepository::with_lease(lease(10, 7));
-        let reader = FakeLogReader::new(cursor(20, 7, None));
-        let matcher = FakeMatcher::with_pages(vec![Ok(match_page(
-            vec![matched_payment(order_id(1), 12)],
-            Some(12),
-            Some(LogPageToken::new(12, 0)),
-            7,
-        ))]);
-        let worker = worker(repo.clone(), matcher.clone(), reader);
+        let head = FakeHeadReader::new(block_ref(12));
+        let matcher = FakeMatcher::with_results(vec![Ok(vec![matched_payment(order_id(1), 12)])]);
+        let worker = worker_with_head(repo.clone(), matcher.clone(), head);
 
         let outcome = worker.tick().await.unwrap();
 
-        assert_eq!(matcher.calls(), vec![None]);
+        assert_eq!(matcher.calls(), vec![(11, 12)]);
         assert_eq!(
             outcome,
             PaymentScannerTickOutcome::Committed {
@@ -840,9 +719,9 @@ mod tests {
     #[tokio::test]
     async fn tick_exits_when_lease_is_held_by_another_worker() {
         let repo = FakePaymentRepository::without_lease();
-        let reader = FakeLogReader::new(cursor(20, 7, None));
-        let matcher = FakeMatcher::with_pages(vec![Ok(match_page(Vec::new(), Some(20), None, 7))]);
-        let worker = worker(repo.clone(), matcher.clone(), reader);
+        let head = FakeHeadReader::new(block_ref(20));
+        let matcher = FakeMatcher::with_results(Vec::new());
+        let worker = worker_with_head(repo.clone(), matcher.clone(), head);
 
         let outcome = worker.tick().await.unwrap();
 
@@ -858,13 +737,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_handles_kv_reorg_before_matching() {
+    async fn handle_reorg_updates_repo_epoch() {
         let repo = FakePaymentRepository::with_lease(lease(10, 7));
-        let reader = FakeLogReader::new(cursor(20, 8, Some(9)));
-        let matcher = FakeMatcher::with_pages(vec![Ok(match_page(Vec::new(), Some(20), None, 8))]);
-        let worker = worker(repo.clone(), matcher.clone(), reader);
+        let matcher = FakeMatcher::with_results(Vec::new());
+        let worker = worker(repo.clone(), matcher.clone());
 
-        let outcome = worker.tick().await.unwrap();
+        let outcome = worker.handle_reorg(8, 9).await.unwrap();
 
         assert_eq!(
             outcome,
@@ -875,112 +753,6 @@ mod tests {
             }
         );
         assert_eq!(repo.reorgs(), vec![(8, 9)]);
-        assert!(matcher.calls().is_empty());
-        assert!(repo.commits().is_empty());
-    }
-
-    #[tokio::test]
-    async fn empty_page_advances_to_kv_completed_block() {
-        let repo = FakePaymentRepository::with_lease(lease(10, 7));
-        let reader = FakeLogReader::new(cursor(15, 7, None));
-        let matcher = FakeMatcher::with_pages(vec![Ok(match_page(Vec::new(), None, None, 7))]);
-        let worker = worker(repo.clone(), matcher, reader);
-
-        let outcome = worker.tick().await.unwrap();
-
-        assert!(matches!(
-            outcome,
-            PaymentScannerTickOutcome::Committed {
-                complete_to_block: 15,
-                matched_payments: 0,
-                ..
-            }
-        ));
-        assert_eq!(repo.commits()[0].complete_to_block, 15);
-        assert!(repo.commits()[0].matched_payments.is_empty());
-    }
-
-    #[tokio::test]
-    async fn old_lookback_log_does_not_pin_scanner_cursor() {
-        let repo = FakePaymentRepository::with_lease(lease(10, 7));
-        let reader = FakeLogReader::new(cursor(12, 7, None));
-        let matcher = FakeMatcher::with_pages(vec![
-            Ok(match_page(
-                vec![matched_payment(order_id(1), 11)],
-                Some(10),
-                Some(LogPageToken::new(11, 0)),
-                7,
-            )),
-            Ok(match_page(Vec::new(), None, None, 7)),
-        ]);
-        let worker = worker(repo.clone(), matcher, reader);
-
-        let outcome = worker.tick().await.unwrap();
-
-        assert!(matches!(
-            outcome,
-            PaymentScannerTickOutcome::Committed {
-                complete_to_block: 12,
-                matched_payments: 1,
-                ..
-            }
-        ));
-        assert_eq!(repo.commits()[0].complete_to_block, 12);
-        assert_eq!(repo.commits()[0].matched_payments.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn old_unmatched_lookback_log_does_not_pin_scanner_cursor() {
-        let repo = FakePaymentRepository::with_lease(lease(10, 7));
-        let reader = FakeLogReader::new(cursor(12, 7, None));
-        let matcher = FakeMatcher::with_pages(vec![
-            Ok(match_page(
-                Vec::new(),
-                Some(9),
-                Some(LogPageToken::new(9, 0)),
-                7,
-            )),
-            Ok(match_page(Vec::new(), None, None, 7)),
-        ]);
-        let worker = worker(repo.clone(), matcher.clone(), reader);
-
-        let outcome = worker.tick().await.unwrap();
-
-        assert!(matches!(
-            outcome,
-            PaymentScannerTickOutcome::Committed {
-                complete_to_block: 12,
-                matched_payments: 0,
-                ..
-            }
-        ));
-        assert_eq!(repo.commits()[0].complete_to_block, 12);
-        assert_eq!(matcher.calls(), vec![None, Some(LogPageToken::new(9, 0))]);
-    }
-
-    #[tokio::test]
-    async fn incomplete_page_does_not_commit() {
-        let repo = FakePaymentRepository::with_lease(lease(10, 7));
-        let reader = FakeLogReader::new(cursor(12, 7, None));
-        let matcher = FakeMatcher::with_pages(vec![Ok(match_page(
-            vec![matched_payment(order_id(1), 11)],
-            None,
-            Some(LogPageToken::new(11, 0)),
-            7,
-        ))]);
-        let worker = worker(repo.clone(), matcher, reader);
-
-        let outcome = worker.tick().await.unwrap();
-
-        assert_eq!(
-            outcome,
-            PaymentScannerTickOutcome::PageIncomplete {
-                stream: stream(),
-                last_scanned_block: 10,
-                next_token: Some(LogPageToken::new(11, 0)),
-            }
-        );
-        assert!(repo.commits().is_empty());
     }
 
     #[tokio::test]
@@ -999,10 +771,9 @@ mod tests {
                 9,
                 PaymentChainStatus::Confirmed,
             )]);
-        let reader = FakeLogReader::new(cursor(10, 7, None));
-        let matcher = FakeMatcher::with_pages(vec![Ok(match_page(Vec::new(), Some(10), None, 7))]);
+        let matcher = FakeMatcher::with_results(Vec::new());
         let head = FakeHeadReader::new(block_ref(10));
-        let worker = worker_with_head(repo.clone(), matcher, reader, head);
+        let worker = worker_with_head(repo.clone(), matcher, head);
 
         let outcome = worker.tick().await.unwrap();
 
@@ -1017,7 +788,7 @@ mod tests {
                     payment_id,
                     order_id,
                     9,
-                    PaymentChainStatus::Confirmed
+                    PaymentChainStatus::Confirmed,
                 )],
             }
         );
@@ -1034,10 +805,9 @@ mod tests {
             FakePaymentRepository::with_lease(lease(10, 7)).with_confirmation_candidates(vec![
                 confirmation_candidate(payment_id(9), order_id(9), block_ref(9)),
             ]);
-        let reader = FakeLogReader::new(cursor(10, 7, None));
-        let matcher = FakeMatcher::with_pages(vec![Ok(match_page(Vec::new(), Some(10), None, 7))]);
+        let matcher = FakeMatcher::with_results(Vec::new());
         let head = FakeHeadReader::new(block_ref(10)).with_block(9, block_hash(0xee));
-        let worker = worker_with_head(repo.clone(), matcher, reader, head);
+        let worker = worker_with_head(repo.clone(), matcher, head);
 
         let error = worker.tick().await.unwrap_err();
 
@@ -1066,9 +836,9 @@ mod tests {
                 actual_lease_owner: Some("scanner-2".to_string()),
             },
         );
-        let reader = FakeLogReader::new(cursor(12, 7, None));
-        let matcher = FakeMatcher::with_pages(vec![Ok(match_page(Vec::new(), Some(12), None, 7))]);
-        let worker = worker(repo, matcher, reader);
+        let matcher = FakeMatcher::with_results(vec![Ok(Vec::new())]);
+        let head = FakeHeadReader::new(block_ref(12));
+        let worker = worker_with_head(repo, matcher, head);
 
         let error = worker.tick().await.unwrap_err();
 
@@ -1082,9 +852,8 @@ mod tests {
     #[test]
     fn spawn_loop_rejects_zero_poll_interval() {
         let repo = FakePaymentRepository::without_lease();
-        let reader = FakeLogReader::new(cursor(20, 7, None));
-        let matcher = FakeMatcher::with_pages(Vec::new());
-        let worker = worker(repo, matcher, reader);
+        let matcher = FakeMatcher::with_results(Vec::new());
+        let worker = worker(repo, matcher);
 
         let error = spawn_payment_scanner_loop(worker, StdDuration::ZERO).unwrap_err();
 
@@ -1100,33 +869,28 @@ mod tests {
     fn worker(
         repo: FakePaymentRepository,
         matcher: FakeMatcher,
-        reader: FakeLogReader,
     ) -> PaymentScannerWorker<
         FakePaymentRepository,
         FakeMatcher,
-        FakeLogReader,
         FakeHeadReader,
         FixedClock,
     > {
-        worker_with_head(repo, matcher, reader, FakeHeadReader::new(block_ref(100)))
+        worker_with_head(repo, matcher, FakeHeadReader::new(block_ref(100)))
     }
 
     fn worker_with_head(
         repo: FakePaymentRepository,
         matcher: FakeMatcher,
-        reader: FakeLogReader,
         head: FakeHeadReader,
     ) -> PaymentScannerWorker<
         FakePaymentRepository,
         FakeMatcher,
-        FakeLogReader,
         FakeHeadReader,
         FixedClock,
     > {
         PaymentScannerWorker::new(
             repo,
             matcher,
-            reader,
             head,
             FixedClock,
             PaymentScannerConfig::new("scanner-1", stream(), Duration::seconds(30)),
@@ -1402,35 +1166,27 @@ mod tests {
 
     #[derive(Clone)]
     struct FakeMatcher {
-        state: Arc<Mutex<FakeMatcherState>>,
-    }
-
-    struct FakeMatcherState {
-        pages: VecDeque<Result<PaymentMatchPage, PaymentMatchingError>>,
-        calls: Vec<Option<LogPageToken>>,
+        calls: Arc<Mutex<Vec<(u64, u64)>>>,
+        results: Arc<Mutex<VecDeque<Result<Vec<MatchedPaymentInput>, PaymentMatchingError>>>>,
     }
 
     impl FakeMatcher {
-        fn with_pages(pages: Vec<Result<PaymentMatchPage, PaymentMatchingError>>) -> Self {
+        fn with_results(
+            results: Vec<Result<Vec<MatchedPaymentInput>, PaymentMatchingError>>,
+        ) -> Self {
             Self {
-                state: Arc::new(Mutex::new(FakeMatcherState {
-                    pages: pages.into(),
-                    calls: Vec::new(),
-                })),
+                calls: Arc::new(Mutex::new(Vec::new())),
+                results: Arc::new(Mutex::new(results.into())),
             }
         }
 
-        fn calls(&self) -> Vec<Option<LogPageToken>> {
-            self.state
-                .lock()
-                .expect("fake matcher lock poisoned")
-                .calls
-                .clone()
+        fn calls(&self) -> Vec<(u64, u64)> {
+            self.calls.lock().unwrap().clone()
         }
     }
 
     #[async_trait]
-    impl PaymentPageMatcher for FakeMatcher {
+    impl PaymentRangeMatcher for FakeMatcher {
         fn config(&self) -> PaymentMatchingConfig {
             PaymentMatchingConfig {
                 stream: stream(),
@@ -1440,64 +1196,17 @@ mod tests {
             }
         }
 
-        async fn match_next_payment_page(
+        async fn match_range(
             &self,
-            after: Option<LogPageToken>,
-        ) -> Result<PaymentMatchPage, PaymentMatchingError> {
-            let mut state = self.state.lock().expect("fake matcher lock poisoned");
-            state.calls.push(after);
-            state
-                .pages
+            from_block: u64,
+            to_block: u64,
+        ) -> Result<Vec<MatchedPaymentInput>, PaymentMatchingError> {
+            self.calls.lock().unwrap().push((from_block, to_block));
+            self.results
+                .lock()
+                .unwrap()
                 .pop_front()
-                .expect("fake matcher page should be queued")
-        }
-    }
-
-    #[derive(Clone)]
-    struct FakeLogReader {
-        cursor: TransferLogCursor,
-    }
-
-    impl FakeLogReader {
-        const fn new(cursor: TransferLogCursor) -> Self {
-            Self { cursor }
-        }
-    }
-
-    #[async_trait]
-    impl TransferLogReader for FakeLogReader {
-        async fn cursor(
-            &self,
-            _stream: StreamId,
-        ) -> Result<TransferLogCursor, TransferLogStoreError> {
-            Ok(self.cursor.clone())
-        }
-
-        async fn block_header(
-            &self,
-            _stream: StreamId,
-            _block: u64,
-        ) -> Result<Option<StoredBlockHeader>, TransferLogStoreError> {
-            Ok(None)
-        }
-
-        async fn logs_in_range(
-            &self,
-            _stream: StreamId,
-            _from: u64,
-            _to: u64,
-            _max_logs: usize,
-        ) -> Result<Vec<StoredTransferLog>, TransferLogStoreError> {
-            Ok(Vec::new())
-        }
-
-        async fn logs_page(
-            &self,
-            _stream: StreamId,
-            _after: Option<LogPageToken>,
-            _limit: usize,
-        ) -> Result<LogsPage, TransferLogStoreError> {
-            Ok(LogsPage::new(stream(), Vec::new(), None, None))
+                .unwrap_or_else(|| Ok(Vec::new()))
         }
     }
 
@@ -1509,41 +1218,6 @@ mod tests {
             lease_until: now() + Duration::seconds(30),
             last_scanned_block,
             seen_kv_reorg_epoch,
-        }
-    }
-
-    fn cursor(
-        last_completed_block: u64,
-        reorg_epoch: u64,
-        last_reorg_from: Option<u64>,
-    ) -> TransferLogCursor {
-        TransferLogCursor {
-            stream: stream(),
-            start_block: 1,
-            next_block: last_completed_block + 1,
-            last_completed_block: Some(last_completed_block),
-            last_completed_hash: Some(BlockHash::ZERO),
-            target_mode: ScanTargetMode::SafeTag,
-            reorg_epoch,
-            last_reorg_from,
-            last_reorg_at: last_reorg_from.map(|_| now()),
-            writer_epoch: 1,
-            updated_at: now(),
-        }
-    }
-
-    fn match_page(
-        matched_payments: Vec<MatchedPaymentInput>,
-        complete_to_block: Option<u64>,
-        next_token: Option<LogPageToken>,
-        kv_reorg_epoch: u64,
-    ) -> PaymentMatchPage {
-        PaymentMatchPage {
-            matched_payments,
-            rejected: Vec::new(),
-            next_token,
-            complete_to_block,
-            kv_reorg_epoch,
         }
     }
 

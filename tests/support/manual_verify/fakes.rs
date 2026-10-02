@@ -2,7 +2,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use pay3::{
-    chain::{ChainBlock, ChainError, ChainHeaderReader},
+    chain::{
+        ChainBlock, ChainError, ChainHeaderReader, TransferLog, TransferLogCapacityLimits,
+        TransferLogCapacityReport, TransferLogRange, TransferLogSource,
+    },
     db::repositories::{
         AllocatedDerivation, CreateOrderCommand, CreateOrderOutcome, MatchedPaymentInput,
         OrderRecord, OrderRepository, OrderView, PaymentRecord, RepositoryError,
@@ -246,6 +249,54 @@ impl TransferLogReader for FakeLogReader {
         _limit: usize,
     ) -> Result<LogsPage, TransferLogStoreError> {
         unimplemented!("manual verify reads a bounded order window, not scanner pages")
+    }
+}
+
+#[async_trait]
+impl TransferLogSource for FakeLogReader {
+    async fn transfer_logs(
+        &self,
+        range: TransferLogRange,
+    ) -> Result<Vec<TransferLog>, ChainError> {
+        self.calls.lock().unwrap().push(LogReaderCall::LogsInRange {
+            stream: self.stream,
+            from: range.from_block,
+            to: range.to_block,
+            max_logs: 1000,
+        });
+        Ok(self
+            .logs
+            .iter()
+            .filter(|log| log.block_number >= range.from_block && log.block_number <= range.to_block)
+            .map(|l| TransferLog {
+                chain_id: l.chain_id,
+                token_address: l.token_address,
+                block: ChainBlock::new(
+                    l.block_number,
+                    l.block_hash,
+                    pay3::domain::BlockHash::ZERO,
+                    l.block_timestamp,
+                ),
+                tx_hash: l.tx_hash,
+                log_index: l.log_index,
+                from_address: l.from_address,
+                to_address: l.to_address,
+                amount_raw: l.amount_raw,
+            })
+            .collect())
+    }
+
+    async fn capacity_probe(
+        &self,
+        range: TransferLogRange,
+        limits: TransferLogCapacityLimits,
+    ) -> Result<TransferLogCapacityReport, ChainError> {
+        Ok(TransferLogCapacityReport {
+            range,
+            log_count: 0,
+            max_logs_in_single_block: 0,
+            limits,
+        })
     }
 }
 

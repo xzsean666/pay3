@@ -51,7 +51,7 @@ TODO -> IN_PROGRESS -> REVIEW -> DONE
 | 任务编号 | 任务名称 | 核心范围 | 依赖项 | 状态 | 关联任务卡 |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **TASK-025** | 多 RPC 负载均衡与智能 CD 冷却升级 | 原子 Round-Robin 分发、429/超时分级 CD 隔离、健康自动探测 | TASK-008 | `DONE` | [TASK-025.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-025.md) |
-| **TASK-026** | 移除 redb 改造为 Direct 无状态扫描器 | 废弃 KVDB、直接 RPC 拉取 + 内存地址过滤 + PostgreSQL 事务写入 | TASK-025 | `TODO` | [TASK-026.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-026.md) |
+| **TASK-026** | 移除 redb 改造为 Direct 无状态扫描器 | 废弃 KVDB、直接 RPC 拉取 + 内存地址过滤 + PostgreSQL 事务写入 | TASK-025 | `DONE` | [TASK-026.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-026.md) |
 | **TASK-018** | 远程 JWKS 动态拉取与密钥轮换 | 实现 `JWT_JWKS_URL` 异步后台刷新、缓存与故障降级 | TASK-003, TASK-016 | `TODO` | [TASK-018.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-018.md) |
 | **TASK-019** | 生产级远程 Signer 部署与网络隔离契约 | Remote Signer 服务鉴权、mTLS/HMAC 签名校验、独立部署配置 | TASK-007, TASK-016 | `TODO` | [TASK-019.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-019.md) |
 | **TASK-020** | Prometheus 告警规则 Dry-Run 与指标补全 | 核心告警规则配置验证、指标模拟上报、Grafana 仪表盘配置 | TASK-016 | `TODO` | [TASK-020.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-020.md) |

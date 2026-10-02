@@ -44,10 +44,7 @@ use pay3::{
         payments::{PaymentMatcher, PaymentMatchingConfig},
     },
     signer::{LocalMnemonicSigner, SignedTx, SignerProvider, UnsignedTx},
-    transfer_log_store::{
-        LogSourceKind, PollOutcome, RedbTransferLogIngestor, ScanTargetMode, StreamId,
-        TransferLogIngestor, TransferLogReader, TransferLogStreamConfig,
-    },
+    transfer_log_store::StreamId,
     wallet::HdWallet,
     workers::{
         collector::{
@@ -58,7 +55,6 @@ use pay3::{
 };
 use serde_json::{Value, json};
 use sqlx::{Connection, Executor, PgConnection, PgPool, postgres::PgPoolOptions};
-use tempfile::TempDir;
 use time::Duration as TimeDuration;
 use tokio::{sync::Mutex, task::JoinSet};
 use uuid::Uuid;
@@ -77,11 +73,10 @@ type RealChainCollectionService = CollectionService<
 type RealChainScanner = PaymentScannerWorker<
     PgPaymentRepository,
     PaymentMatcher<
-        RedbTransferLogIngestor<RpcRangeSource>,
+        RpcRangeSource,
         RepositoryPaymentWindowLookup<PgOrderRepository>,
         RpcRangeSource,
     >,
-    RedbTransferLogIngestor<RpcRangeSource>,
     RpcRangeSource,
     SystemClock,
 >;
@@ -91,7 +86,6 @@ type RealChainCollector =
 const DEFAULT_ENV_FILE: &str = ".env.test";
 const DEFAULT_PAYER_DERIVATION_PATH: &str = "m/44'/60'/0'/0/0";
 const DEFAULT_ORDER_TTL_SECONDS: u64 = 3_600;
-const DEFAULT_BATCH_SIZE_BLOCKS: u64 = 100;
 const DEFAULT_RECEIPT_TIMEOUT_SECS: u64 = 180;
 const DEFAULT_CONFIRMATION_TIMEOUT_SECS: u64 = 360;
 const DEFAULT_COLLECTION_GAS_LIMIT: u64 = 120_000;
@@ -126,7 +120,7 @@ async fn real_chain_order_payment_collection_flow() -> Result<(), AnyError> {
         .optional("PAY3_E2E_RECEIVE_ADDRESS_INDEX")
         .unwrap_or("0")
         .parse::<u32>()?;
-    let batch_size_blocks = env_values
+    let _batch_size_blocks = env_values
         .optional("PAY3_E2E_BATCH_SIZE_BLOCKS")
         .unwrap_or("100")
         .parse::<u64>()?
@@ -241,28 +235,6 @@ async fn real_chain_order_payment_collection_flow() -> Result<(), AnyError> {
         .await?;
         set_wallet_cursor_address_index(&pool, receive_address_index).await?;
 
-        let kvdb_dir = TempDir::new()?;
-        let kvdb_path = kvdb_dir.path().join("real-chain-transfer-log.redb");
-        let log_store = RedbTransferLogIngestor::open(rpc_source.clone(), &kvdb_path)?;
-        let stream_config = TransferLogStreamConfig {
-            chain_id: config.chain.chain_id,
-            token_address: config.chain.token_address,
-            start_block,
-            poll_interval_ms: 1_000,
-            batch_size_blocks,
-            max_batch_size_blocks: batch_size_blocks.max(DEFAULT_BATCH_SIZE_BLOCKS),
-            max_logs_per_page: 1_000,
-            max_unique_to_addresses_per_batch: 1_000,
-            max_db_fallback_addresses: 1_000,
-            capacity_probe_blocks: 1,
-            reorg_lookback_blocks: config.chain.min_confirmations.max(1),
-            target_mode: ScanTargetMode::LatestMinusConfirmations(0),
-            rpc_max_retries: 3,
-            log_source: LogSourceKind::RpcRange,
-            sparse_headers: false,
-        };
-        log_store.ensure_stream(stream_config).await?;
-
         let order_service = OrderService::new(
             OrderServiceConfig::new(
                 config.chain.chain_id,
@@ -275,7 +247,7 @@ async fn real_chain_order_payment_collection_flow() -> Result<(), AnyError> {
         )?;
 
         let payment_matcher = PaymentMatcher::new(
-            log_store.clone(),
+            rpc_source.clone(),
             RepositoryPaymentWindowLookup::new(order_repo.clone(), 1_000),
             rpc_source.clone(),
             PaymentMatchingConfig {
@@ -288,7 +260,6 @@ async fn real_chain_order_payment_collection_flow() -> Result<(), AnyError> {
         let scanner = Arc::new(PaymentScannerWorker::new(
             payment_repo,
             payment_matcher,
-            log_store.clone(),
             rpc_source.clone(),
             SystemClock,
             PaymentScannerConfig::new("real-chain-scanner-e2e", stream, TimeDuration::seconds(60))
@@ -360,7 +331,6 @@ async fn real_chain_order_payment_collection_flow() -> Result<(), AnyError> {
                 concurrency,
                 order_service: order_service.clone(),
                 scanner: scanner.clone(),
-                log_store: log_store.clone(),
                 rpc_source: rpc_source.clone(),
                 pool: pool.clone(),
                 order_repo: order_repo.clone(),
@@ -488,7 +458,7 @@ async fn real_chain_order_payment_collection_flow() -> Result<(), AnyError> {
             payment_receipt.block.number
         );
         poll_log_store_until(
-            &log_store,
+            &rpc_source,
             stream,
             payment_receipt.block.number,
             confirmation_timeout,
@@ -842,7 +812,6 @@ struct ConcurrentRealChainContext {
     concurrency: usize,
     order_service: RealChainOrderService,
     scanner: Arc<RealChainScanner>,
-    log_store: RedbTransferLogIngestor<RpcRangeSource>,
     rpc_source: RpcRangeSource,
     pool: PgPool,
     order_repo: PgOrderRepository,
@@ -1223,36 +1192,25 @@ async fn wait_for_confirmations(
 }
 
 async fn poll_log_store_until(
-    log_store: &RedbTransferLogIngestor<RpcRangeSource>,
+    rpc_source: &RpcRangeSource,
     stream: StreamId,
     target_block: u64,
     timeout: StdDuration,
 ) -> Result<(), AnyError> {
     let deadline = std::time::Instant::now() + timeout;
     eprintln!(
-        "[real-chain-e2e] polling transfer log store stream={:?} until block {}",
+        "[real-chain-e2e] waiting for chain head stream={:?} until block {}",
         stream, target_block
     );
     loop {
-        let cursor = log_store.cursor(stream).await?;
-        if cursor
-            .last_completed_block
-            .is_some_and(|completed| completed >= target_block)
-        {
+        let head = rpc_source.latest_head().await?;
+        if head.number >= target_block {
             return Ok(());
         }
-        match log_store.poll_once(stream).await {
-            Ok(PollOutcome::Advanced { .. } | PollOutcome::Rewound { .. }) => {}
-            Ok(PollOutcome::Idle { .. }) => tokio::time::sleep(StdDuration::from_secs(2)).await,
-            Err(error) if is_transient_external_error(&error) => {
-                eprintln!("temporary log store poll failure for stream {stream:?}: {error}");
-                tokio::time::sleep(StdDuration::from_secs(2)).await;
-            }
-            Err(error) => return Err(Box::new(error)),
-        }
+        tokio::time::sleep(StdDuration::from_secs(2)).await;
         if std::time::Instant::now() > deadline {
             return Err(helper_error(format!(
-                "timed out waiting for transfer log store to cover block {target_block}"
+                "timed out waiting for chain head to reach block {target_block}"
             )));
         }
     }
@@ -1318,7 +1276,6 @@ where
                 PaymentScannerTickOutcome::Committed { .. }
                 | PaymentScannerTickOutcome::ConfirmationsSwept { .. }
                 | PaymentScannerTickOutcome::Idle { .. }
-                | PaymentScannerTickOutcome::PageIncomplete { .. }
                 | PaymentScannerTickOutcome::LeaseHeld { .. }
                 | PaymentScannerTickOutcome::KvReorgHandled { .. },
             ) => {}
@@ -1476,7 +1433,6 @@ async fn run_real_chain_concurrent_flow(ctx: ConcurrentRealChainContext) -> Resu
         concurrency,
         order_service,
         scanner,
-        log_store,
         rpc_source,
         pool,
         order_repo,
@@ -1598,7 +1554,6 @@ async fn run_real_chain_concurrent_flow(ctx: ConcurrentRealChainContext) -> Resu
         let order_service = order_service.clone();
         let scanner = scanner.clone();
         let scanner_lock = scanner_lock.clone();
-        let log_store = log_store.clone();
         let rpc_source = rpc_source.clone();
         let pool = pool.clone();
         let order_repo = order_repo.clone();
@@ -1699,7 +1654,7 @@ async fn run_real_chain_concurrent_flow(ctx: ConcurrentRealChainContext) -> Resu
                 payment_receipt.block.number
             );
             poll_log_store_until(
-                &log_store,
+                &rpc_source,
                 stream,
                 payment_receipt.block.number,
                 confirmation_timeout,

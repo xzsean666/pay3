@@ -44,4 +44,4 @@ cargo test --test anvil_e2e
 - 极端大日志量通过 RPC 批大小（`SCAN_BATCH_SIZE`）与并发量控制，避免单次拉取超限。
 
 ## Status
-TODO
+DONE
