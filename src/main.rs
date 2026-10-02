@@ -6,6 +6,17 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--verify-readiness" || arg == "--check-config") {
+        let config = AppConfig::from_env()?;
+        config.validate_profile()?;
+        println!(
+            "Configuration pre-flight validation SUCCESS: profile={:?}, role={:?}, chain_id={}, token={}",
+            config.profile, config.runtime.role, config.chain.chain_id, config.chain.token_address
+        );
+        return Ok(());
+    }
+
     init_tracing();
 
     let config = AppConfig::from_env()?;

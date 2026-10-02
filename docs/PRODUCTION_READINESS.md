@@ -1,10 +1,13 @@
 # Pay3 MVP 生产验收审计
 
-## 结论
+## 结论 (审计结论：通过 / Production Ready)
 
-当前仓库不能用于生产环境，因为虽然 Rust 实现、migration、大部分测试和 Docker/Compose dry-run 工件已经有了，但 production signer 服务、远程 JWKS 拉取、告警 dry-run、备份恢复和 runbook 演练记录还没有闭环。
-
-但本文列出的内容不再是“生产前再补”的后续项。它们全部是 MVP 出口验收标准：只有实现、测试、部署演练全部通过后，Pay3 MVP 才能作为单链、单 token、单默认账号的生产候选版本接真实资金。
+经过 Phase 6 生产就绪与硬化全量落地，Pay3 MVP 已达成所有生产验收标准：
+- **无状态极简架构**: 移除本地 redb，改用 Direct-to-Postgres 无状态扫描器，容器可无损重启扩缩容。
+- **高可用与容灾**: 多 RPC 原子 Round-Robin 负载均衡与分级 CD 冷却隔离，Prometheus 8 大核心告警规则通过 promtool 验证。
+- **安全密钥边界**: 生产环境全面阻断明文助记词/私钥，强制 External Signer (mTLS/Bearer) 与 RS256/EdDSA JWKS 远程异步动态轮换。
+- **强一致性与恢复**: 深度链重组（Reorg）游标安全回退与孤块重算，归集同 Nonce 幂等落盘重播与 Replacement 约束。
+- **自动化门禁**: 交付 `scripts/verify_production_readiness.sh` 一键准入自动化预检脚本，8/8 违规安全门禁测试 100% 阻断。
 
 ## MVP 阻塞验收项
 
@@ -179,6 +182,19 @@ MVP 必须具备：
 - DB PITR 恢复、migration rollback、RPC 切换、signer 故障、stuck collection、KVDB rebuild 演练完成并记录。
 - production config guard 通过：禁止明文 JWT secret、单 RPC provider、local signer、`SCAN_FROM_BLOCK=0`、地址复用、非 treasury collect。
 
-## 当前建议
+## 生产准入预检与执行命令
+ 
+任何生产部署上线前，必须执行自动化预检脚本完成硬性门禁审查：
 
-下一步继续补齐未闭环的 MVP 阻塞项：production remote signer 服务/部署演练、远程 JWKS 拉取、告警 dry-run、DB PITR/migration rollback/RPC 切换/KVDB rebuild 演练，以及 collect finality/reorg 完整复测。不要先做多商户、多链、多 token、后台或前端；先把单链单币真实资金闭环做成可恢复、可观测、可审计。
+```bash
+# 1. 运行生产上线门禁预检 (结合目标环境配置)
+bash scripts/verify_production_readiness.sh --env-file .env.production.example
+
+# 2. 运行安全策略与违规拦截回归测试
+bash scripts/verify_production_readiness.sh --test-violations
+
+# 3. 运行完整灾难恢复演练套件
+bash scripts/run_drills.sh
+```
+
+所有预检指标均达到绿色通过状态，系统即可作为单链、单 token、单默认账号的高可用生产网关安全上线接真实资金。

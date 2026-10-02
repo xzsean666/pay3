@@ -37,4 +37,4 @@ bash scripts/verify_production_readiness.sh --env-file .env.production.example
 - 脚本执行环境具备 `curl`、`jq` 或对应 CLI 工具支持。
 
 ## Status
-TODO
+DONE

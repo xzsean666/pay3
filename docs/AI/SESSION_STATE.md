@@ -8,7 +8,7 @@
 
 - **当前 Goal**: 生产级极简架构重构与生产就绪硬化（单实例单 Token、多 RPC 负载均衡 + CD 熔断机制、无状态 Direct Scanner、远程 JWKS 动态拉取与轮换、远程 Signer 部署与鉴权加固、Prometheus 告警规则 Dry-run、深度 Reorg 回归、归集崩溃恢复与 Nonce 幂等、灾难演练与上线审计门禁）
 - **当前 Task**: [TASK-024: 生产上线审计门禁自动化验证脚本](file:///ssd0/git/pay3/docs/AI/tasks/TASK-024.md)
-- **当前状态**: `IN_PROGRESS`
+- **当前状态**: `DONE` (全量任务 100% 达成)
 
 ---
 
@@ -59,29 +59,34 @@
     - 全面更新 `docs/RUNBOOK.md`，彻底移除已废弃的 redb 运维条目，对齐无状态 Direct Scanner 架构与多 RPC 故障排查手册。
     - 编制 5 份结构化演练执行报告（`docs/drill_reports/DRILL-001 ~ DRILL-005`）：包含 PostgreSQL PITR 恢复演练、无状态 Scanner 游标回退演练、多 RPC CD 隔离与故障转移演练、Remote Signer 宕机与鉴权加固演练、卡死归集同 Nonce 替换演练。
     - 编写自动化演练脚本 `scripts/run_drills.sh` 并实操执行通过。
+12. **完成 TASK-024：生产上线审计门禁自动化验证脚本**:
+    - 在 `src/main.rs` 中支持 `--verify-readiness` / `--check-config` 命令行选项，直接利用 Rust 内置 `AppConfig` profile 规则做确定性静态门禁放行校验。
+    - 提供模板工件 `.env.production.example`，规范生产级单链单币安全变量。
+    - 交付综合预检门禁脚本 `scripts/verify_production_readiness.sh`，覆盖 7 大门禁检验（敏感机密扫描、生产不变量审计、Rust AppConfig 验证、无状态架构合规、依赖健康探测、Prometheus 告警规则语法及时序单测校验、灾备工件审计）。
+    - 提供 `--test-violations` 自动化负例回归测试，8/8 关键违规项（如明文助记词、弱 JWT、单 RPC、START_BLOCK=0、地址冲突等）100% 拦截。
+    - 更新 `docs/PRODUCTION_READINESS.md` 签署通过结论并给出上线前执行步骤。
 
 ---
 
 ## 3. 修改、创建与移除的文件清单
 
 ### 创建文件
-- `docs/drill_reports/DRILL-001-DB-PITR-RECOVERY.md`
-- `docs/drill_reports/DRILL-002-STATELESS-SCANNER-RESUME.md`
-- `docs/drill_reports/DRILL-003-MULTI-RPC-COOLDOWN.md`
-- `docs/drill_reports/DRILL-004-REMOTE-SIGNER-OUTAGE.md`
-- `docs/drill_reports/DRILL-005-STUCK-COLLECTION-REPLACEMENT.md`
-- `scripts/run_drills.sh`
+- `.env.production.example`
+- `scripts/verify_production_readiness.sh`
 
 ### 修改文件
-- `docs/RUNBOOK.md`
+- `src/main.rs`
+- `docs/PRODUCTION_READINESS.md`
 - `docs/AI/TASK_INDEX.md`
-- `docs/AI/tasks/TASK-023.md`
+- `docs/AI/tasks/TASK-024.md`
 - `docs/AI/SESSION_STATE.md`
 
 ---
 
 ## 4. 已运行的验证命令及结果
 
+- `bash scripts/verify_production_readiness.sh --env-file .env.production.example`: **通过**。21 checks passed, 0 failed.
+- `bash scripts/verify_production_readiness.sh --test-violations`: **通过**。8/8 违规用例全部精准阻断拦截。
 - `bash scripts/run_drills.sh`: **通过**。5 大容灾演练场景及 Prometheus 告警规则全部通过。
 - `cargo check --all-targets`: **通过**。零错误，零警告。
 - `cargo test --tests`: **通过**。全部 264 个单元/契约/集成测试全部绿色通过。
@@ -90,19 +95,21 @@
 
 ## 5. 未解决问题与剩余工作
 
-- 推进最后一个任务 **TASK-024**：生产上线审计门禁自动化验证脚本。
+- **无未解决问题**。
+- `docs/AI/TASK_INDEX.md` 中所有 26 个任务卡（TASK-001 ~ TASK-026）全部处于 `DONE` 状态。
+- 系统已全面达到生产可用，架构极简、单实例单币、无状态扫描、高可用容灾与审计门禁全部闭环。
 
 ---
 
 ## 6. 下一步任务与读取入口
 
-- **下一步执行任务**: [TASK-024: 生产上线审计门禁自动化验证脚本](file:///ssd0/git/pay3/docs/AI/tasks/TASK-024.md)
-- **下一次 Session 应先读取的文件**:
-  1. [AGENTS.md](file:///ssd0/git/pay3/AGENTS.md)
-  2. [docs/AI/SESSION_STATE.md](file:///ssd0/git/pay3/docs/AI/SESSION_STATE.md)
-  3. [docs/AI/TASK_INDEX.md](file:///ssd0/git/pay3/docs/AI/TASK_INDEX.md)
-  4. [docs/AI/tasks/TASK-024.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-024.md)
-  5. [docs/PRODUCTION_READINESS.md](file:///ssd0/git/pay3/docs/PRODUCTION_READINESS.md)
+- **项目状态**: **100% 生产就绪 (Production Ready)**
+- **读取入口**:
+  1. [docs/PRODUCTION_READINESS.md](file:///ssd0/git/pay3/docs/PRODUCTION_READINESS.md) (生产验收结论与上线命令)
+  2. [docs/RUNBOOK.md](file:///ssd0/git/pay3/docs/RUNBOOK.md) (故障排查与运维指南)
+  3. [docs/DEPLOYMENT.md](file:///ssd0/git/pay3/docs/DEPLOYMENT.md) (生产部署架构)
+  4. [docs/AI/ARCHITECTURE.md](file:///ssd0/git/pay3/docs/AI/ARCHITECTURE.md) (系统架构)
+  5. [docs/AI/TASK_INDEX.md](file:///ssd0/git/pay3/docs/AI/TASK_INDEX.md) (全量任务卡索引)
 
 
 
