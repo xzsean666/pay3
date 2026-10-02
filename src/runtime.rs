@@ -376,7 +376,10 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
         )?);
     }
 
-    let auth = jwt_verifier(&config)?;
+    let auth = jwt_verifier(&config).await?;
+    if let Some(refresher) = auth.spawn_background_refresher() {
+        background_tasks.push(refresher);
+    }
     let orders = Arc::new(order_service(
         &config,
         pool.clone(),
@@ -451,7 +454,7 @@ fn runtime_seed_config(config: &AppConfig) -> RuntimeSeedConfig {
     }
 }
 
-fn jwt_verifier(config: &AppConfig) -> Result<JwtVerifier, RuntimeError> {
+async fn jwt_verifier(config: &AppConfig) -> Result<JwtVerifier, RuntimeError> {
     let issuer = config.jwt.issuer.clone();
     let audience = config.jwt.audience.clone();
 
@@ -472,13 +475,8 @@ fn jwt_verifier(config: &AppConfig) -> Result<JwtVerifier, RuntimeError> {
             jwt_algorithm(*algorithm),
             public_key_pem,
         )?,
-        JwtKeySource::RemoteJwks { .. } => {
-            return Err(RuntimeError::Config(ConfigError::Validation {
-                errors: vec![
-                    "JWT_JWKS_URL is reserved for remote JWKS fetch; set JWT_JWKS_JSON for now"
-                        .to_string(),
-                ],
-            }));
+        JwtKeySource::RemoteJwks { url } => {
+            JwtVerifier::from_jwks_url(issuer, audience, url).await?
         }
     })
 }
@@ -1193,10 +1191,10 @@ MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
         );
     }
 
-    #[test]
-    fn jwt_verifier_uses_development_hs256_source() {
+    #[tokio::test]
+    async fn jwt_verifier_uses_development_hs256_source() {
         let config = test_config(&[]);
-        let verifier = jwt_verifier(&config).expect("jwt verifier");
+        let verifier = jwt_verifier(&config).await.expect("jwt verifier");
         let token = signed_token(
             Algorithm::HS256,
             "pay3-key-1",
@@ -1208,14 +1206,14 @@ MCowBQYDK2VwAyEA2+Jj2UvNCvQiUPNYRgSi0cJSPiJI6Rs6D0UTeEpQVj8=
         assert_eq!(principal.subject, "merchant-default");
     }
 
-    #[test]
-    fn jwt_verifier_uses_pem_public_key_source() {
+    #[tokio::test]
+    async fn jwt_verifier_uses_pem_public_key_source() {
         let config = test_config_owned(vec![
             ("JWT_PUBLIC_KEY_PEM", ED_PUBLIC_KEY_PEM.to_string()),
             ("JWT_ALGORITHM", "EdDSA".to_string()),
             ("JWT_KEY_ID", "ed-key".to_string()),
         ]);
-        let verifier = jwt_verifier(&config).expect("jwt verifier");
+        let verifier = jwt_verifier(&config).await.expect("jwt verifier");
         let token = signed_token(
             Algorithm::EdDSA,
             "ed-key",

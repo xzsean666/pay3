@@ -1,7 +1,7 @@
 mod jwt;
 mod scope;
 
-pub use jwt::{Audience, Claims, JwtVerifier, Principal};
+pub use jwt::{Audience, Claims, JwtVerifier, Principal, RemoteJwksConfig};
 pub use scope::{
     COLLECTIONS_CREATE_SCOPE, COLLECTIONS_READ_SCOPE, ORDERS_CREATE_SCOPE, ORDERS_READ_SCOPE,
     ORDERS_VERIFY_SCOPE, ScopeSet, require_scope,
@@ -47,4 +47,6 @@ pub enum AuthError {
     MissingScope(String),
     #[error("insufficient scope: {0}")]
     InsufficientScope(String),
+    #[error("remote jwks fetch failed: {0}")]
+    RemoteJwksFetchFailed(String),
 }

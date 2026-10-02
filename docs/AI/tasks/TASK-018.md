@@ -38,4 +38,4 @@ cargo clippy --all-targets -- -D warnings
 - 依赖网络连接访问指定的 Identity Provider JWKS 端点。
 
 ## Status
-TODO
+DONE

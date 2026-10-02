@@ -698,7 +698,7 @@ async fn create_order(
     headers: HeaderMap,
     payload: Result<Json<CreateOrderRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<OrderResponse>), ApiError> {
-    let principal = require_scope(&state, &headers, ORDERS_CREATE_SCOPE)?;
+    let principal = require_scope(&state, &headers, ORDERS_CREATE_SCOPE).await?;
     let Json(payload) = payload.map_err(json_rejection)?;
     let config = state.order_response_config()?;
 
@@ -738,7 +738,7 @@ async fn get_order(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<OrderResponse>, ApiError> {
-    let principal = require_scope(&state, &headers, ORDERS_READ_SCOPE)?;
+    let principal = require_scope(&state, &headers, ORDERS_READ_SCOPE).await?;
     let id = parse_order_id(&id)?;
     let config = state.order_response_config()?;
     let Some(view) = state
@@ -761,7 +761,7 @@ async fn get_order_by_external_id(
     headers: HeaderMap,
     Path(external_id): Path<String>,
 ) -> Result<Json<OrderResponse>, ApiError> {
-    let principal = require_scope(&state, &headers, ORDERS_READ_SCOPE)?;
+    let principal = require_scope(&state, &headers, ORDERS_READ_SCOPE).await?;
     let config = state.order_response_config()?;
     let Some(view) = state
         .orders()?
@@ -784,7 +784,7 @@ async fn accept_problem_payment(
     Path(id): Path<String>,
     payload: Result<Json<AcceptProblemPaymentRequest>, JsonRejection>,
 ) -> Result<Json<OrderResponse>, ApiError> {
-    let principal = require_scope(&state, &headers, ORDERS_VERIFY_SCOPE)?;
+    let principal = require_scope(&state, &headers, ORDERS_VERIFY_SCOPE).await?;
     let id = parse_order_id(&id)?;
     let Json(payload) = payload.map_err(json_rejection)?;
     let config = state.order_response_config()?;
@@ -812,7 +812,7 @@ async fn create_collection(
     headers: HeaderMap,
     payload: Result<Json<CreateCollectionRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<CollectionResponse>), ApiError> {
-    let principal = require_scope(&state, &headers, COLLECTIONS_CREATE_SCOPE)?;
+    let principal = require_scope(&state, &headers, COLLECTIONS_CREATE_SCOPE).await?;
     let Json(payload) = payload.map_err(json_rejection)?;
     let order_id = parse_order_id(&payload.order_id)?;
     let amount = parse_collection_amount(&payload.amount)?;
@@ -849,7 +849,7 @@ async fn get_collection(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<CollectionResponse>, ApiError> {
-    let principal = require_scope(&state, &headers, COLLECTIONS_READ_SCOPE)?;
+    let principal = require_scope(&state, &headers, COLLECTIONS_READ_SCOPE).await?;
     let id = parse_collection_id(&id)?;
     let Some(collection) = state
         .collections()?
@@ -1045,7 +1045,7 @@ fn parse_collection_amount(value: &str) -> Result<CollectionAmount, ApiError> {
     }
 }
 
-fn require_scope(
+async fn require_scope(
     state: &ApiState,
     headers: &HeaderMap,
     required_scope: &str,
@@ -1055,7 +1055,8 @@ fn require_scope(
         .and_then(|value| value.to_str().ok());
     state
         .auth()?
-        .verify_bearer_with_scope(authorization, required_scope)
+        .verify_bearer_with_scope_async(authorization, required_scope)
+        .await
         .map_err(auth_error_to_api)
 }
 
@@ -1063,6 +1064,9 @@ fn auth_error_to_api(error: AuthError) -> ApiError {
     match error {
         AuthError::MissingScope(_) | AuthError::InsufficientScope(_) => {
             ApiError::forbidden(error.to_string())
+        }
+        AuthError::RemoteJwksFetchFailed(_) => {
+            ApiError::service_unavailable("jwks_unavailable", error.to_string())
         }
         _ => ApiError::unauthorized(error.to_string()),
     }

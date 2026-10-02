@@ -54,7 +54,7 @@ pub(super) async fn verify_order(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<OrderVerifyResult>, ApiError> {
-    require_scope(&state, &headers, ORDERS_VERIFY_SCOPE)?;
+    require_scope(&state, &headers, ORDERS_VERIFY_SCOPE).await?;
     let id = parse_order_id(&id)?;
     let result = state
         .order_verify()?

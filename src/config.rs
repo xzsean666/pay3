@@ -784,11 +784,10 @@ impl AppConfig {
                     errors.push("production JWT public key requires JWT_KEY_ID".to_string());
                 }
             }
-            JwtKeySource::RemoteJwks { .. } => {
-                errors.push(
-                    "JWT_JWKS_URL is reserved for remote JWKS fetch; set JWT_JWKS_JSON for now"
-                        .to_string(),
-                );
+            JwtKeySource::RemoteJwks { url } => {
+                if !is_https_url(url) {
+                    errors.push("production profile requires HTTPS JWT_JWKS_URL".to_string());
+                }
             }
         }
 
