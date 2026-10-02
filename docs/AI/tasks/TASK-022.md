@@ -37,4 +37,5 @@ cargo test --test collector_recovery_integration
 - 需要模拟故障注入机制。
 
 ## Status
-TODO
+DONE
+

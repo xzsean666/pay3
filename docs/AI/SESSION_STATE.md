@@ -6,8 +6,8 @@
 
 ## 1. 当前上下文
 
-- **当前 Goal**: 生产级极简架构重构与生产就绪硬化（单实例单 Token、多 RPC 负载均衡 + CD 熔断机制、无状态 Direct Scanner、远程 JWKS 动态拉取与轮换、远程 Signer 部署与鉴权加固、Prometheus 告警规则 Dry-run、深度 Reorg 回归）
-- **当前 Task**: [TASK-021: 深度 Reorg 与孤块付款真实 DB 回归](file:///ssd0/git/pay3/docs/AI/tasks/TASK-021.md)
+- **当前 Goal**: 生产级极简架构重构与生产就绪硬化（单实例单 Token、多 RPC 负载均衡 + CD 熔断机制、无状态 Direct Scanner、远程 JWKS 动态拉取与轮换、远程 Signer 部署与鉴权加固、Prometheus 告警规则 Dry-run、深度 Reorg 回归、归集崩溃恢复与 Nonce 幂等）
+- **当前 Task**: [TASK-022: 归集崩溃恢复与 Finality/Reorg 深度回归](file:///ssd0/git/pay3/docs/AI/tasks/TASK-022.md)
 - **当前状态**: `DONE`
 
 ---
@@ -51,44 +51,49 @@
    - 编写 `tests/reorg_integration.rs` 专项测试，构建分叉后孤块付款场景。
    - 验证分叉发生时：`payments` 孤块被标记为 `chain_status = 'orphaned'`，游标回退至 `last_reorg_from - 1`，订单金额实时重算，订单状态从 `paid` 安全倒退回 `pending` 或 `partial`。
    - 验证孤块金额永远无法参与确认数与归集计算的不变量。
+10. **完成 TASK-022：归集崩溃恢复与 Finality/Reorg 深度回归**:
+    - 编写 `tests/collector_recovery_integration.rs` 专项测试，模拟签名后落盘未广播崩溃、同 Nonce Replacement 唯一约束竞争与 Receipt 确认推进。
+    - 验证进程崩溃恢复优先重播既有 Signed Tx 且不分配新 Nonce。
+    - 验证 PostgreSQL Partial Unique Index `outbound_active_nonce_idx` 在同 Nonce 替换生命周期中全程阻止重复活跃记录。
 
 ---
 
 ## 3. 修改、创建与移除的文件清单
 
 ### 创建文件
-- `tests/reorg_integration.rs`
+- `tests/collector_recovery_integration.rs`
 
 ### 修改文件
 - `docs/AI/TASK_INDEX.md`
-- `docs/AI/tasks/TASK-021.md`
+- `docs/AI/tasks/TASK-022.md`
 - `docs/AI/SESSION_STATE.md`
 
 ---
 
 ## 4. 已运行的验证命令及结果
 
-- `cargo test --test reorg_integration`: **通过**。3 passed。
+- `cargo test --test collector_recovery_integration`: **通过**。4 passed。
 - `cargo check --all-targets`: **通过**。零错误，零警告。
-- `cargo test --tests`: **通过**。全部 260 个单元/契约/集成测试全部绿色通过。
+- `cargo test --tests`: **通过**。全部 264 个单元/契约/集成测试全部绿色通过。
 
 ---
 
 ## 5. 未解决问题与剩余工作
 
 - 无遗留未解决缺陷。
-- 下一步按 Backlog 推进 **TASK-022**：归集崩溃恢复与 Finality/Reorg 深度回归。
+- 下一步按 Backlog 推进 **TASK-023**：灾难恢复 Runbook 实操演练与记录。
 
 ---
 
 ## 6. 下一步任务与读取入口
 
-- **下一步执行任务**: [TASK-022: 归集崩溃恢复与 Finality/Reorg 深度回归](file:///ssd0/git/pay3/docs/AI/tasks/TASK-022.md)
+- **下一步执行任务**: [TASK-023: 灾难恢复 Runbook 实操演练与记录](file:///ssd0/git/pay3/docs/AI/tasks/TASK-023.md)
 - **下一次 Session 应先读取的文件**:
   1. [AGENTS.md](file:///ssd0/git/pay3/AGENTS.md)
   2. [docs/AI/SESSION_STATE.md](file:///ssd0/git/pay3/docs/AI/SESSION_STATE.md)
   3. [docs/AI/TASK_INDEX.md](file:///ssd0/git/pay3/docs/AI/TASK_INDEX.md)
-  4. [docs/AI/tasks/TASK-022.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-022.md)
+  4. [docs/AI/tasks/TASK-023.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-023.md)
+
 
 
 

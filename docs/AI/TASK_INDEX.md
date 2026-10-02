@@ -56,6 +56,6 @@ TODO -> IN_PROGRESS -> REVIEW -> DONE
 | **TASK-019** | 生产级远程 Signer 部署与网络隔离契约 | Remote Signer 服务鉴权、mTLS/HMAC 签名校验、独立部署配置 | TASK-007, TASK-016 | `DONE` | [TASK-019.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-019.md) |
 | **TASK-020** | Prometheus 告警规则 Dry-Run 与指标补全 | 核心告警规则配置验证、指标模拟上报、Grafana 仪表盘配置 | TASK-016 | `DONE` | [TASK-020.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-020.md) |
 | **TASK-021** | 深度 Reorg 与孤块付款真实 DB 回归 | 编写多块深度分叉场景下 Scanner 游标回退与孤块重算的集成测试 | TASK-013, TASK-017 | `DONE` | [TASK-021.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-021.md) |
-| **TASK-022** | 归集崩溃恢复与 Finality/Reorg 深度回归 | 模拟广播前/后强行中断进程、链重组下的归集状态机完整回归 | TASK-015, TASK-017 | `TODO` | [TASK-022.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-022.md) |
+| **TASK-022** | 归集崩溃恢复与 Finality/Reorg 深度回归 | 模拟广播前/后强行中断进程、链重组下的归集状态机完整回归 | TASK-015, TASK-017 | `DONE` | [TASK-022.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-022.md) |
 | **TASK-023** | 灾难恢复 Runbook 实操演练与记录 | DB PITR、KV 重建、RPC 切换、Signer 故障、卡死归集实操演练 | TASK-016, TASK-017 | `TODO` | [TASK-023.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-023.md) |
 | **TASK-024** | 生产上线审计门禁自动化验证脚本 | 编写一键 Pre-flight Check 脚本，自动检查所有生产准入禁项 | TASK-018 ~ TASK-023 | `TODO` | [TASK-024.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-024.md) |
