@@ -192,11 +192,17 @@ scripts/build-prebuilt-binary.sh
 
 ## 文档
 
-- `docs/MVP_ARCHITECTURE.md`: MVP 架构、API、数据库、模块和测试设计。
-- `docs/END_TO_END_FLOW.md`: 从订单创建到付款匹配、归集的完整流程。
-- `docs/MODULE_PLAN.md`: 模块实现、测试和联调计划。
-- `docs/TRANSFER_LOG_KV_MODULE.md`: ERC20 Transfer log KVDB 采集模块设计。
-- `docs/PRODUCTION_READINESS.md`: 生产验收审计和上线清单。
-- `docs/DEPLOYMENT.md`: 部署拓扑、worker 锁、RPC provider 和 readiness 要求。
-- `docs/RUNBOOK.md`: RPC、reorg、collection、KVDB rebuild、DB 恢复等操作手册。
+### AI 代理与工程规范
+- `AGENTS.md`: AI 开发代理最高规则与事实来源说明。
+- `docs/AI_AGENT_PROMPT.md`: AI Agent 项目开发提示词与工程规范标准。
+- `docs/AI/GOAL.md`: 项目总目标、范围界定与核心不变量。
+- `docs/AI/TASK_INDEX.md`: 细粒度任务中央索引与执行状态看板。
+- `docs/AI/SESSION_STATE.md`: 当前会话上下文、已完成项与下一步任务。
+- `docs/AI/ARCHITECTURE.md`: 系统分层架构与数据流转拓扑。
+- `docs/AI/DECISIONS.md`: 关键架构决策记录 (ADR-001 ~ ADR-010)。
+
+### 生产部署与运维手册
+- `docs/DEPLOYMENT.md`: 部署拓扑、Docker/Compose 配置与测试网说明。
+- `docs/PRODUCTION_READINESS.md`: 生产就绪验收审计和上线清单。
+- `docs/RUNBOOK.md`: RPC 故障、Reorg、归集卡死、KVDB 重建、DB 恢复等应急操作手册。
 - `frontend-test/README.md`: 前端测试页说明。

@@ -164,7 +164,7 @@ MVP 必须具备：
 全部满足后，才可以评估接真实资金：
 
 - Rust 服务实现完成，所有 endpoint 和 worker 可运行。
-- `docs/MODULE_PLAN.md` 每个 phase 的独立测试和组合测试完成。
+- `docs/AI/TASK_INDEX.md` 基础任务清单与独立/组合契约测试全部完成。
 - PostgreSQL migrations 完成，并通过并发一致性和 DB 负例约束测试。
 - Anvil e2e 覆盖创建订单、付款、确认、归集。
 - reorg/orphan payment 测试通过。
