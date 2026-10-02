@@ -40,4 +40,5 @@ cargo test --test reorg_integration
 - 需要本地或 CI 环境提供可连接的 PostgreSQL 测试实例。
 
 ## Status
-TODO
+DONE
+

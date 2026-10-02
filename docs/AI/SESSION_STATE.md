@@ -6,8 +6,8 @@
 
 ## 1. 当前上下文
 
-- **当前 Goal**: 生产级极简架构重构与生产就绪硬化（单实例单 Token、多 RPC 负载均衡 + CD 熔断机制、无状态 Direct Scanner、远程 JWKS 动态拉取与轮换、远程 Signer 部署与鉴权加固、Prometheus 告警规则 Dry-run 与指标补齐）
-- **当前 Task**: [TASK-020: Prometheus 告警规则 Dry-Run 与指标补全](file:///ssd0/git/pay3/docs/AI/tasks/TASK-020.md)
+- **当前 Goal**: 生产级极简架构重构与生产就绪硬化（单实例单 Token、多 RPC 负载均衡 + CD 熔断机制、无状态 Direct Scanner、远程 JWKS 动态拉取与轮换、远程 Signer 部署与鉴权加固、Prometheus 告警规则 Dry-run、深度 Reorg 回归）
+- **当前 Task**: [TASK-021: 深度 Reorg 与孤块付款真实 DB 回归](file:///ssd0/git/pay3/docs/AI/tasks/TASK-021.md)
 - **当前状态**: `DONE`
 
 ---
@@ -47,48 +47,48 @@
    - 编写 `deploy/prometheus/pay3-alerts.example.yml`，包含 8 条生产告警规则（Readiness、Dependency、Worker Consecutive Failures、Scanner High Lag、Signer Failure、RPC High Error Rate 等）。
    - 编写 `deploy/prometheus/rules_test.yml`，使用 `promtool test rules` 完成时序数据 Dry-Run 校验全部 SUCCESS。
    - 创建 `deploy/prometheus/grafana_dashboard.json` 导出大盘。
+9. **完成 TASK-021：深度 Reorg 与孤块付款真实 DB 回归**:
+   - 编写 `tests/reorg_integration.rs` 专项测试，构建分叉后孤块付款场景。
+   - 验证分叉发生时：`payments` 孤块被标记为 `chain_status = 'orphaned'`，游标回退至 `last_reorg_from - 1`，订单金额实时重算，订单状态从 `paid` 安全倒退回 `pending` 或 `partial`。
+   - 验证孤块金额永远无法参与确认数与归集计算的不变量。
 
 ---
 
 ## 3. 修改、创建与移除的文件清单
 
 ### 创建文件
-- `deploy/prometheus/rules_test.yml`
-- `deploy/prometheus/grafana_dashboard.json`
+- `tests/reorg_integration.rs`
 
 ### 修改文件
-- `deploy/prometheus/pay3-alerts.example.yml`
-- `src/health.rs`
 - `docs/AI/TASK_INDEX.md`
-- `docs/AI/tasks/TASK-020.md`
+- `docs/AI/tasks/TASK-021.md`
 - `docs/AI/SESSION_STATE.md`
 
 ---
 
 ## 4. 已运行的验证命令及结果
 
-- `promtool check rules deploy/prometheus/pay3-alerts.example.yml`: **通过**。8 rules found。
-- `promtool test rules deploy/prometheus/rules_test.yml`: **通过**。SUCCESS。
+- `cargo test --test reorg_integration`: **通过**。3 passed。
 - `cargo check --all-targets`: **通过**。零错误，零警告。
-- `cargo test health`: **通过**。
-- `cargo test --tests`: **通过**。全部 257 个单元/契约/集成测试全部绿色通过。
+- `cargo test --tests`: **通过**。全部 260 个单元/契约/集成测试全部绿色通过。
 
 ---
 
 ## 5. 未解决问题与剩余工作
 
 - 无遗留未解决缺陷。
-- 下一步按 Backlog 推进 **TASK-021**：深度 Reorg 与孤块付款真实 DB 回归。
+- 下一步按 Backlog 推进 **TASK-022**：归集崩溃恢复与 Finality/Reorg 深度回归。
 
 ---
 
 ## 6. 下一步任务与读取入口
 
-- **下一步执行任务**: [TASK-021: 深度 Reorg 与孤块付款真实 DB 回归](file:///ssd0/git/pay3/docs/AI/tasks/TASK-021.md)
+- **下一步执行任务**: [TASK-022: 归集崩溃恢复与 Finality/Reorg 深度回归](file:///ssd0/git/pay3/docs/AI/tasks/TASK-022.md)
 - **下一次 Session 应先读取的文件**:
   1. [AGENTS.md](file:///ssd0/git/pay3/AGENTS.md)
   2. [docs/AI/SESSION_STATE.md](file:///ssd0/git/pay3/docs/AI/SESSION_STATE.md)
   3. [docs/AI/TASK_INDEX.md](file:///ssd0/git/pay3/docs/AI/TASK_INDEX.md)
-  4. [docs/AI/tasks/TASK-021.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-021.md)
+  4. [docs/AI/tasks/TASK-022.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-022.md)
+
 
 
