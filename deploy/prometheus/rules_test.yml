@@ -1,0 +1,100 @@
+rule_files:
+  - pay3-alerts.example.yml
+
+evaluation_interval: 1m
+
+tests:
+  # 1. Pay3NotReady: triggers after 2m of readiness == 0
+  - interval: 1m
+    input_series:
+      - series: 'pay3_readyz_status'
+        values: '1 1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: Pay3NotReady
+        exp_alerts: []
+      - eval_time: 4m
+        alertname: Pay3NotReady
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Pay3 readiness is failing"
+              description: "Pay3 readiness check reported 0 for more than 2 minutes. Inspect /readyz for DB, RPC, Signer, and Worker status."
+
+  # 2. Pay3DependencyUnhealthy: triggers when a specific dependency stays unhealthy
+  - interval: 1m
+    input_series:
+      - series: 'pay3_readyz_dependency_status{dependency="db"}'
+        values: '1 1 0 0 0 0'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: Pay3DependencyUnhealthy
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              dependency: db
+            exp_annotations:
+              summary: "Pay3 dependency db is unhealthy"
+              description: "Readiness dependency db has been unhealthy for more than 3 minutes."
+
+  # 3. Pay3WorkerConsecutiveFailures: triggers when consecutive failures exceed 5 for >2m
+  - interval: 1m
+    input_series:
+      - series: 'pay3_worker_consecutive_failures{worker="payment_scanner"}'
+        values: '0 2 6 6 6 6'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: Pay3WorkerConsecutiveFailures
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              worker: payment_scanner
+            exp_annotations:
+              summary: "Pay3 worker payment_scanner consecutive failures exceed threshold"
+              description: "Worker payment_scanner has failed >5 consecutive times for more than 2 minutes."
+
+  # 4. Pay3PaymentScannerHighLag: triggers when scanner lag > 50 for >5m
+  - interval: 1m
+    input_series:
+      - series: 'pay3_payment_scanner_lag_blocks'
+        values: '10 20 60 70 80 90 100 110'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: Pay3PaymentScannerHighLag
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Pay3 payment scanner lag high"
+              description: "Payment scanner is lagging by more than 50 blocks for more than 5 minutes."
+
+  # 5. Pay3SignerFailure: triggers on signer error increase
+  - interval: 1m
+    input_series:
+      - series: 'pay3_signer_errors_total'
+        values: '0 0 1 2 2 2'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: Pay3SignerFailure
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              summary: "Pay3 external signer errors detected"
+              description: "Signer encountered errors in the last 5 minutes. Outbound collections may be stalled."
+
+  # 6. Pay3RpcHighErrorRate: triggers on rpc error spike
+  - interval: 1m
+    input_series:
+      - series: 'pay3_rpc_errors_total'
+        values: '0 0 5 15 20 25 30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: Pay3RpcHighErrorRate
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Pay3 RPC error rate elevated"
+              description: "RPC errors increased by more than 10 in the last 5 minutes."

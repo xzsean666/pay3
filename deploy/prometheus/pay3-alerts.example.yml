@@ -1,23 +1,32 @@
 groups:
-  - name: pay3-dry-run
+  - name: pay3-alerts
     rules:
       - alert: Pay3NotReady
         expr: pay3_readyz_status == 0
         for: 2m
         labels:
-          severity: warning
+          severity: critical
         annotations:
-          summary: Pay3 readiness is failing
-          description: "Check /readyz for DB, KVDB, RPC, signer, and worker dependency details."
+          summary: "Pay3 readiness is failing"
+          description: "Pay3 readiness check reported 0 for more than 2 minutes. Inspect /readyz for DB, RPC, Signer, and Worker status."
 
       - alert: Pay3DependencyUnhealthy
         expr: pay3_readyz_dependency_status == 0
-        for: 5m
+        for: 3m
         labels:
-          severity: warning
+          severity: critical
         annotations:
           summary: "Pay3 dependency {{ $labels.dependency }} is unhealthy"
-          description: "Dry-run alert sample only; tune thresholds and routing before production."
+          description: "Readiness dependency {{ $labels.dependency }} has been unhealthy for more than 3 minutes."
+
+      - alert: Pay3WorkerConsecutiveFailures
+        expr: pay3_worker_consecutive_failures > 5
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pay3 worker {{ $labels.worker }} consecutive failures exceed threshold"
+          description: "Worker {{ $labels.worker }} has failed >5 consecutive times for more than 2 minutes."
 
       - alert: Pay3WorkerTickFailures
         expr: increase(pay3_worker_ticks_total{result="error"}[10m]) > 0
@@ -26,4 +35,40 @@ groups:
           severity: warning
         annotations:
           summary: "Pay3 worker {{ $labels.worker }} reported tick failures"
-          description: "Inspect structured logs and runbook before allowing cursor or collection progress."
+          description: "Worker {{ $labels.worker }} encountered errors in the last 10 minutes."
+
+      - alert: Pay3PaymentScannerHighLag
+        expr: pay3_payment_scanner_lag_blocks > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pay3 payment scanner lag high"
+          description: "Payment scanner is lagging by more than 50 blocks for more than 5 minutes."
+
+      - alert: Pay3RpcHighErrorRate
+        expr: increase(pay3_rpc_errors_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pay3 RPC error rate elevated"
+          description: "RPC errors increased by more than 10 in the last 5 minutes."
+
+      - alert: Pay3SignerFailure
+        expr: increase(pay3_signer_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Pay3 external signer errors detected"
+          description: "Signer encountered errors in the last 5 minutes. Outbound collections may be stalled."
+
+      - alert: Pay3HighHttpLatency
+        expr: pay3_http_request_latency_seconds_max > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pay3 max HTTP request latency elevated"
+          description: "Observed max HTTP request latency exceeds 2 seconds for more than 5 minutes."

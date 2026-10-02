@@ -340,6 +340,9 @@ struct MetricsInner {
     request_count: AtomicU64,
     request_latency_micros_total: AtomicU64,
     request_latency_micros_max: AtomicU64,
+    rpc_errors_total: AtomicU64,
+    signer_errors_total: AtomicU64,
+    payment_events_total: AtomicU64,
     kvdb_last_completed_block: RwLock<Option<u64>>,
     kvdb_retention_floor_block: RwLock<Option<u64>>,
     worker_metrics: RwLock<BTreeMap<WorkerName, WorkerMetricState>>,
@@ -354,6 +357,18 @@ impl MetricsRecorder {
             .request_latency_micros_total
             .fetch_add(latency_micros, Ordering::Relaxed);
         update_max(&self.inner.request_latency_micros_max, latency_micros);
+    }
+
+    pub fn record_rpc_error(&self) {
+        self.inner.rpc_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_signer_error(&self) {
+        self.inner.signer_errors_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_payment_event(&self) {
+        self.inner.payment_events_total.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_worker_success(&self, worker: WorkerName, latency: Duration) {
@@ -531,6 +546,21 @@ impl MetricsRecorder {
             "pay3_http_request_latency_seconds_max {:.6}\n",
             max_seconds
         ));
+        let rpc_errors_total = self.inner.rpc_errors_total.load(Ordering::Relaxed);
+        output.push_str("# HELP pay3_rpc_errors_total Total number of RPC call errors.\n");
+        output.push_str("# TYPE pay3_rpc_errors_total counter\n");
+        output.push_str(&format!("pay3_rpc_errors_total {rpc_errors_total}\n"));
+
+        let signer_errors_total = self.inner.signer_errors_total.load(Ordering::Relaxed);
+        output.push_str("# HELP pay3_signer_errors_total Total number of signer errors.\n");
+        output.push_str("# TYPE pay3_signer_errors_total counter\n");
+        output.push_str(&format!("pay3_signer_errors_total {signer_errors_total}\n"));
+
+        let payment_events_total = self.inner.payment_events_total.load(Ordering::Relaxed);
+        output.push_str("# HELP pay3_payment_events_total Total number of processed payment events.\n");
+        output.push_str("# TYPE pay3_payment_events_total counter\n");
+        output.push_str(&format!("pay3_payment_events_total {payment_events_total}\n"));
+
         let kvdb_last_completed_block = self
             .inner
             .kvdb_last_completed_block
@@ -734,6 +764,9 @@ mod tests {
             "rpc timeout",
         );
         metrics.record_kvdb_state(Some(42), Some(40));
+        metrics.record_rpc_error();
+        metrics.record_signer_error();
+        metrics.record_payment_event();
 
         let checks = metrics.worker_dependency_checks();
         assert!(checks.iter().any(|dependency| {
@@ -752,6 +785,9 @@ mod tests {
         let readiness = ReadinessReport::new(checks);
         let body = metrics.render_prometheus(&readiness);
 
+        assert!(body.contains("pay3_rpc_errors_total 1"));
+        assert!(body.contains("pay3_signer_errors_total 1"));
+        assert!(body.contains("pay3_payment_events_total 1"));
         assert!(
             body.contains(
                 "pay3_worker_ticks_total{worker=\"payment_scanner\",result=\"success\"} 1"

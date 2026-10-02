@@ -28,10 +28,10 @@
 ## Verification Commands
 ```bash
 promtool check rules deploy/prometheus/pay3-alerts.example.yml
+promtool test rules deploy/prometheus/rules_test.yml
+cargo test health
 ```
 
-## Risks and Assumptions
-- 假设环境已安装 `promtool` 或提供预编译可执行工具。
-
 ## Status
-TODO
+DONE
+
