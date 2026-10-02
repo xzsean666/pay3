@@ -247,11 +247,29 @@ impl RpcProviderManager {
     }
 
     pub async fn validate_chain_ids(&self) -> Result<Vec<RpcProviderChainStatus>, ChainError> {
+        let mut tasks = tokio::task::JoinSet::new();
+        for provider in self.providers.clone() {
+            let expected_chain_id = self.expected_chain_id;
+            tasks.spawn(async move {
+                let res = Self::provider_chain_id(provider.inner.as_ref()).await;
+                (provider, expected_chain_id, res)
+            });
+        }
+
         let mut statuses = Vec::new();
         let mut errors = Vec::new();
-        for provider in &self.providers {
-            match self.provider_chain_id(provider.inner.as_ref()).await {
-                Ok(actual_chain_id) if actual_chain_id == self.expected_chain_id => {
+
+        while let Some(res) = tasks.join_next().await {
+            let (provider, expected_chain_id, req_res) = match res {
+                Ok(tuple) => tuple,
+                Err(join_err) => {
+                    errors.push(format!("task join error: {join_err}"));
+                    continue;
+                }
+            };
+
+            match req_res {
+                Ok(actual_chain_id) if actual_chain_id == expected_chain_id => {
                     provider.record_success();
                     statuses.push(RpcProviderChainStatus {
                         provider_id: provider.provider_id().to_string(),
@@ -261,7 +279,7 @@ impl RpcProviderManager {
                 Ok(actual_chain_id) => {
                     provider.record_failure();
                     return Err(ChainError::ChainIdMismatch {
-                        expected: self.expected_chain_id,
+                        expected: expected_chain_id,
                         actual: actual_chain_id,
                     });
                 }
@@ -283,6 +301,7 @@ impl RpcProviderManager {
             )));
         }
 
+        statuses.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
         Ok(statuses)
     }
 
@@ -304,7 +323,7 @@ impl RpcProviderManager {
         })
     }
 
-    async fn provider_chain_id(&self, provider: &dyn JsonRpcProvider) -> Result<u64, ChainError> {
+    async fn provider_chain_id(provider: &dyn JsonRpcProvider) -> Result<u64, ChainError> {
         let value = provider.request("eth_chainId", json!([])).await?;
         let chain_id = value.as_str().ok_or_else(|| {
             ChainError::malformed_rpc_response(format!(
@@ -365,13 +384,20 @@ impl RpcProviderManager {
                     Ok(block) => {
                         provider.record_success();
                         blocks.push(block);
+                        if blocks.len() >= self.min_provider_count {
+                            ensure_consistent_block_hashes(&context, &blocks)?;
+                            return Ok(blocks);
+                        }
                     }
                     Err(error) => {
                         provider.record_failure();
                         errors.push(format!("{}: {error}", provider.provider_id()));
                     }
                 },
-                Err(ChainError::BlockNotFound { .. }) => return Err(not_found.clone()),
+                Err(ChainError::BlockNotFound { .. }) => {
+                    not_found_count += 1;
+                    errors.push(format!("{}: block not found", provider.provider_id()))
+                }
                 Err(error) => {
                     if is_provider_health_failure(&error) {
                         provider.record_failure();
@@ -1541,6 +1567,77 @@ mod tests {
             .filter(|call| call.as_str() == "eth_chainId")
             .count();
         assert_eq!(p2_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn rpc_provider_manager_bounded_quorum_avoids_exhaustive_pool_sweep() {
+        let blk = block(10, 0xaa);
+        let p1 = Arc::new(FakeRpcProvider::new("provider-1", 1).with_block(blk));
+        let p2 = Arc::new(FakeRpcProvider::new("provider-2", 1).with_block(blk));
+        let p3 = Arc::new(FakeRpcProvider::new("provider-3", 1).with_block(blk));
+        let p4 = Arc::new(FakeRpcProvider::new("provider-4", 1).with_block(blk));
+        let p5 = Arc::new(FakeRpcProvider::new("provider-5", 1).with_block(blk));
+
+        // Pool has 5 providers, but min_provider_count is 2
+        let manager = RpcProviderManager::with_min_provider_count(
+            1,
+            vec![
+                p1.clone() as SharedJsonRpcProvider,
+                p2.clone() as SharedJsonRpcProvider,
+                p3.clone() as SharedJsonRpcProvider,
+                p4.clone() as SharedJsonRpcProvider,
+                p5.clone() as SharedJsonRpcProvider,
+            ],
+            2,
+        )
+        .unwrap();
+
+        let fetched = manager.block_by_number(10).await.unwrap();
+        assert_eq!(fetched.number, 10);
+        assert_eq!(fetched.hash, block_hash(0xaa));
+
+        let total_get_block_calls = [p1, p2, p3, p4, p5]
+            .iter()
+            .map(|p| p.calls().iter().filter(|c| c.as_str() == "eth_getBlockByNumber").count())
+            .sum::<usize>();
+
+        // Exactly 2 calls made (bounded quorum), not 5!
+        assert_eq!(total_get_block_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn rpc_provider_manager_block_by_number_fails_over_and_isolates_failed_node() {
+        let blk = block(10, 0xaa);
+        let p1 = Arc::new(
+            FakeRpcProvider::new("provider-1", 1)
+                .with_block(blk)
+                .fail_method("eth_getBlockByNumber"),
+        );
+        let p2 = Arc::new(FakeRpcProvider::new("provider-2", 1).with_block(blk));
+        let p3 = Arc::new(FakeRpcProvider::new("provider-3", 1).with_block(blk));
+
+        let manager = RpcProviderManager::with_min_provider_count(
+            1,
+            vec![
+                p1.clone() as SharedJsonRpcProvider,
+                p2.clone() as SharedJsonRpcProvider,
+                p3.clone() as SharedJsonRpcProvider,
+            ],
+            2,
+        )
+        .unwrap();
+
+        let fetched = manager.block_by_number(10).await.unwrap();
+        assert_eq!(fetched.number, 10);
+
+        // p1 failed and should be in cooldown
+        let p1_health = p1.calls().iter().filter(|c| c.as_str() == "eth_getBlockByNumber").count();
+        let p2_health = p2.calls().iter().filter(|c| c.as_str() == "eth_getBlockByNumber").count();
+        let p3_health = p3.calls().iter().filter(|c| c.as_str() == "eth_getBlockByNumber").count();
+
+        assert_eq!(p1_health, 1);
+        assert_eq!(p2_health, 1);
+        assert_eq!(p3_health, 1);
     }
 
     #[tokio::test]

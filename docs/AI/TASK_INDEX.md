@@ -59,3 +59,4 @@ TODO -> IN_PROGRESS -> REVIEW -> DONE
 | **TASK-022** | 归集崩溃恢复与 Finality/Reorg 深度回归 | 模拟广播前/后强行中断进程、链重组下的归集状态机完整回归 | TASK-015, TASK-017 | `DONE` | [TASK-022.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-022.md) |
 | **TASK-023** | 灾难恢复 Runbook 实操演练与记录 | DB PITR、KV 重建、RPC 切换、Signer 故障、卡死归集实操演练 | TASK-016, TASK-017 | `DONE` | [TASK-023.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-023.md) |
 | **TASK-024** | 生产上线审计门禁自动化验证脚本 | 编写一键 Pre-flight Check 脚本，自动检查所有生产准入禁项 | TASK-018 ~ TASK-023 | `DONE` | [TASK-024.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-024.md) |
+| **TASK-027** | 参考 evm-call 优化多 RPC 连接池 | 并发启动探测、故障快速漂移与按需法定多数，适配公开 RPC 池 | TASK-025, TASK-026 | `DONE` | [TASK-027.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-027.md) |

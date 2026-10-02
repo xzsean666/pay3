@@ -6,8 +6,8 @@
 
 ## 1. 当前上下文
 
-- **当前 Goal**: 生产级极简架构重构与生产就绪硬化（单实例单 Token、多 RPC 负载均衡 + CD 熔断机制、无状态 Direct Scanner、远程 JWKS 动态拉取与轮换、远程 Signer 部署与鉴权加固、Prometheus 告警规则 Dry-run、深度 Reorg 回归、归集崩溃恢复与 Nonce 幂等、灾难演练与上线审计门禁）
-- **当前 Task**: [TASK-024: 生产上线审计门禁自动化验证脚本](file:///ssd0/git/pay3/docs/AI/tasks/TASK-024.md)
+- **当前 Goal**: 生产级极简架构重构与生产就绪硬化（单实例单 Token、多 RPC 负载均衡 + CD 熔断机制、无状态 Direct Scanner、远程 JWKS 动态拉取与轮换、远程 Signer 部署与鉴权加固、Prometheus 告警规则 Dry-run、深度 Reorg 回归、归集崩溃恢复与 Nonce 幂等、灾难演练与上线审计门禁、多公开 RPC 容错池优化）
+- **当前 Task**: [TASK-027: 参考 evm-call 优化多 RPC 连接池](file:///ssd0/git/pay3/docs/AI/tasks/TASK-027.md)
 - **当前状态**: `DONE` (全量任务 100% 达成)
 
 ---
@@ -65,39 +65,40 @@
     - 交付综合预检门禁脚本 `scripts/verify_production_readiness.sh`，覆盖 7 大门禁检验（敏感机密扫描、生产不变量审计、Rust AppConfig 验证、无状态架构合规、依赖健康探测、Prometheus 告警规则语法及时序单测校验、灾备工件审计）。
     - 提供 `--test-violations` 自动化负例回归测试，8/8 关键违规项（如明文助记词、弱 JWT、单 RPC、START_BLOCK=0、地址冲突等）100% 拦截。
     - 更新 `docs/PRODUCTION_READINESS.md` 签署通过结论并给出上线前执行步骤。
+13. **完成 TASK-027：参考 evm-call 优化多 RPC 连接池（并发探测、故障快速漂移与按需法定多数）**:
+    - 在 `src/chain/rpc.rs` 中为 `RpcProviderManager::validate_chain_ids` 接入 `tokio::task::JoinSet`，实现多个 RPC 节点并发启动探测，彻底消除单节点慢响应对系统初始化的累加阻塞。
+    - 将 `request_blocks` 优化为“按需法定多数（Bounded Quorum）+ 快速漂移（Fast Failover）”：达到 `min_provider_count` 且区块哈希一致后即刻返回，不再对池内全部公开节点冗余全量扫遍。
+    - 节点遭遇 429、5xx、超时时自动触发分级 CD 隔离并快速 failover 至下一个健康候选节点。
+    - 增加两个专项单元测试，验证大节点池下的受限法定多数与故障自动隔离。
 
 ---
 
 ## 3. 修改、创建与移除的文件清单
 
 ### 创建文件
-- `.env.production.example`
-- `scripts/verify_production_readiness.sh`
+- `docs/AI/tasks/TASK-027.md`
 
 ### 修改文件
-- `src/main.rs`
-- `docs/PRODUCTION_READINESS.md`
+- `src/chain/rpc.rs`
 - `docs/AI/TASK_INDEX.md`
-- `docs/AI/tasks/TASK-024.md`
 - `docs/AI/SESSION_STATE.md`
 
 ---
 
 ## 4. 已运行的验证命令及结果
 
-- `bash scripts/verify_production_readiness.sh --env-file .env.production.example`: **通过**。21 checks passed, 0 failed.
-- `bash scripts/verify_production_readiness.sh --test-violations`: **通过**。8/8 违规用例全部精准阻断拦截。
-- `bash scripts/run_drills.sh`: **通过**。5 大容灾演练场景及 Prometheus 告警规则全部通过。
 - `cargo check --all-targets`: **通过**。零错误，零警告。
-- `cargo test --tests`: **通过**。全部 264 个单元/契约/集成测试全部绿色通过。
+- `cargo test --lib chain::rpc::tests`: **通过**。全部 11 个 RPC 单元测试通过。
+- `cargo test --tests`: **通过**。全部 266 个单元/契约/集成测试全部绿色通过。
+- `bash scripts/verify_production_readiness.sh --env-file .env.production.example`: **通过**。21 checks passed, 0 failed.
 
 ---
 
 ## 5. 未解决问题与剩余工作
 
 - **无未解决问题**。
-- `docs/AI/TASK_INDEX.md` 中所有 26 个任务卡（TASK-001 ~ TASK-026）全部处于 `DONE` 状态。
-- 系统已全面达到生产可用，架构极简、单实例单币、无状态扫描、高可用容灾与审计门禁全部闭环。
+- `docs/AI/TASK_INDEX.md` 中所有 27 个任务卡（TASK-001 ~ TASK-027）全部处于 `DONE` 状态。
+- 系统已全面达到生产可用，架构极简、单实例单币、无状态扫描、多公开 RPC 高可用容灾与审计门禁全部闭环。
 
 ---
 
