@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeMap,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
 };
 
@@ -163,6 +166,7 @@ pub struct RpcProviderManager {
     expected_chain_id: u64,
     min_provider_count: usize,
     providers: Vec<ManagedRpcProvider>,
+    round_robin_counter: Arc<AtomicUsize>,
 }
 
 impl fmt::Debug for RpcProviderManager {
@@ -171,6 +175,7 @@ impl fmt::Debug for RpcProviderManager {
             .field("expected_chain_id", &self.expected_chain_id)
             .field("min_provider_count", &self.min_provider_count)
             .field("provider_count", &self.providers.len())
+            .field("round_robin_counter", &self.round_robin_counter.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -204,6 +209,7 @@ impl RpcProviderManager {
             expected_chain_id,
             min_provider_count,
             providers,
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -243,7 +249,7 @@ impl RpcProviderManager {
     pub async fn validate_chain_ids(&self) -> Result<Vec<RpcProviderChainStatus>, ChainError> {
         let mut statuses = Vec::new();
         let mut errors = Vec::new();
-        for provider in self.provider_candidates() {
+        for provider in &self.providers {
             match self.provider_chain_id(provider.inner.as_ref()).await {
                 Ok(actual_chain_id) if actual_chain_id == self.expected_chain_id => {
                     provider.record_success();
@@ -433,11 +439,25 @@ impl RpcProviderManager {
             .cloned()
             .collect::<Vec<_>>();
 
-        if available.is_empty() {
-            return self.providers.clone();
+        let pool = if available.is_empty() {
+            &self.providers
+        } else {
+            &available
+        };
+
+        if pool.is_empty() {
+            return Vec::new();
         }
 
-        available
+        let start_idx = self
+            .round_robin_counter
+            .fetch_add(1, Ordering::Relaxed)
+            % pool.len();
+        let mut candidates = Vec::with_capacity(pool.len());
+        for i in 0..pool.len() {
+            candidates.push(pool[(start_idx + i) % pool.len()].clone());
+        }
+        candidates
     }
 }
 
@@ -467,17 +487,26 @@ impl ManagedRpcProvider {
     }
 
     fn record_success(&self) {
-        self.health
-            .lock()
-            .expect("RPC provider health lock poisoned")
-            .record_success();
+        let mut health = self.health.lock().expect("RPC provider health lock poisoned");
+        if health.consecutive_failures > 0 {
+            tracing::info!(
+                provider = %self.provider_id(),
+                "RPC provider recovered from cooldown"
+            );
+        }
+        health.record_success();
     }
 
     fn record_failure(&self) {
-        self.health
-            .lock()
-            .expect("RPC provider health lock poisoned")
-            .record_failure(Instant::now());
+        let mut health = self.health.lock().expect("RPC provider health lock poisoned");
+        health.record_failure(Instant::now());
+        let cd = provider_cooldown(health.consecutive_failures);
+        tracing::warn!(
+            provider = %self.provider_id(),
+            consecutive_failures = health.consecutive_failures,
+            cooldown_secs = cd.as_secs(),
+            "RPC provider failed, entering cooldown"
+        );
     }
 }
 
@@ -1458,6 +1487,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_provider_manager_distributes_requests_round_robin() {
+        let token = address(0x11);
+        let user = address(0x22);
+        let p1 = Arc::new(FakeRpcProvider::new("provider-1", 1).with_balance(100));
+        let p2 = Arc::new(FakeRpcProvider::new("provider-2", 1).with_balance(100));
+        let p3 = Arc::new(FakeRpcProvider::new("provider-3", 1).with_balance(100));
+        let source = source(vec![p1.clone(), p2.clone(), p3.clone()]);
+
+        // Send 6 requests across 3 providers
+        for _ in 0..6 {
+            let balance = source.token_balance(token, user).await.unwrap();
+            assert_eq!(balance, RawAmount::from(100));
+        }
+
+        let p1_calls = p1.calls().iter().filter(|c| c.as_str() == "eth_call").count();
+        let p2_calls = p2.calls().iter().filter(|c| c.as_str() == "eth_call").count();
+        let p3_calls = p3.calls().iter().filter(|c| c.as_str() == "eth_call").count();
+
+        // Exactly 2 calls per provider due to round-robin
+        assert_eq!(p1_calls, 2);
+        assert_eq!(p2_calls, 2);
+        assert_eq!(p3_calls, 2);
+    }
+
+    #[tokio::test]
     async fn validate_chain_ids_allows_unavailable_extra_provider_when_minimum_is_met() {
         let p1 = Arc::new(FakeRpcProvider::new("provider-1", 1).fail_method("eth_chainId"));
         let p2 = Arc::new(FakeRpcProvider::new("provider-2", 1));
@@ -1501,7 +1555,13 @@ mod tests {
                 .with_receipt(receipt_json(tx, 10, 0xaa, "0x1", 21_000))
                 .with_broadcast(tx_hash(8)),
         );
-        let p2 = Arc::new(FakeRpcProvider::new("provider-2", 1));
+        let p2 = Arc::new(
+            FakeRpcProvider::new("provider-2", 1)
+                .with_native_balance(1_000_000)
+                .with_balance(99)
+                .with_receipt(receipt_json(tx, 10, 0xaa, "0x1", 21_000))
+                .with_broadcast(tx_hash(8)),
+        );
         let source = source(vec![p1, p2]);
 
         assert_eq!(
