@@ -6,8 +6,8 @@
 
 ## 1. 当前上下文
 
-- **当前 Goal**: 生产级极简架构重构与生产就绪硬化（单实例单 Token、多 RPC 负载均衡 + CD 熔断机制、无状态 Direct Scanner、远程 JWKS 动态拉取与轮换）
-- **当前 Task**: [TASK-018: 远程 JWKS 动态拉取与密钥轮换支持](file:///ssd0/git/pay3/docs/AI/tasks/TASK-018.md)
+- **当前 Goal**: 生产级极简架构重构与生产就绪硬化（单实例单 Token、多 RPC 负载均衡 + CD 熔断机制、无状态 Direct Scanner、远程 JWKS 动态拉取与轮换、远程 Signer 部署与鉴权加固）
+- **当前 Task**: [TASK-019: 生产级外部 Signer 部署工件与鉴权加固](file:///ssd0/git/pay3/docs/AI/tasks/TASK-019.md)
 - **当前状态**: `DONE`
 
 ---
@@ -38,44 +38,50 @@
    - `src/config.rs` 生产 Profile 校验放行合法 HTTPS `JWT_JWKS_URL`。
    - `src/runtime.rs` 在启动时装配远程 JWKS 并调度后台静默定时保鲜任务。
    - 完善单测覆盖：初次拉取验签、密钥轮换、网络异常降级、Cache-Control TTL 自适应解析。
+7. **完成 TASK-019：生产级外部 Signer 部署工件与鉴权加固**:
+   - 建立 `deploy/signer/` 独立生产部署工件：包含 `Dockerfile`、`docker-compose.yml`、`README.md` 与可执行的 `reference_signer.py` 参考签名服务。
+   - 在 `tests/signer_contract.rs` 中增加 401 Unauthorized、500 Internal Server Error 与超时断言覆盖。
+   - 全部 16 个签名契约测试均成功通过。
 
 ---
 
 ## 3. 修改、创建与移除的文件清单
 
+### 创建文件
+- `deploy/signer/reference_signer.py`
+- `deploy/signer/Dockerfile`
+- `deploy/signer/docker-compose.yml`
+- `deploy/signer/README.md`
+
 ### 修改文件
-- `src/auth/jwt.rs`
-- `src/auth/mod.rs`
-- `src/config.rs`
-- `src/runtime.rs`
-- `src/api/mod.rs`
-- `src/api/verify.rs`
+- `tests/signer_contract.rs`
 - `docs/AI/TASK_INDEX.md`
-- `docs/AI/tasks/TASK-018.md`
+- `docs/AI/tasks/TASK-019.md`
 - `docs/AI/SESSION_STATE.md`
 
 ---
 
 ## 4. 已运行的验证命令及结果
 
-- `cargo check`: **通过**。零错误，零警告。
-- `cargo test auth::jwt`: **通过**。全部 18 个单测绿色通过。
-- `cargo test --tests`: **通过**。全部 254 个单元/契约/集成测试全部绿色通过。
+- `cargo check --all-targets`: **通过**。零错误，零警告。
+- `cargo test --test signer_contract`: **通过**。全部 16 个单测绿色通过。
+- `cargo test --tests`: **通过**。全部 257 个单元/契约/集成测试全部绿色通过。
 
 ---
 
 ## 5. 未解决问题与剩余工作
 
 - 无遗留未解决缺陷。
-- 下一步按 Backlog 推进 **TASK-019**：生产级远程 Signer 部署与网络隔离契约。
+- 下一步按 Backlog 推进 **TASK-020**：Prometheus 告警规则 Dry-Run 与指标补全。
 
 ---
 
 ## 6. 下一步任务与读取入口
 
-- **下一步执行任务**: [TASK-019: 生产级远程 Signer 部署与网络隔离契约](file:///ssd0/git/pay3/docs/AI/tasks/TASK-019.md)
+- **下一步执行任务**: [TASK-020: Prometheus 告警规则 Dry-Run 与指标补全](file:///ssd0/git/pay3/docs/AI/tasks/TASK-020.md)
 - **下一次 Session 应先读取的文件**:
   1. [AGENTS.md](file:///ssd0/git/pay3/AGENTS.md)
   2. [docs/AI/SESSION_STATE.md](file:///ssd0/git/pay3/docs/AI/SESSION_STATE.md)
   3. [docs/AI/TASK_INDEX.md](file:///ssd0/git/pay3/docs/AI/TASK_INDEX.md)
-  4. [docs/AI/tasks/TASK-019.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-019.md)
+  4. [docs/AI/tasks/TASK-020.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-020.md)
+

@@ -348,6 +348,98 @@ async fn remote_http_signer_reports_malformed_json_payloads() {
     ));
 }
 
+#[tokio::test]
+async fn remote_http_signer_unauthorized_token_returns_http_status_error() {
+    let signer =
+        DeterministicFakeSigner::with_allowed_key_refs(TEST_NAMESPACE, [TEST_KEY_REF]).unwrap();
+    let server = spawn_remote_signer_server_with_auth(
+        ServerMode::Happy,
+        signer,
+        Some("valid-secret-token".to_string()),
+    )
+    .await;
+
+    // 1. Missing token
+    let unauthenticated = RemoteHttpSigner::new(server.base_url.clone(), TEST_TIMEOUT).unwrap();
+    let err = unauthenticated.health_check().await.unwrap_err();
+    assert!(matches!(
+        err,
+        SignerError::RemoteHttpStatus {
+            operation: "health_check",
+            status: 401,
+            ..
+        }
+    ));
+
+    // 2. Wrong token on derive_address
+    let wrong_token = RemoteHttpSigner::with_bearer_token(
+        server.base_url.clone(),
+        TEST_TIMEOUT,
+        Some("wrong-token"),
+    )
+    .unwrap();
+    let err = wrong_token
+        .derive_address(TEST_KEY_REF, TEST_PATH)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SignerError::RemoteHttpStatus {
+            operation: "derive_address",
+            status: 401,
+            ..
+        }
+    ));
+
+    // 3. Wrong token on sign_transaction
+    let err = wrong_token
+        .sign_transaction(TEST_KEY_REF, TEST_PATH, unsigned_tx(12))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        SignerError::RemoteHttpStatus {
+            operation: "sign_transaction",
+            status: 401,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn remote_http_signer_server_error_returns_http_status_error() {
+    let signer =
+        DeterministicFakeSigner::with_allowed_key_refs(TEST_NAMESPACE, [TEST_KEY_REF]).unwrap();
+    let server = spawn_remote_signer_server(ServerMode::InternalError, signer).await;
+    let remote = RemoteHttpSigner::new(server.base_url.clone(), TEST_TIMEOUT).unwrap();
+
+    let err = remote.health_check().await.unwrap_err();
+    assert!(matches!(
+        err,
+        SignerError::RemoteHttpStatus {
+            operation: "health_check",
+            status: 500,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn remote_http_signer_timeout_returns_transport_error() {
+    let signer =
+        DeterministicFakeSigner::with_allowed_key_refs(TEST_NAMESPACE, [TEST_KEY_REF]).unwrap();
+    let server = spawn_remote_signer_server(ServerMode::Hang, signer).await;
+    let remote = RemoteHttpSigner::new(server.base_url.clone(), Duration::from_millis(50)).unwrap();
+
+    let err = remote.health_check().await.unwrap_err();
+    assert!(matches!(
+        err,
+        SignerError::RemoteTransport { operation, message }
+            if operation == "health_check" && message.contains("timed out")
+    ));
+}
+
+
 fn unsigned_tx(nonce: u64) -> UnsignedTx {
     unsigned_tx_with_request_id_and_fees(
         format!("collection-job-{nonce}"),
@@ -413,6 +505,8 @@ enum ServerMode {
     Happy,
     DeriveRejected,
     SignMalformed,
+    InternalError,
+    Hang,
 }
 
 #[derive(Clone)]
@@ -502,9 +596,17 @@ async fn closed_endpoint() -> String {
     format!("http://{addr}")
 }
 
-async fn healthz(State(state): State<ServerState>, headers: HeaderMap) -> Json<HealthzResponse> {
-    assert_expected_auth(&state, &headers);
-    Json(HealthzResponse { status: "ok" })
+async fn healthz(State(state): State<ServerState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+    if state.mode == ServerMode::Hang {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if state.mode == ServerMode::InternalError {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "signer internal failure").into_response();
+    }
+    Json(HealthzResponse { status: "ok" }).into_response()
 }
 
 async fn derive_address(
@@ -512,7 +614,15 @@ async fn derive_address(
     headers: HeaderMap,
     Json(request): Json<DeriveAddressRequest>,
 ) -> Response {
-    assert_expected_auth(&state, &headers);
+    if let Err(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+    if state.mode == ServerMode::Hang {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if state.mode == ServerMode::InternalError {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "signer internal failure").into_response();
+    }
     assert_eq!(request.key_ref, state.expected_key_ref);
     assert_eq!(request.path, state.expected_path);
 
@@ -533,7 +643,15 @@ async fn sign_transaction(
     headers: HeaderMap,
     Json(request): Json<SignTransactionRequest>,
 ) -> Response {
-    assert_expected_auth(&state, &headers);
+    if let Err(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+    if state.mode == ServerMode::Hang {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if state.mode == ServerMode::InternalError {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "signer internal failure").into_response();
+    }
     assert_eq!(request.key_ref, state.expected_key_ref);
     assert_eq!(request.path, state.expected_path);
     assert_eq!(request.transaction, state.expected_tx);
@@ -550,14 +668,16 @@ async fn sign_transaction(
     Json(signed_tx).into_response()
 }
 
-fn assert_expected_auth(state: &ServerState, headers: &HeaderMap) {
+fn check_auth(state: &ServerState, headers: &HeaderMap) -> Result<(), Response> {
     if let Some(token) = &state.expected_bearer_token {
         let expected = format!("Bearer {token}");
-        assert_eq!(
-            headers
-                .get(header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-            Some(expected.as_str())
-        );
+        let provided = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        if provided != Some(expected.as_str()) {
+            return Err((StatusCode::UNAUTHORIZED, "unauthorized").into_response());
+        }
     }
+    Ok(())
 }
+

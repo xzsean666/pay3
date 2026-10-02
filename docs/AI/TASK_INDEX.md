@@ -53,7 +53,7 @@ TODO -> IN_PROGRESS -> REVIEW -> DONE
 | **TASK-025** | 多 RPC 负载均衡与智能 CD 冷却升级 | 原子 Round-Robin 分发、429/超时分级 CD 隔离、健康自动探测 | TASK-008 | `DONE` | [TASK-025.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-025.md) |
 | **TASK-026** | 移除 redb 改造为 Direct 无状态扫描器 | 废弃 KVDB、直接 RPC 拉取 + 内存地址过滤 + PostgreSQL 事务写入 | TASK-025 | `DONE` | [TASK-026.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-026.md) |
 | **TASK-018** | 远程 JWKS 动态拉取与密钥轮换 | 实现 `JWT_JWKS_URL` 异步后台刷新、缓存与故障降级 | TASK-003, TASK-016 | `DONE` | [TASK-018.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-018.md) |
-| **TASK-019** | 生产级远程 Signer 部署与网络隔离契约 | Remote Signer 服务鉴权、mTLS/HMAC 签名校验、独立部署配置 | TASK-007, TASK-016 | `TODO` | [TASK-019.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-019.md) |
+| **TASK-019** | 生产级远程 Signer 部署与网络隔离契约 | Remote Signer 服务鉴权、mTLS/HMAC 签名校验、独立部署配置 | TASK-007, TASK-016 | `DONE` | [TASK-019.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-019.md) |
 | **TASK-020** | Prometheus 告警规则 Dry-Run 与指标补全 | 核心告警规则配置验证、指标模拟上报、Grafana 仪表盘配置 | TASK-016 | `TODO` | [TASK-020.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-020.md) |
 | **TASK-021** | 深度 Reorg 与孤块付款真实 DB 回归 | 编写多块深度分叉场景下 Scanner 游标回退与孤块重算的集成测试 | TASK-013, TASK-017 | `TODO` | [TASK-021.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-021.md) |
 | **TASK-022** | 归集崩溃恢复与 Finality/Reorg 深度回归 | 模拟广播前/后强行中断进程、链重组下的归集状态机完整回归 | TASK-015, TASK-017 | `TODO` | [TASK-022.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-022.md) |

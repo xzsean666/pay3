@@ -37,4 +37,5 @@ cargo clippy --all-targets -- -D warnings
 - 生产环境中 Signer 服务应部署在受限的专用 VPC 或私有网络中。
 
 ## Status
-TODO
+DONE
+

@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  signer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pay3-signer
+    restart: unless-stopped
+    environment:
+      - SIGNER_HOST=0.0.0.0
+      - SIGNER_PORT=8088
+      - SIGNER_KEY_REF=pay3-master
+      - SIGNER_AUTH_TOKEN=${SIGNER_AUTH_TOKEN:-change-this-in-production-signer-token}
+    networks:
+      - pay3-internal
+    ports:
+      - "127.0.0.1:8088:8088"
+
+networks:
+  pay3-internal:
+    driver: bridge
+    internal: true
