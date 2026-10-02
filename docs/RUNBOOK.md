@@ -1,151 +1,144 @@
-# Pay3 MVP Runbook
+# Pay3 生产运维与灾难恢复手册 (Operations & Disaster Recovery Runbook)
 
-## 当前状态
+本文档是 Pay3 支付网关生产环境故障排查、应急响应、灾难恢复与实操演练的事实指导手册。
 
-这是 MVP 生产候选必须随代码一起完成和演练的 runbook。当前仓库已经有 Rust 实现，但演练状态仍未开始。
+---
 
-## 告警阈值
+## 1. 系统核心不变量与运维原则
 
-- `pay3_log_ingestor_lag_blocks > MIN_CONFIRMATIONS * 2` 持续 5 分钟：warning。
-- `pay3_payment_scanner_lag_blocks > REORG_LOOKBACK_BLOCKS` 持续 5 分钟：critical。
-- RPC error rate > 5% 持续 5 分钟：warning。
-- RPC primary/secondary safe/finalized head hash 冲突：critical，暂停 cursor 推进。
-- KVDB single-writer fencing epoch 冲突：critical，暂停 log ingestor。
-- collection `transferring/confirming` 超过 30 分钟：warning。
-- collection failed、dropped 或 replacement 失败：critical，需要人工确认 tx hash 和 nonce。
-- signer 连续失败超过 3 次：critical，暂停 collector。
-- prefunded gas 余额低于 3 次 collect 估算 gas：warning。
-- late/outside_window payment 出现：warning，进入人工对账。
+1. **单实例单一 Token 架构 (One Instance, One Token)**:
+   - 每个网关实例只绑定一个 `CHAIN_ID` 与单一 `TOKEN_ADDRESS`。多币种跨链采用独立实例隔离部署，杜绝跨链交叉污染。
+2. **绝对禁止地址复用 (Strict No Address Reuse)**:
+   - 每个订单唯一绑定派生的子收款地址（`orders.receive_address` UNIQUE）。迟到付款必须留在原订单进入对账，绝不分配给新订单。
+3. **PostgreSQL 是唯一真相源，扫描器 100% 纯无状态 (Stateless Direct Scanner)**:
+   - 订单、付款、游标、归集、nonce 均在 PostgreSQL 强事务一致性保护下。
+   - 无本地 redb 或 KV 文件存储，无磁盘写放大与文件锁风险，容器重启随时按 PostgreSQL 游标自动续扫。
+4. **多 RPC 负载均衡与智能 CD 冷却熔断 (Multi-RPC Load Balancing & Cooldown)**:
+   - 请求通过原子计数器在配置的多节点间 Round-Robin 分发。遇 429 或超时自动进入阶梯 CD（5s -> 10s -> 60s），健康节点承接流量，冷却到期自动半开探测恢复。
+5. **同 Nonce 幂等与崩溃优先重播**:
+   - 广播链上交易前必须持久化落盘 `(chain_id, from_address, nonce, signed_tx, tx_hash)`。
+   - 崩溃恢复必须优先重播同一已签名交易，严禁发放新 nonce 导致资金重出。
 
-## RPC Provider 故障
+---
 
-1. 查看 provider health、chain_id、safe/finalized head、block hash、429/error rate。
-2. 如果 provider hash 冲突，暂停 `pay3-log-ingestor` 和 `pay3-scanner` 推进 cursor。
-3. 切到健康 provider，但不得跳过 KV cursor 或 PostgreSQL cursor。
-4. 从 `transfer_log_store.next_block - REORG_LOOKBACK_BLOCKS` 开始校验 block hash。
-5. 确认一致后恢复 log ingestor。
-6. 等 KVDB logs 覆盖 scanner 所需区间后，再恢复 scanner lease。
-7. 记录切换时间、受影响 block range、最终 `chain_cursors.last_scanned_block`。
+## 2. 核心监控指标与告警阈值
 
-Pass 标准：cursor 不跳跃，`pay3_log_ingestor_lag_blocks` 和 `pay3_payment_scanner_lag_blocks` 恢复到阈值内，无重复 collect/outbound tx。
+| 告警规则 | 触发条件 | 级别 | 处置动作 |
+| :--- | :--- | :--- | :--- |
+| **Pay3NotReady** | `pay3_readyz_status == 0` 持续 2m | `critical` | 访问 `/readyz` 查看失败依赖（DB、RPC、Signer、Workers）并查看日志 |
+| **Pay3DependencyUnhealthy** | `pay3_readyz_dependency_status == 0` 持续 3m | `critical` | 排查指定依赖连通性（PostgreSQL 连接池、RPC 节点响应、Signer Token） |
+| **Pay3WorkerConsecutiveFailures** | `pay3_worker_consecutive_failures > 5` 持续 2m | `critical` | 检查对应 Worker 结构化错误日志，排查网络阻塞或数据库锁冲突 |
+| **Pay3PaymentScannerHighLag** | `pay3_payment_scanner_lag_blocks > 50` 持续 5m | `warning` | 检查 RPC 节点出块与网络延迟，核对 `chain_cursors` 推进状态 |
+| **Pay3RpcHighErrorRate** | `increase(pay3_rpc_errors_total[5m]) > 10` 持续 2m | `warning` | 检查 RPC 供应商配额、429 限制，必要时增加备用 RPC 节点 |
+| **Pay3SignerFailure** | `increase(pay3_signer_errors_total[5m]) > 0` 持续 1m | `critical` | 检查外部 Signer 服务健康状态、网络连通性及 Bearer Token 是否过期 |
+| **Pay3HighHttpLatency** | `pay3_http_request_latency_seconds_max > 2` 持续 5m | `warning` | 检查数据库慢查询或外网网络抖动 |
 
-## Reorg
+---
 
-1. 暂停 log ingestor 和 payment scanner 推进。
-2. 从 RPC 重拉最近 `REORG_LOOKBACK_BLOCKS` 的 block hash；KVDB block header cache 只能加速，不能作为唯一依据。
-3. 与 PostgreSQL matched payments 的 `block_number/block_hash` 对比。
-4. 调用 `transfer_log_store.rewind_to(reorg_safe_block)`；KV cursor 必须增加 `reorg_epoch` 并写 `last_reorg_from`。
-5. scanner 发现新 KV epoch 后，回退 `chain_cursors.last_scanned_block`，更新 `seen_kv_reorg_epoch`。
-6. 标记受影响 payments 为 `orphaned`。
-7. 按 order id 排序重算订单状态。
-8. 从 reorg-safe block 继续扫描并推进 PostgreSQL `chain_cursors`。
+## 3. 常见故障排查与应急操作规程
 
-Pass 标准：orphaned payments 不再计入 paid，reorg 后新分支同区间 Pay3 payment 能被 overlap 重扫发现。
+### 3.1 多 RPC 节点故障与网络中断
 
-## KVDB Rebuild
+**现象**：
+- 日志中频繁出现 `RPC node entered cooldown`、`HTTP 429 Too Many Requests` 或 `Request timeout`。
+- `pay3_rpc_errors_total` 指标上升。
 
-触发场景：redb 损坏、丢失、retention 误清理、schema migration 失败。
+**系统自愈行为**：
+- 系统自动将故障节点隔离冷却，流量自动无缝切换到其他配置的健康 RPC 节点。
+- CD 冷却时间采用指数退避：第 1 次 5 秒，第 2 次 10 秒，第 3 次及以上最高 60 秒。
+- 冷却期满后，节点自动进入半开状态，成功处理请求即恢复健康。
 
-1. 暂停 `pay3-scanner`。
-2. 读取 PostgreSQL `chain_cursors.last_scanned_block` 和最早未结订单 `payment_windows.window_from_block`。
-3. 计算 `rebuild_from = min(last_scanned_block - REORG_LOOKBACK_BLOCKS, earliest_unsettled_window_from_block)`。
-4. 清理或隔离旧 redb 文件。
-5. 调用 `transfer_log_store.ensure_stream(chain_id, token_address, start_block)`。
-6. 调用 `rewind_to(rebuild_from)` 并从该块重扫 raw Transfer logs。
-7. 等 KVDB 覆盖 `[rebuild_from, target]` 后恢复 scanner。
-8. scanner 用幂等 upsert 重扫，只写 matched Pay3 payments。
+**人工介入步骤**：
+1. 若所有节点均进入冷却，检查外部网络或供应商服务状态。
+2. 紧急增加备用 RPC 节点：
+   ```bash
+   # 更新环境变量 CHAIN_RPC_URLS
+   export CHAIN_RPC_URLS="https://rpc1.example.com,https://rpc2.example.com,https://backup-rpc.example.com"
+   # 平滑重启服务实例
+   ```
+3. 服务重启后会自动从 PostgreSQL `chain_cursors` 当前高度无缝续扫，不会跳块或重复记账。
 
-Pass 标准：KVDB 重建期间 PostgreSQL 资金状态不丢失；恢复后 scanner 不漏、不重复推进 cursor。
+---
 
-## Hot Token / Capacity Gate
+### 3.2 深度链分叉 (Deep Reorg) 处置
 
-1. 查看 `TransferLogSource.capacity_probe` 报告：最近 N 块 logs 数、单块最大 logs、provider cap、429/error rate。
-2. 如果 `RpcRangeSource` 超阈值，保持 log ingestor not ready，不推进 cursor。
-3. 配置兼容 `TransferLogSource` 的 indexer/分片 source。
-4. 在 staging 对同一区间比对 RPC/indexer normalized logs、headers、block hash。
-5. 比对通过后切换 source，并记录 source version、起始 block、校验 hash。
+**现象**：
+- 链发生超过配置 `REORG_LOOKBACK_BLOCKS` 的深度分叉，孤块产生。
+- 扫描器检测到区块哈希不连续。
 
-Pass 标准：切换 source 不改变 KV schema、不绕过 reorg 校验、不产生 PostgreSQL raw logs 表。
+**处理规程**：
+1. 暂停 Scanner Worker 推进。
+2. 确认最新的 Canonical 链权威分叉高度（`fork_block_number`）。
+3. 执行游标回退与孤块重算（系统内部自动处理，或手动触发）：
+   ```sql
+   -- 1. 将分叉高度及以后的付款标记为 orphaned
+   UPDATE payments
+   SET chain_status = 'orphaned', updated_at = now()
+   WHERE chain_id = $CHAIN_ID AND token_address = $TOKEN_ADDRESS AND block_number >= $FORK_BLOCK
+     AND chain_status <> 'orphaned';
 
-## Stuck Collection
+   -- 2. 将游标回退至分叉前一个安全区块
+   UPDATE chain_cursors
+   SET last_scanned_block = $FORK_BLOCK - 1,
+       lease_owner = NULL,
+       lease_until = NULL,
+       updated_at = now()
+   WHERE chain_id = $CHAIN_ID AND token_address = $TOKEN_ADDRESS;
+   ```
+4. 数据库内的订单金额计算引擎会自动将孤块金额剔除，原 `paid` 订单安全倒退为 `pending` 或 `partial`。
+5. 重启 Scanner，从回退高度继续沿新主链重扫入库。
 
-1. 查询 `collections.outbound_tx_id`。
-2. 查询 `outbound_transactions.tx_hash` receipt。
-3. 如果未广播，重播同一 `signed_tx`。
-4. 如果 pending 超过阈值，进入 replacement 流程。
-5. replacement 必须使用同一 `from_address/to_address/nonce/purpose/token transfer calldata`，只提高费用。
-6. 在一个 DB 事务内把旧 outbound 标记 `replaced`，插入新 outbound，更新 collection `outbound_tx_id`。
-7. 广播新 signed tx。
-8. 如果旧 tx 和新 tx 出现异常 receipt，人工核对 treasury token balance 和两个 tx receipt，再更新状态。
+---
 
-Pass 标准：同一 nonce 只有一个 active outbound；所有 replacement 有 `replacement_of` 链路；不允许重新构造未关联原 job 的交易。
+### 3.3 外部 Signer 服务宕机或鉴权失效
 
-## Signer 故障
+**现象**：
+- `/readyz` 报告 `signer` 依赖 unhealthy。
+- Collector 报告 `RemoteHttpStatus { status: 401 }` 或 `RemoteTransport timeout`。
 
-1. 暂停 collector 领取新 job。
-2. 检查 signer health、key_ref、rate limit、审计日志。
-3. 对已经 `signed/broadcast` 的 outbound 优先查 receipt 或重播原 signed tx。
-4. signer 恢复后先跑 health check 和小额签名 contract test。
-5. 恢复 collector。
+**处理规程**：
+1. 检查 Signer 服务容器与网络健康：
+   ```bash
+   curl -H "Authorization: Bearer $SIGNER_AUTH_TOKEN" http://signer-host:8088/healthz
+   ```
+2. 若返回 401：
+   - 检查环境变量 `SIGNER_REMOTE_BEARER_TOKEN` 与 Signer 端配置是否一致。
+   - 更新匹配的 Token 并热重载。
+3. 若服务进程退出：
+   - 检查 Signer 容器日志，重启服务：
+   ```bash
+   docker compose -f deploy/signer/docker-compose.yml restart
+   ```
+4. 恢复后：Collector 自动唤醒，无需任何人工对账，继续处理队列中的归集作业。
 
-Pass 标准：故障期间不生成未落库 signed tx；恢复后 nonce 连续，审计日志完整。
+---
 
-## DB 恢复
+### 3.4 归集交易卡死与同 Nonce 加速替换 (Stuck Collection Replacement)
 
-1. 使用 PITR 恢复到目标时间。
-2. 校验 migration version。
-3. 校验 PostgreSQL `chain_cursors` 和 matched payments 的最近 block refs。
-4. 从 `last_scanned_block - REORG_LOOKBACK_BLOCKS` 通过 `transfer_log_store` 重拉 headers 和 Transfer logs，重建 KVDB scan cache。
-5. 幂等重扫该窗口，只把 matched Pay3 payments 写回 PostgreSQL。
-6. collector 恢复前先对所有 pending outbound tx 查 receipt。
-7. 记录 RTO、RPO、恢复点、最后校验 block。
+**现象**：
+- 归集交易在链上长时间处于 pending 状态（Gas Price 剧烈上涨导致）。
+- 达到 `replacement_stuck_after` 超时阈值。
 
-Pass 标准：PITR 后订单、payments、nonces、signed_tx 和 audit_events 一致；collector 不重复发送新 nonce。
+**处理规程**：
+- Collector Worker 自动进入同 Nonce Replacement 流程：
+  1. 读取原卡死交易记录与 Nonce。
+  2. 使用同一 `(chain_id, from_address, nonce, to_address)` 构造新交易，提高 `max_fee_per_gas` 与 `max_priority_fee_per_gas`。
+  3. 请求 Signer 完成重签。
+  4. 数据库事务内将旧记录标记为 `replaced`，落盘新记录为 `signed`。
+  5. 广播新签名交易，推进状态为 `broadcast`。
+- **数据库强约束保证**：PostgreSQL Partial Unique Index 绝不允许出现两个处于活跃状态的同 Nonce 记录，彻底杜绝双花或资金重出。
 
-## 人工对账
+---
 
-触发：late/outside_window payment、reorg 深度超过 lookback、replacement 异常、treasury balance 对不上。
+### 3.5 PostgreSQL 灾难恢复 (PITR)
 
-记录内容：
-
-- order_id、receive_address、tx_hash、log_index、block_number、block_hash。
-- match_status、chain_status、expected_amount、paid_amount。
-- scanner cursor、KV reorg_epoch、处理人、处理结论。
-
-## 上线前演练
-
-必须完成并记录：
-
-- migration dry-run 和 rollback。
-- DB PITR 恢复。
-- RPC provider 切换。
-- KVDB rebuild。
-- log source capacity gate / indexer source 切换。
-- scanner crash/resume。
-- collector 广播前/广播后崩溃恢复。
-- dropped/stuck collection replacement。
-- signer 故障。
-- reorg/orphan payment 重算。
-- readyz 依赖失败。
-- metrics/alert dry-run。
-
-## 演练记录模板
-
-```text
-Drill:
-Date:
-Environment:
-Operator:
-Start time:
-End time:
-RTO:
-RPO:
-Initial state:
-Steps executed:
-Expected result:
-Actual result:
-Metrics checked:
-Logs/audit events checked:
-Pass/Fail:
-Follow-up:
-```
+**规程**：
+1. 使用云厂商或物理备份将 PostgreSQL 数据库实例 PITR 恢复至指定安全时间点 $T$。
+2. 校验数据库约束与最新迁移版本：
+   ```bash
+   cargo test --test migration_contract
+   ```
+3. 核对 `chain_cursors.last_scanned_block`：
+   - 由于 PITR 可能回退几分钟数据，扫描器启动后会自动从 PITR 后的 `last_scanned_block` 继续向最新区块拉取日志。
+   - 写入 `payments` 采用 `ON CONFLICT (chain_id, tx_hash, log_index) DO NOTHING` 幂等插入，完全幂等且无重复数据。
+4. Collector 启动后优先检查所有未决 Outbound 交易在链上的实际 Receipt，确认真实执行状态，防止重复广播。

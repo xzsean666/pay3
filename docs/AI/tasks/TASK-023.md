@@ -37,4 +37,4 @@ bash scripts/drill_kv_rebuild.sh # 示例演练脚本
 - 演练需在专用的 Staging 或隔离测试环境中进行，不可在生产真实环境直接演练。
 
 ## Status
-TODO
+DONE
