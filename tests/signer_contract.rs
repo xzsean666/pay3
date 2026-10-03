@@ -439,6 +439,58 @@ async fn remote_http_signer_timeout_returns_transport_error() {
     ));
 }
 
+#[tokio::test]
+async fn fake_signer_signs_digest_deterministically() {
+    let key_ref = "pay3-master";
+    let path = "m/44'/60'/0'/0/1";
+    let signer =
+        DeterministicFakeSigner::with_allowed_key_refs("pay3-signer-tests", [key_ref]).unwrap();
+    let digest = [0x55u8; 32];
+
+    let sig1 = signer.sign_digest(key_ref, path, digest).await.unwrap();
+    let sig2 = signer.sign_digest(key_ref, path, digest).await.unwrap();
+
+    assert_eq!(sig1, sig2);
+    assert_eq!(sig1.v, 27);
+    assert_ne!(sig1.r, [0u8; 32]);
+    assert_ne!(sig1.s, [0u8; 32]);
+}
+
+#[tokio::test]
+async fn local_mnemonic_signer_signs_digest_with_valid_ecdsa() {
+    let signer = LocalMnemonicSigner::new(
+        "pay3-master",
+        "test test test test test test test test test test test junk",
+    )
+    .unwrap();
+    let digest = [0x77u8; 32];
+    let sig = signer
+        .sign_digest("pay3-master", "m/44'/60'/0'/0/0", digest)
+        .await
+        .unwrap();
+
+    assert!(sig.v == 27 || sig.v == 28);
+    assert_ne!(sig.r, [0u8; 32]);
+    assert_ne!(sig.s, [0u8; 32]);
+}
+
+#[tokio::test]
+async fn remote_http_signer_signs_digest_over_http() {
+    let signer =
+        DeterministicFakeSigner::with_allowed_key_refs(TEST_NAMESPACE, [TEST_KEY_REF]).unwrap();
+    let server = spawn_remote_signer_server(ServerMode::Happy, signer).await;
+
+    let client = RemoteHttpSigner::new(&server.base_url, Duration::from_secs(1)).unwrap();
+    let digest = [0x42u8; 32];
+    let sig = client
+        .sign_digest(TEST_KEY_REF, TEST_PATH, digest)
+        .await
+        .unwrap();
+
+    assert_eq!(sig.v, 27);
+    assert_ne!(sig.r, [0u8; 32]);
+    assert_ne!(sig.s, [0u8; 32]);
+}
 
 fn unsigned_tx(nonce: u64) -> UnsignedTx {
     unsigned_tx_with_request_id_and_fees(
@@ -573,6 +625,7 @@ async fn spawn_remote_signer_server_with_auth(
         .route("/healthz", get(healthz))
         .route("/v1/addresses/derive", post(derive_address))
         .route("/v1/transactions/sign", post(sign_transaction))
+        .route("/v1/digests/sign", post(sign_digest_endpoint))
         .with_state(state);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -666,6 +719,31 @@ async fn sign_transaction(
         .await
         .unwrap();
     Json(signed_tx).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct SignDigestPayload {
+    key_ref: String,
+    path: String,
+    digest: String,
+}
+
+async fn sign_digest_endpoint(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    Json(request): Json<SignDigestPayload>,
+) -> Response {
+    if let Err(resp) = check_auth(&state, &headers) {
+        return resp;
+    }
+    let digest_bytes =
+        pay3::domain::address::decode_prefixed_fixed::<32>(&request.digest, "digest").unwrap();
+    let sig = state
+        .signer
+        .sign_digest(&request.key_ref, &request.path, digest_bytes)
+        .await
+        .unwrap();
+    Json(sig).into_response()
 }
 
 fn check_auth(state: &ServerState, headers: &HeaderMap) -> Result<(), Response> {

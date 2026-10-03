@@ -6,8 +6,8 @@
 
 ## 1. 当前上下文
 
-- **当前 Goal**: 全面审计缺陷修复与生产架构优化（卡死归集 Gas 替换费率底线、Order Verify 多租户鉴权、EVM Topic 零填充校验、无状态扫描器废弃 KVDB 冗余代码清理）
-- **当前 Task**: [TASK-028: 全面审计缺陷修复与生产架构优化](file:///ssd0/git/pay3/docs/AI/tasks/TASK-028.md)
+- **当前 Goal**: 全功能可插拔免 Gas (Permit / Meta-Tx) 资金归集架构（支持 EIP-3009 原生 USDC、Polygon PoS MetaTx USDT 与 EIP-2612 Permit，由独立 Relayer 钱包代付原生 Gas）
+- **当前 Task**: [TASK-029: 全功能可插拔免 Gas (Permit / Meta-Tx) 资金归集架构](file:///ssd0/git/pay3/docs/AI/tasks/TASK-029.md)
 - **当前状态**: `DONE`
 
 ---
@@ -75,6 +75,24 @@
     - **Finding 2 (Low/Medium - 租户隔离)**: 在 `POST /v1/orders/{id}/verify` 端点与服务层校验调用者的 `owner_sub`，禁止跨租户非法核验他人物流与订单信息，非法跨商户请求安全返回 404；
     - **Finding 3 (Low - 防护)**: 在 `parse_topic_address` 增加 EVM ABI 高位 12 字节（24 字符）全零校验，杜绝恶意伪造非对齐 Topic 地址；
     - **Finding 4 (Informational - 架构整洁度)**: 清理移除了 `health.rs`、`api/mod.rs`、`workers/scanner.rs` 中遗留的 KVDB 相关死代码、指标与未使用的错误枚举变体。
+15. **完成 TASK-029：全功能可插拔免 Gas (Permit / Meta-Tx) 资金归集架构**:
+    - **EIP-712 与 ABI 编码模块 (`src/domain/permit.rs`)**:
+      - 抽象并实现 `CollectionMethod` (`Standard`, `Eip3009`, `PolygonMetaTx`, `Eip2612`)。
+      - 实现标准 EIP-712 Domain Separator、Polygon PoS 特殊 Salt Domain Separator、EIP-3009 `TransferWithAuthorization`、Polygon `MetaTransaction`、EIP-2612 `Permit` 的 Struct Hash 及标准 EVM ABI Calldata 编码器。
+    - **统一签名抽象与适配器扩展 (`src/signer/mod.rs`, `local.rs`, `external.rs`, `reference_signer.py`)**:
+      - `SignerProvider` 增加 `sign_digest(&self, key_ref, digest) -> Result<TypedSignature, WalletError>`。
+      - `LocalMnemonicSigner`、`DeterministicFakeSigner`、`RemoteHttpSigner` 及 Python 外部参考签名服务均已实现 digest 签名，覆盖 19 个签名契约测试。
+    - **数据库安全约束与白名单 (`20261003000200_collection_relayers.sql`)**:
+      - 新增 `relayer_addresses (chain_id, relayer_address)` 表。
+      - 增强 `enforce_collection_outbound_tx()` 触发器：白名单放行注册的 Relayer 作为 `from_address`（代付主网原生 Gas），非白名单地址抛出 23514 约束错误。
+    - **归集策略与服务编排 (`src/services/collections.rs`)**:
+      - 实现 `CollectionStrategyConfig`。免 Gas 归集时由子地址离线签名，Payer 自动切换为 `relayer.address`；
+      - `gas_checker.ensure_prefunded_gas` 校验 Relayer 钱包原生 Gas 余额，子收款地址 0 原生 Gas 也可顺利归集；
+      - `account_nonces` 分配锁定 Relayer 的 Nonce；`outbound_transactions` 严格落盘 `from_address = relayer.address`，`to_address = treasury`；
+      - 幂等同 Nonce Replacement 支持免 Gas 重构与手续费上浮重新广播。
+    - **运行时装配 (`src/runtime.rs`, `src/config.rs`)**:
+      - 环境变量配置解析 `COLLECTION_METHOD`、`COLLECTION_RELAYER_KEY_REF`、`COLLECTION_RELAYER_DERIVATION_PATH`、`COLLECTION_TOKEN_NAME`、`COLLECTION_TOKEN_VERSION`。
+      - 启动时自动派生 Relayer 地址并注册进 DB `relayer_addresses` 表。
 
 ---
 
@@ -82,33 +100,36 @@
 
 ### 创建文件
 - `docs/AI/tasks/TASK-028.md`
+- `docs/AI/tasks/TASK-029.md`
 - `src/db/migrations/20261003000100_outbound_gas_fees.sql`
+- `src/db/migrations/20261003000200_collection_relayers.sql`
+- `src/domain/permit.rs`
 
 ### 修改文件
-- `src/api/mod.rs`
-- `src/api/verify.rs`
-- `src/api/verify_service.rs`
-- `src/chain/rpc.rs`
-- `src/db/repositories/outbound.rs`
-- `src/db/repositories/types.rs`
-- `src/domain/collection.rs`
-- `src/health.rs`
-- `src/services/collections.rs`
-- `src/services/verify/service.rs`
-- `src/workers/collector.rs`
-- `src/workers/scanner.rs`
-- `tests/collector_recovery_integration.rs`
-- `tests/migration_contract.rs`
-- `tests/order_verify_api_contract.rs`
+- `deploy/signer/reference_signer.py`
 - `docs/AI/TASK_INDEX.md`
 - `docs/AI/SESSION_STATE.md`
+- `src/config.rs`
+- `src/db/migrations.rs`
+- `src/domain/address.rs`
+- `src/domain/mod.rs`
+- `src/runtime.rs`
+- `src/services/collections.rs`
+- `src/signer/external.rs`
+- `src/signer/local.rs`
+- `src/signer/mod.rs`
+- `tests/anvil_e2e.rs`
+- `tests/migration_contract.rs`
+- `tests/real_chain_e2e.rs`
+- `tests/signer_contract.rs`
+- `tests/support/anvil.rs`
 
 ---
 
 ## 4. 已运行的验证命令及结果
 
 - `cargo check --all-targets`: **通过**。零错误，零警告。
-- `cargo test`: **通过**。全量 194+ 个单元/契约/集成测试全部绿色通过。
+- `cargo test`: **通过**。全量 203+ 个单元测试、契约测试、集成测试全部绿色通过。
 - `bash scripts/verify_production_readiness.sh --env-file .env.production.example`: **通过**。21 checks passed, 0 failed.
 
 ---
@@ -116,20 +137,22 @@
 ## 5. 未解决问题与剩余工作
 
 - **无未解决问题**。
-- `docs/AI/TASK_INDEX.md` 中所有 28 个任务卡（TASK-001 ~ TASK-028）全部处于 `DONE` 状态。
-- 系统安全加固、租户隔离、EIP-1559 替换交易费率健壮性、架构整洁度已达到生产级高可靠水平。
+- `docs/AI/TASK_INDEX.md` 中所有 29 个任务卡（TASK-001 ~ TASK-029）全部处于 `DONE` 状态。
+- USDT/USDC Permit / Meta-Tx 免 Gas 归集闭环完整落地，生产级高可靠运行。
 
 ---
 
 ## 6. 下一步任务与读取入口
 
-- **项目状态**: **100% 生产就绪与审计加固完成 (Production Ready & Audited)**
+- **项目状态**: **100% 生产就绪、审计加固与免 Gas 归集扩展完成 (Production Ready, Audited & Permit Enabled)**
 - **读取入口**:
   1. [docs/PRODUCTION_READINESS.md](file:///ssd0/git/pay3/docs/PRODUCTION_READINESS.md) (生产验收结论与上线命令)
   2. [docs/RUNBOOK.md](file:///ssd0/git/pay3/docs/RUNBOOK.md) (故障排查与运维指南)
   3. [docs/DEPLOYMENT.md](file:///ssd0/git/pay3/docs/DEPLOYMENT.md) (生产部署架构)
   4. [docs/AI/ARCHITECTURE.md](file:///ssd0/git/pay3/docs/AI/ARCHITECTURE.md) (系统架构)
   5. [docs/AI/TASK_INDEX.md](file:///ssd0/git/pay3/docs/AI/TASK_INDEX.md) (全量任务卡索引)
+  6. [docs/AI/tasks/TASK-029.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-029.md) (免 Gas 归集方案实现卡)
+
 
 
 

@@ -98,6 +98,7 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
                 token_address,
                 treasury_address,
                 problem_funds_address,
+                relayer_address: None,
                 start_block,
             },
         )
@@ -357,6 +358,7 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
                 token_address,
                 treasury_address,
                 problem_funds_address,
+                relayer_address: None,
                 start_block,
             },
         )

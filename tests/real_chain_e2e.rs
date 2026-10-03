@@ -229,6 +229,7 @@ async fn real_chain_order_payment_collection_flow() -> Result<(), AnyError> {
                 token_address: config.chain.token_address,
                 treasury_address: config.chain.treasury_address,
                 problem_funds_address: config.chain.problem_funds_address,
+                relayer_address: None,
                 start_block,
             },
         )

@@ -62,6 +62,17 @@ def sign_transaction_mock(key_ref: str, path: str, tx: dict) -> dict:
     }
 
 
+def sign_digest_mock(key_ref: str, path: str, digest: str) -> dict:
+    """Deterministic mock typed data signature matching test fixtures."""
+    r_bytes = hashlib.sha256(f"pay3-digest-r:{key_ref}:{path}:{digest}".encode()).digest()
+    s_bytes = hashlib.sha256(f"pay3-digest-s:{key_ref}:{path}:{digest}".encode()).digest()
+    return {
+        "v": 27,
+        "r": "0x" + r_bytes.hex(),
+        "s": "0x" + s_bytes.hex(),
+    }
+
+
 class SignerHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, data: any):
         body = json.dumps(data).encode("utf-8")
@@ -132,6 +143,19 @@ class SignerHandler(BaseHTTPRequestHandler):
                 return
             signed_tx = sign_transaction_mock(key_ref, path, tx)
             self._send_json(200, signed_tx)
+
+        elif self.path == "/v1/digests/sign":
+            key_ref = req.get("key_ref")
+            path = req.get("path")
+            digest = req.get("digest")
+            if not key_ref or not path or not digest:
+                self._send_error(400, "Missing key_ref, path, or digest")
+                return
+            if EXPECTED_KEY_REF and key_ref != EXPECTED_KEY_REF:
+                self._send_error(400, f"Unknown key_ref: {key_ref}")
+                return
+            sig = sign_digest_mock(key_ref, path, digest)
+            self._send_json(200, sig)
 
         else:
             self._send_error(404, "Not Found")

@@ -13,6 +13,8 @@ const ORDER_PAYMENT_OVERRIDES: &str =
     include_str!("../src/db/migrations/20260622000100_order_payment_overrides.sql");
 const OUTBOUND_GAS_FEES: &str =
     include_str!("../src/db/migrations/20261003000100_outbound_gas_fees.sql");
+const COLLECTION_RELAYERS: &str =
+    include_str!("../src/db/migrations/20261003000200_collection_relayers.sql");
 
 #[test]
 fn migrator_embeds_initial_schema() {
@@ -28,7 +30,8 @@ fn migrator_embeds_initial_schema() {
             20260507000200,
             20260507000300,
             20260622000100,
-            20261003000100
+            20261003000100,
+            20261003000200
         ]
     );
 }
@@ -171,6 +174,22 @@ fn outbound_gas_fees_migration_adds_eip1559_fee_fields_and_constraints() {
     ] {
         assert!(
             OUTBOUND_GAS_FEES.contains(fragment),
+            "missing {fragment}"
+        );
+    }
+}
+
+#[test]
+fn collection_relayers_migration_adds_relayer_table_and_updates_trigger() {
+    for fragment in [
+        "CREATE TABLE relayer_addresses",
+        "PRIMARY KEY (chain_id, relayer_address)",
+        "CHECK (relayer_address ~ '^0x[0-9a-f]{40}$')",
+        "CREATE OR REPLACE FUNCTION enforce_collection_outbound_tx()",
+        "FROM relayer_addresses r",
+    ] {
+        assert!(
+            COLLECTION_RELAYERS.contains(fragment),
             "missing {fragment}"
         );
     }

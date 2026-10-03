@@ -22,7 +22,11 @@ use crate::{
         OutboundTxRecord, ReceiptCheckableOutboundTx, RepositoryError,
     },
     domain::{
-        CollectionFees, CollectionPurpose, CollectionTxPlan, EvmAddress, OrderStatus, RawAmount,
+        eip2612_struct_hash, eip3009_struct_hash, eip712_digest, eip712_domain_separator,
+        encode_eip2612_permit, encode_eip3009_transfer_with_authorization,
+        encode_polygon_execute_meta_transaction, polygon_meta_tx_domain_separator,
+        polygon_meta_tx_struct_hash, CollectionFees, CollectionPurpose,
+        CollectionTxPlan, EvmAddress, OrderStatus, RawAmount,
     },
     services::orders::{IdGenerator, RandomIdGenerator},
     signer::{SignedTx, SignerError, SignerProvider, UnsignedTx},
@@ -31,12 +35,133 @@ use crate::{
 const ERC20_TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayerConfig {
+    pub key_ref: String,
+    pub derivation_path: String,
+    pub address: EvmAddress,
+}
+
+impl RelayerConfig {
+    pub fn new(
+        key_ref: impl Into<String>,
+        derivation_path: impl Into<String>,
+        address: EvmAddress,
+    ) -> Self {
+        Self {
+            key_ref: key_ref.into(),
+            derivation_path: derivation_path.into(),
+            address,
+        }
+    }
+
+    fn validate(&self) -> Result<(), CollectionServiceError> {
+        if self.key_ref.trim().is_empty() {
+            return Err(CollectionServiceError::invalid_argument(
+                "relayer.key_ref",
+                "must not be empty",
+            ));
+        }
+        if self.derivation_path.trim().is_empty() {
+            return Err(CollectionServiceError::invalid_argument(
+                "relayer.derivation_path",
+                "must not be empty",
+            ));
+        }
+        if self.address == EvmAddress::ZERO {
+            return Err(CollectionServiceError::invalid_argument(
+                "relayer.address",
+                "must not be zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CollectionStrategyConfig {
+    Standard,
+    Eip3009 {
+        token_name: String,
+        token_version: String,
+        relayer: RelayerConfig,
+    },
+    PolygonMetaTx {
+        token_name: String,
+        token_version: String,
+        relayer: RelayerConfig,
+    },
+    Eip2612 {
+        token_name: String,
+        token_version: String,
+        relayer: RelayerConfig,
+    },
+}
+
+impl Default for CollectionStrategyConfig {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+impl CollectionStrategyConfig {
+    pub fn is_gasless(&self) -> bool {
+        !matches!(self, Self::Standard)
+    }
+
+    pub fn relayer(&self) -> Option<&RelayerConfig> {
+        match self {
+            Self::Standard => None,
+            Self::Eip3009 { relayer, .. }
+            | Self::PolygonMetaTx { relayer, .. }
+            | Self::Eip2612 { relayer, .. } => Some(relayer),
+        }
+    }
+
+    fn validate(&self) -> Result<(), CollectionServiceError> {
+        match self {
+            Self::Standard => Ok(()),
+            Self::Eip3009 {
+                token_name,
+                token_version,
+                relayer,
+            }
+            | Self::PolygonMetaTx {
+                token_name,
+                token_version,
+                relayer,
+            }
+            | Self::Eip2612 {
+                token_name,
+                token_version,
+                relayer,
+            } => {
+                if token_name.trim().is_empty() {
+                    return Err(CollectionServiceError::invalid_argument(
+                        "strategy.token_name",
+                        "must not be empty",
+                    ));
+                }
+                if token_version.trim().is_empty() {
+                    return Err(CollectionServiceError::invalid_argument(
+                        "strategy.token_version",
+                        "must not be empty",
+                    ));
+                }
+                relayer.validate()?;
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionServiceConfig {
     pub chain_id: u64,
     pub token_address: EvmAddress,
     pub treasury_address: EvmAddress,
     pub problem_funds_address: EvmAddress,
     pub fees: CollectionFees,
+    pub strategy: CollectionStrategyConfig,
 }
 
 impl CollectionServiceConfig {
@@ -53,7 +178,13 @@ impl CollectionServiceConfig {
             treasury_address,
             problem_funds_address,
             fees,
+            strategy: CollectionStrategyConfig::Standard,
         }
+    }
+
+    pub fn with_strategy(mut self, strategy: CollectionStrategyConfig) -> Self {
+        self.strategy = strategy;
+        self
     }
 
     fn validate(&self) -> Result<(), CollectionServiceError> {
@@ -93,6 +224,7 @@ impl CollectionServiceConfig {
                 "must be greater than zero",
             ));
         }
+        self.strategy.validate()?;
         Ok(())
     }
 }
@@ -620,12 +752,26 @@ where
             return Ok(PrepareCollectionJobOutcome::NoJob);
         };
 
+        let (payer_address, payer_key_ref, payer_derivation_path) =
+            match self.config.strategy.relayer() {
+                Some(relayer) => (
+                    relayer.address,
+                    relayer.key_ref.as_str(),
+                    relayer.derivation_path.as_str(),
+                ),
+                None => (
+                    job.collection.from_address,
+                    job.signer_key_ref.as_str(),
+                    job.derivation_path.as_str(),
+                ),
+            };
+
         let amount = self.resolve_collection_amount(&job).await?;
         let fees = self.current_collection_fees().await?;
         self.gas_checker
             .ensure_prefunded_gas(PrefundedGasCheck {
                 chain_id: job.collection.chain_id,
-                from_address: job.collection.from_address,
+                from_address: payer_address,
                 gas_limit: fees.gas_limit,
                 max_fee_per_gas: fees.max_fee_per_gas,
                 max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
@@ -635,17 +781,18 @@ where
 
         let pending_nonce = self
             .chain
-            .pending_nonce(job.collection.chain_id, job.collection.from_address)
+            .pending_nonce(job.collection.chain_id, payer_address)
             .await?;
         let reserved_nonce = self
             .outbound
             .reserve_nonce(
                 job.collection.chain_id,
-                job.collection.from_address,
+                payer_address,
                 pending_nonce,
             )
             .await?;
         let nonce = raw_amount_to_u64(reserved_nonce.nonce)?;
+        let data = self.build_collection_calldata(&job, amount).await?;
         let unsigned = UnsignedTx::new(
             format!("collection-{}-nonce-{nonce}", job.collection.id),
             job.collection.chain_id,
@@ -655,13 +802,13 @@ where
             fees.gas_limit,
             fees.max_fee_per_gas,
             fees.max_priority_fee_per_gas,
-            erc20_transfer_data(job.collection.to_address, amount),
+            data,
         )?;
         let signed = self
             .signer
-            .sign_transaction(&job.signer_key_ref, &job.derivation_path, unsigned)
+            .sign_transaction(payer_key_ref, payer_derivation_path, unsigned)
             .await?;
-        ensure_signed_tx_matches_job(&job, &signed, nonce)?;
+        ensure_signed_tx_matches_job(&job, &signed, payer_address, nonce)?;
 
         let outbound = self
             .outbound
@@ -671,7 +818,7 @@ where
                     id: self.ids.new_id(),
                     chain_id: job.collection.chain_id,
                     purpose: OutboundTxPurpose::Collect,
-                    from_address: job.collection.from_address,
+                    from_address: payer_address,
                     to_address: job.collection.to_address,
                     nonce: reserved_nonce.nonce,
                     gas_limit: fees.gas_limit,
@@ -802,10 +949,33 @@ where
                 .max_priority_fee_per_gas
                 .max(bumped_from_prev.max_priority_fee_per_gas),
         );
+        let (payer_address, payer_key_ref, payer_derivation_path) =
+            match self.config.strategy.relayer() {
+                Some(relayer) => (
+                    relayer.address,
+                    relayer.key_ref.as_str(),
+                    relayer.derivation_path.as_str(),
+                ),
+                None => (
+                    collection.from_address,
+                    collection_job.signer_key_ref.as_str(),
+                    collection_job.derivation_path.as_str(),
+                ),
+            };
+
+        if job.outbound.from_address != payer_address {
+            return Err(CollectionServiceError::SignedTxInvariant {
+                message: format!(
+                    "outbound {} from_address {} did not match expected payer {}",
+                    job.outbound.id, job.outbound.from_address, payer_address
+                ),
+            });
+        }
+
         let original_plan = CollectionTxPlan::new(
             collection.chain_id,
             nonce,
-            collection.from_address,
+            payer_address,
             collection.to_address,
             amount,
             CollectionPurpose::TreasurySweep,
@@ -823,7 +993,7 @@ where
         self.gas_checker
             .ensure_prefunded_gas(PrefundedGasCheck {
                 chain_id: collection.chain_id,
-                from_address: collection.from_address,
+                from_address: payer_address,
                 gas_limit: replacement_fees.gas_limit,
                 max_fee_per_gas: replacement_fees.max_fee_per_gas,
                 max_priority_fee_per_gas: replacement_fees.max_priority_fee_per_gas,
@@ -831,6 +1001,9 @@ where
             .await?;
         self.signer.health_check().await?;
 
+        let data = self
+            .build_collection_calldata(&collection_job, amount)
+            .await?;
         let unsigned = UnsignedTx::new(
             format!(
                 "collection-{}-nonce-{nonce}-replacement-{}",
@@ -843,17 +1016,17 @@ where
             replacement_fees.gas_limit,
             replacement_fees.max_fee_per_gas,
             replacement_fees.max_priority_fee_per_gas,
-            erc20_transfer_data(collection.to_address, amount),
+            data,
         )?;
         let signed = self
             .signer
             .sign_transaction(
-                &collection_job.signer_key_ref,
-                &collection_job.derivation_path,
+                payer_key_ref,
+                payer_derivation_path,
                 unsigned,
             )
             .await?;
-        ensure_signed_tx_matches_job(&collection_job, &signed, nonce)?;
+        ensure_signed_tx_matches_job(&collection_job, &signed, payer_address, nonce)?;
 
         let outbound = self
             .outbound
@@ -863,7 +1036,7 @@ where
                     id: self.ids.new_id(),
                     chain_id: collection.chain_id,
                     purpose: OutboundTxPurpose::Collect,
-                    from_address: collection.from_address,
+                    from_address: payer_address,
                     to_address: collection.to_address,
                     nonce: job.outbound.nonce,
                     gas_limit: replacement_fees.gas_limit,
@@ -967,6 +1140,116 @@ where
             .await?;
         Ok(())
     }
+
+    async fn build_collection_calldata(
+        &self,
+        job: &CollectionJob,
+        amount: RawAmount,
+    ) -> Result<Vec<u8>, CollectionServiceError> {
+        match &self.config.strategy {
+            CollectionStrategyConfig::Standard => {
+                Ok(erc20_transfer_data(job.collection.to_address, amount))
+            }
+            CollectionStrategyConfig::Eip3009 {
+                token_name,
+                token_version,
+                ..
+            } => {
+                let domain_sep = eip712_domain_separator(
+                    token_name,
+                    token_version,
+                    job.collection.chain_id,
+                    job.collection.token_address,
+                );
+                let auth_nonce =
+                    *keccak256(format!("pay3:eip3009:{}", job.collection.id).as_bytes());
+                let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+                let valid_after = now.saturating_sub(60);
+                let valid_before = now + 86_400;
+                let struct_hash = eip3009_struct_hash(
+                    job.collection.from_address,
+                    job.collection.to_address,
+                    amount,
+                    valid_after,
+                    valid_before,
+                    auth_nonce,
+                );
+                let digest = eip712_digest(domain_sep, struct_hash);
+                let sig = self
+                    .signer
+                    .sign_digest(&job.signer_key_ref, &job.derivation_path, digest)
+                    .await?;
+                Ok(encode_eip3009_transfer_with_authorization(
+                    job.collection.from_address,
+                    job.collection.to_address,
+                    amount,
+                    valid_after,
+                    valid_before,
+                    auth_nonce,
+                    sig,
+                ))
+            }
+            CollectionStrategyConfig::PolygonMetaTx {
+                token_name,
+                token_version,
+                ..
+            } => {
+                let domain_sep = polygon_meta_tx_domain_separator(
+                    token_name,
+                    token_version,
+                    job.collection.chain_id,
+                    job.collection.token_address,
+                );
+                let fn_sig = erc20_transfer_data(job.collection.to_address, amount);
+                let meta_nonce = 0u64;
+                let struct_hash =
+                    polygon_meta_tx_struct_hash(meta_nonce, job.collection.from_address, &fn_sig);
+                let digest = eip712_digest(domain_sep, struct_hash);
+                let sig = self
+                    .signer
+                    .sign_digest(&job.signer_key_ref, &job.derivation_path, digest)
+                    .await?;
+                Ok(encode_polygon_execute_meta_transaction(
+                    job.collection.from_address,
+                    &fn_sig,
+                    sig,
+                ))
+            }
+            CollectionStrategyConfig::Eip2612 {
+                token_name,
+                token_version,
+                relayer,
+            } => {
+                let domain_sep = eip712_domain_separator(
+                    token_name,
+                    token_version,
+                    job.collection.chain_id,
+                    job.collection.token_address,
+                );
+                let now = OffsetDateTime::now_utc().unix_timestamp().max(0) as u64;
+                let deadline = now + 86_400;
+                let struct_hash = eip2612_struct_hash(
+                    job.collection.from_address,
+                    relayer.address,
+                    amount,
+                    0,
+                    deadline,
+                );
+                let digest = eip712_digest(domain_sep, struct_hash);
+                let sig = self
+                    .signer
+                    .sign_digest(&job.signer_key_ref, &job.derivation_path, digest)
+                    .await?;
+                Ok(encode_eip2612_permit(
+                    job.collection.from_address,
+                    relayer.address,
+                    amount,
+                    deadline,
+                    sig,
+                ))
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1068,6 +1351,7 @@ pub fn erc20_transfer_data(to: EvmAddress, amount: RawAmount) -> Vec<u8> {
 fn ensure_signed_tx_matches_job(
     job: &CollectionJob,
     signed: &SignedTx,
+    expected_from: EvmAddress,
     nonce: u64,
 ) -> Result<(), CollectionServiceError> {
     if signed.chain_id != job.collection.chain_id {
@@ -1082,10 +1366,10 @@ fn ensure_signed_tx_matches_job(
             signed.nonce
         )));
     }
-    if signed.from != job.collection.from_address {
+    if signed.from != expected_from {
         return Err(signed_invariant(format!(
-            "signed from {} did not match collection from {}",
-            signed.from, job.collection.from_address
+            "signed from {} did not match expected from {}",
+            signed.from, expected_from
         )));
     }
     if signed.to != job.collection.token_address {
@@ -1169,6 +1453,7 @@ mod tests {
     use time::{OffsetDateTime, macros::datetime};
 
     use super::*;
+    use crate::domain::TypedSignature;
     use crate::{
         chain::{
             ChainBlock, ChainHeaderReader, FakeErc20ChainClient, TransactionStatus, TransferLog,
@@ -1540,6 +1825,184 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_next_collection_job_with_eip3009_gasless_strategy() {
+        let relayer = RelayerConfig::new("relayer-key", "m/44'/60'/0'/0/0", relayer_address());
+        let strategy = CollectionStrategyConfig::Eip3009 {
+            token_name: "USD Coin".to_string(),
+            token_version: "2".to_string(),
+            relayer,
+        };
+        let service = service(Fixture {
+            strategy,
+            ..Fixture::default()
+        });
+
+        let outcome = service
+            .prepare_next_collection_job("collector-1")
+            .await
+            .unwrap();
+        let PrepareCollectionJobOutcome::Prepared {
+            collection,
+            outbound,
+            signed_tx,
+        } = outcome
+        else {
+            panic!("expected prepared collection job");
+        };
+
+        assert_eq!(collection.outbound_tx_id, Some(outbound.id));
+        assert_eq!(outbound.purpose, OutboundTxPurpose::Collect);
+        assert_eq!(outbound.from_address, relayer_address());
+        assert_eq!(outbound.to_address, treasury());
+        assert_eq!(outbound.nonce, RawAmount::from(7));
+        assert_eq!(outbound.tx_hash, signed_tx.tx_hash);
+
+        assert_eq!(
+            service.gas_checker.checked_addresses(),
+            vec![relayer_address()]
+        );
+        assert_eq!(
+            service.outbound.reserved(),
+            vec![(1, relayer_address(), RawAmount::from(7))]
+        );
+
+        let signed_requests = service.signer.signed_requests();
+        assert_eq!(signed_requests.len(), 1);
+        assert_eq!(signed_requests[0].to, token());
+        assert_eq!(signed_requests[0].nonce, 7);
+        assert_eq!(
+            &signed_requests[0].data[..4],
+            &crate::domain::permit::EIP3009_TRANSFER_WITH_AUTHORIZATION_SELECTOR
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_next_collection_job_with_polygon_meta_tx_gasless_strategy() {
+        let relayer = RelayerConfig::new("relayer-key", "m/44'/60'/0'/0/0", relayer_address());
+        let strategy = CollectionStrategyConfig::PolygonMetaTx {
+            token_name: "(PoS) Tether USD".to_string(),
+            token_version: "1".to_string(),
+            relayer,
+        };
+        let service = service(Fixture {
+            strategy,
+            ..Fixture::default()
+        });
+
+        let outcome = service
+            .prepare_next_collection_job("collector-1")
+            .await
+            .unwrap();
+        let PrepareCollectionJobOutcome::Prepared {
+            collection,
+            outbound,
+            signed_tx,
+        } = outcome
+        else {
+            panic!("expected prepared collection job");
+        };
+
+        assert_eq!(collection.outbound_tx_id, Some(outbound.id));
+        assert_eq!(outbound.purpose, OutboundTxPurpose::Collect);
+        assert_eq!(outbound.from_address, relayer_address());
+        assert_eq!(outbound.to_address, treasury());
+        assert_eq!(outbound.nonce, RawAmount::from(7));
+        assert_eq!(outbound.tx_hash, signed_tx.tx_hash);
+
+        assert_eq!(
+            service.gas_checker.checked_addresses(),
+            vec![relayer_address()]
+        );
+
+        let signed_requests = service.signer.signed_requests();
+        assert_eq!(signed_requests.len(), 1);
+        assert_eq!(signed_requests[0].to, token());
+        assert_eq!(signed_requests[0].nonce, 7);
+        assert_eq!(
+            &signed_requests[0].data[..4],
+            &crate::domain::permit::POLYGON_EXECUTE_META_TRANSACTION_SELECTOR
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_collection_job_with_eip3009_gasless_strategy() {
+        let relayer = RelayerConfig::new("relayer-key", "m/44'/60'/0'/0/0", relayer_address());
+        let strategy = CollectionStrategyConfig::Eip3009 {
+            token_name: "USD Coin".to_string(),
+            token_version: "2".to_string(),
+            relayer,
+        };
+        let service = service(Fixture {
+            strategy,
+            ..Fixture::default()
+        });
+
+        let old_tx = NewSignedOutboundTx {
+            id: Uuid::from_u128(200),
+            chain_id: 1,
+            purpose: OutboundTxPurpose::Collect,
+            from_address: relayer_address(),
+            to_address: treasury(),
+            nonce: RawAmount::from(7),
+            gas_limit: 65_000,
+            max_fee_per_gas: RawAmount::from(30_000_000_000),
+            max_priority_fee_per_gas: RawAmount::from(1_500_000_000),
+            tx_hash: tx_hash(0xab),
+            signed_tx: b"old-signed".to_vec(),
+            replacement_of: None,
+            replacement_reason: None,
+        };
+        let mut collection_job = collection_job(Some(RawAmount::from(1_000)));
+        collection_job.collection.status = CollectionRecordStatus::Confirming;
+        collection_job.collection.outbound_tx_id = Some(old_tx.id);
+        collection_job.collection.attempt_count = 2;
+        collection_job.collection.amount_raw = Some(RawAmount::from(1_000));
+        {
+            let mut state = service
+                .collections
+                .state
+                .lock()
+                .expect("fake collection repo mutex poisoned");
+            state
+                .jobs_by_collection_id
+                .insert(collection_job.collection.id, collection_job.clone());
+        }
+        let mut old_outbound = outbound_record(old_tx);
+        old_outbound.status = OutboundTxStatus::Broadcast;
+        old_outbound.last_broadcast_at = Some(now() - time::Duration::hours(2));
+
+        let outcome = service
+            .replace_collection_job(
+                "collector-1",
+                ReceiptCheckableOutboundTx {
+                    collection_id: collection_job.collection.id,
+                    outbound: old_outbound.clone(),
+                },
+                "receipt missing beyond replacement threshold",
+            )
+            .await
+            .unwrap();
+
+        let PrepareCollectionJobOutcome::Prepared { outbound, .. } = outcome else {
+            panic!("expected replacement to produce a prepared job");
+        };
+
+        assert_eq!(outbound.from_address, relayer_address());
+        assert_eq!(outbound.to_address, treasury());
+        assert_eq!(
+            service.gas_checker.checked_addresses(),
+            vec![relayer_address()]
+        );
+        let signed_requests = service.signer.signed_requests();
+        assert_eq!(signed_requests.len(), 1);
+        assert_eq!(signed_requests[0].nonce, 7);
+        assert_eq!(
+            &signed_requests[0].data[..4],
+            &crate::domain::permit::EIP3009_TRANSFER_WITH_AUTHORIZATION_SELECTOR
+        );
+    }
+
+    #[tokio::test]
     async fn prepare_next_collection_job_fails_gas_gate_before_nonce_or_signing() {
         let service = service(Fixture {
             gas_error: Some(GasFundingError::Insufficient {
@@ -1638,7 +2101,7 @@ mod tests {
 
     fn service(fixture: Fixture) -> TestService {
         CollectionService::with_id_generator(
-            config(),
+            config().with_strategy(fixture.strategy),
             FakeOrderRepository::new(order_view(fixture.order_status)),
             FakeCollectionRepository::new(collection_job(fixture.job_amount)),
             FakeOutboundRepository::default(),
@@ -1663,6 +2126,7 @@ mod tests {
         job_amount: Option<RawAmount>,
         gas_error: Option<GasFundingError>,
         fee_estimate: Eip1559FeeEstimate,
+        strategy: CollectionStrategyConfig,
     }
 
     impl Default for Fixture {
@@ -1676,6 +2140,7 @@ mod tests {
                     max_fee_per_gas: RawAmount::from(20_000_000_000),
                     max_priority_fee_per_gas: RawAmount::from(1_000_000_000),
                 },
+                strategy: CollectionStrategyConfig::Standard,
             }
         }
     }
@@ -2105,15 +2570,19 @@ mod tests {
     impl SignerProvider for FakeSigner {
         async fn derive_address(
             &self,
-            _key_ref: &str,
+            key_ref: &str,
             _path: &str,
         ) -> Result<EvmAddress, SignerError> {
-            Ok(child_address())
+            if key_ref == "relayer-key" {
+                Ok(relayer_address())
+            } else {
+                Ok(child_address())
+            }
         }
 
         async fn sign_transaction(
             &self,
-            _key_ref: &str,
+            key_ref: &str,
             _path: &str,
             tx: UnsignedTx,
         ) -> Result<SignedTx, SignerError> {
@@ -2122,15 +2591,29 @@ mod tests {
                 .expect("fake signer mutex poisoned")
                 .push(tx.clone());
             let raw_tx = format!("signed:{}", tx.request_id).into_bytes();
+            let from = if key_ref == "relayer-key" {
+                relayer_address()
+            } else {
+                child_address()
+            };
             Ok(SignedTx {
                 request_id: tx.request_id,
                 chain_id: tx.chain_id,
                 nonce: tx.nonce,
-                from: child_address(),
+                from,
                 to: tx.to,
                 tx_hash: tx_hash(0xaa),
                 raw_tx,
             })
+        }
+
+        async fn sign_digest(
+            &self,
+            _key_ref: &str,
+            _path: &str,
+            digest: [u8; 32],
+        ) -> Result<TypedSignature, SignerError> {
+            Ok(TypedSignature::new(27, digest, digest))
         }
 
         async fn health_check(&self) -> Result<(), SignerError> {
@@ -2244,14 +2727,27 @@ mod tests {
         }
     }
 
-    #[derive(Clone, Debug)]
+    #[derive(Clone, Debug, Default)]
     struct FakeGasChecker {
+        checks: Arc<Mutex<Vec<PrefundedGasCheck>>>,
         error: Option<GasFundingError>,
     }
 
     impl FakeGasChecker {
         fn new(error: Option<GasFundingError>) -> Self {
-            Self { error }
+            Self {
+                checks: Arc::new(Mutex::new(Vec::new())),
+                error,
+            }
+        }
+
+        fn checked_addresses(&self) -> Vec<EvmAddress> {
+            self.checks
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|c| c.from_address)
+                .collect()
         }
     }
 
@@ -2259,8 +2755,9 @@ mod tests {
     impl PrefundedGasChecker for FakeGasChecker {
         async fn ensure_prefunded_gas(
             &self,
-            _check: PrefundedGasCheck,
+            check: PrefundedGasCheck,
         ) -> Result<(), GasFundingError> {
+            self.checks.lock().unwrap().push(check);
             match &self.error {
                 Some(error) => Err(error.clone()),
                 None => Ok(()),
@@ -2443,5 +2940,9 @@ mod tests {
 
     fn tx_hash(byte: u8) -> TxHash {
         TxHash::from_bytes([byte; 32])
+    }
+
+    fn relayer_address() -> EvmAddress {
+        address(0x55)
     }
 }

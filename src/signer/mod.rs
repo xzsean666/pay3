@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::domain::{EvmAddress, MAX_DERIVATION_INDEX, RawAmount, TxHash};
+use crate::domain::{EvmAddress, MAX_DERIVATION_INDEX, RawAmount, TxHash, TypedSignature};
 
 mod external;
 mod local;
@@ -134,6 +134,13 @@ pub trait SignerProvider: Send + Sync {
         path: &str,
         tx: UnsignedTx,
     ) -> Result<SignedTx, SignerError>;
+
+    async fn sign_digest(
+        &self,
+        key_ref: &str,
+        path: &str,
+        digest: [u8; 32],
+    ) -> Result<TypedSignature, SignerError>;
 
     async fn health_check(&self) -> Result<(), SignerError>;
 }
@@ -284,6 +291,38 @@ impl SignerProvider for DeterministicFakeSigner {
             tx_hash: TxHash::from_bytes(tx_hash),
             raw_tx,
         })
+    }
+
+    async fn sign_digest(
+        &self,
+        key_ref: &str,
+        path: &str,
+        digest: [u8; 32],
+    ) -> Result<TypedSignature, SignerError> {
+        let key_ref = normalize_signer_key_ref(key_ref)?;
+        validate_derivation_path(path)?;
+        self.ensure_allowed_key_ref(&key_ref)?;
+
+        let r_preimage = [
+            b"pay3:fake-typed-sig:r:".as_slice(),
+            self.namespace.as_bytes(),
+            key_ref.as_bytes(),
+            path.as_bytes(),
+            &digest,
+        ]
+        .concat();
+        let s_preimage = [
+            b"pay3:fake-typed-sig:s:".as_slice(),
+            self.namespace.as_bytes(),
+            key_ref.as_bytes(),
+            path.as_bytes(),
+            &digest,
+        ]
+        .concat();
+
+        let r: [u8; 32] = keccak256(r_preimage).into();
+        let s: [u8; 32] = keccak256(s_preimage).into();
+        Ok(TypedSignature::new(27, r, s))
     }
 
     async fn health_check(&self) -> Result<(), SignerError> {

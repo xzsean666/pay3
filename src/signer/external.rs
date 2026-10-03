@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-use crate::domain::EvmAddress;
+use crate::domain::{EvmAddress, TypedSignature};
 
 use super::{
     SignedTx, SignerError, SignerProvider, UnsignedTx, normalize_request_id,
@@ -23,6 +23,7 @@ use super::{
 const HEALTHZ_PATH: &str = "/healthz";
 const DERIVE_ADDRESS_PATH: &str = "/v1/addresses/derive";
 const SIGN_TRANSACTION_PATH: &str = "/v1/transactions/sign";
+const SIGN_DIGEST_PATH: &str = "/v1/digests/sign";
 const HEALTHY_STATUS: &str = "ok";
 
 #[derive(Clone)]
@@ -157,6 +158,13 @@ struct SignTransactionRequest<'a> {
     transaction: &'a UnsignedTx,
 }
 
+#[derive(Debug, Serialize)]
+struct SignDigestRequest<'a> {
+    key_ref: &'a str,
+    path: &'a str,
+    digest: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct HealthzResponse {
     status: String,
@@ -237,6 +245,31 @@ impl SignerProvider for RemoteHttpSigner {
                     .json(&request),
             ),
             "sign_transaction",
+        )
+        .await
+    }
+
+    async fn sign_digest(
+        &self,
+        key_ref: &str,
+        path: &str,
+        digest: [u8; 32],
+    ) -> Result<TypedSignature, SignerError> {
+        let key_ref = normalize_signer_key_ref(key_ref)?;
+        validate_derivation_path(path)?;
+
+        let request = SignDigestRequest {
+            key_ref: &key_ref,
+            path,
+            digest: crate::domain::address::encode_lower_prefixed(&digest),
+        };
+        self.request_json(
+            self.authenticated(
+                self.client
+                    .post(self.url(SIGN_DIGEST_PATH))
+                    .json(&request),
+            ),
+            "sign_digest",
         )
         .await
     }

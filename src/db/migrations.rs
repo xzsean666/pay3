@@ -14,6 +14,7 @@ pub struct RuntimeSeedConfig {
     pub token_address: EvmAddress,
     pub treasury_address: EvmAddress,
     pub problem_funds_address: EvmAddress,
+    pub relayer_address: Option<EvmAddress>,
     pub start_block: u64,
 }
 
@@ -40,6 +41,7 @@ pub async fn seed_runtime_config(
     seed_wallet_cursor(&mut tx, config).await?;
     seed_chain_cursor(&mut tx, config).await?;
     seed_treasury_address(&mut tx, config).await?;
+    seed_relayer_address(&mut tx, config).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -127,6 +129,30 @@ async fn seed_treasury_address(
         .bind(i64::try_from(config.chain_id)?)
         .bind(config.token_address.to_string())
         .bind(address.to_string())
+        .execute(&mut **tx)
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn seed_relayer_address(
+    tx: &mut Transaction<'_, Postgres>,
+    config: &RuntimeSeedConfig,
+) -> Result<(), MigrationBootstrapError> {
+    if let Some(relayer_address) = config.relayer_address {
+        sqlx::query(
+            r#"
+            INSERT INTO relayer_addresses (
+                chain_id,
+                relayer_address
+            )
+            VALUES ($1, $2)
+            ON CONFLICT (chain_id, relayer_address) DO NOTHING
+            "#,
+        )
+        .bind(i64::try_from(config.chain_id)?)
+        .bind(relayer_address.to_string())
         .execute(&mut **tx)
         .await?;
     }

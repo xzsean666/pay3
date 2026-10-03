@@ -14,8 +14,8 @@ use tempfile::TempDir;
 use tokio::time::sleep;
 
 use pay3::{
-    domain::{EvmAddress, RawAmount, TxHash},
-    signer::{SignedTx, SignerError, SignerProvider, UnsignedTx},
+    domain::{EvmAddress, RawAmount, TxHash, TypedSignature},
+    signer::{LocalMnemonicSigner, SignedTx, SignerError, SignerProvider, UnsignedTx},
 };
 
 pub type AnyError = Box<dyn Error + Send + Sync>;
@@ -287,6 +287,19 @@ impl SignerProvider for AnvilMnemonicSigner {
             tx_hash,
             raw_tx,
         })
+    }
+
+    async fn sign_digest(
+        &self,
+        key_ref: &str,
+        path: &str,
+        digest: [u8; 32],
+    ) -> Result<TypedSignature, SignerError> {
+        if key_ref.trim().is_empty() {
+            return Err(SignerError::EmptySignerKeyRef);
+        }
+        let signer = LocalMnemonicSigner::new(key_ref, &self.mnemonic)?;
+        signer.sign_digest(key_ref, path, digest).await
     }
 
     async fn health_check(&self) -> Result<(), SignerError> {

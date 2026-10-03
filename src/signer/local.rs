@@ -1,12 +1,12 @@
 use std::fmt;
 
 use alloy_consensus::{SignableTransaction, TxEip1559};
-use alloy_primitives::TxKind;
+use alloy_primitives::{B256, TxKind};
 use alloy_signer::SignerSync;
 use alloy_signer_local::{MnemonicBuilder, coins_bip39::English};
 use async_trait::async_trait;
 
-use crate::domain::{EvmAddress, RawAmount, TxHash};
+use crate::domain::{EvmAddress, RawAmount, TxHash, TypedSignature};
 
 use super::{
     SignedTx, SignerError, SignerProvider, UnsignedTx, normalize_request_id,
@@ -139,6 +139,27 @@ impl SignerProvider for LocalMnemonicSigner {
             tx_hash,
             raw_tx,
         })
+    }
+
+    async fn sign_digest(
+        &self,
+        key_ref: &str,
+        path: &str,
+        digest: [u8; 32],
+    ) -> Result<TypedSignature, SignerError> {
+        self.ensure_key_ref(key_ref)?;
+        let signer = self.signer_for_path(path)?;
+        let signature = signer
+            .sign_hash_sync(&B256::from(digest))
+            .map_err(|error| SignerError::LocalSigner {
+                operation: "sign_digest",
+                message: error.to_string(),
+            })?;
+
+        let r = signature.r().to_be_bytes();
+        let s = signature.s().to_be_bytes();
+        let v = if signature.v() { 28u8 } else { 27u8 };
+        Ok(TypedSignature::new(v, r, s))
     }
 
     async fn health_check(&self) -> Result<(), SignerError> {

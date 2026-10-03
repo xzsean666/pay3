@@ -32,8 +32,8 @@ use crate::{
     },
     services::{
         collections::{
-            CollectionService, CollectionServiceConfig, CreateCollectionInput,
-            NativeBalanceGasChecker,
+            CollectionService, CollectionServiceConfig, CollectionStrategyConfig,
+            CreateCollectionInput, NativeBalanceGasChecker, RelayerConfig,
         },
         orders::{OrderService, OrderServiceConfig, SystemClock},
         payment_windows::{RepositoryPaymentWindowLookup, WatchSetPaymentWindowLookup},
@@ -151,6 +151,25 @@ impl SignerProvider for RuntimeSigner {
             }
             Self::Remote(signer) => {
                 SignerProvider::sign_transaction(signer, key_ref, path, tx).await
+            }
+        }
+    }
+
+    async fn sign_digest(
+        &self,
+        key_ref: &str,
+        path: &str,
+        digest: [u8; 32],
+    ) -> Result<crate::domain::TypedSignature, SignerError> {
+        match self {
+            Self::Fake { signer, .. } => {
+                SignerProvider::sign_digest(signer, key_ref, path, digest).await
+            }
+            Self::Local(signer) => {
+                SignerProvider::sign_digest(signer, key_ref, path, digest).await
+            }
+            Self::Remote(signer) => {
+                SignerProvider::sign_digest(signer, key_ref, path, digest).await
             }
         }
     }
@@ -326,7 +345,6 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
 
     let pool = PgPool::connect(&config.database.url).await?;
     run_schema_migrations(&pool).await?;
-    seed_runtime_config(&pool, &runtime_seed_config(&config)).await?;
 
     let rpc_source = RpcRangeSource::from_http_urls(
         config.chain.chain_id,
@@ -337,6 +355,22 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
 
     let signer = runtime_signer(&config)?;
     ensure_runtime_signer_health(&signer).await?;
+
+    let relayer_address = if let Some(key_ref) = &config.collection.relayer_key_ref {
+        Some(
+            SignerProvider::derive_address(
+                &signer,
+                key_ref,
+                &config.collection.relayer_derivation_path,
+            )
+            .await
+            .map_err(|error| RuntimeError::Signer(Box::new(error)))?,
+        )
+    } else {
+        None
+    };
+    seed_runtime_config(&pool, &runtime_seed_config(&config, relayer_address)).await?;
+
     let metrics = MetricsRecorder::default();
 
     let stream = StreamId::new(config.chain.chain_id, config.chain.token_address);
@@ -386,16 +420,19 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
         rpc_source.clone(),
         signer.clone(),
     )?);
-    let collections = Arc::new(collection_service(
-        &config,
-        pool.clone(),
-        rpc_source.clone(),
-        signer.clone(),
-    )?);
+    let collections = Arc::new(
+        collection_service(
+            &config,
+            pool.clone(),
+            rpc_source.clone(),
+            signer.clone(),
+        )
+        .await?,
+    );
     if runtime_workers_enabled && workers.collection_enqueuer {
         background_tasks.push(tokio::spawn(auto_collection_enqueue_loop(
             pool.clone(),
-            collection_service(&config, pool.clone(), rpc_source.clone(), signer.clone())?,
+            collection_service(&config, pool.clone(), rpc_source.clone(), signer.clone()).await?,
             config.chain.chain_id,
             config.chain.token_address,
             config.chain.problem_funds_address,
@@ -406,7 +443,7 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
     if runtime_workers_enabled && workers.collection_collector {
         background_tasks.push(spawn_collection_collector_loop_with_metrics(
             CollectionCollectorWorker::new(
-                collection_service(&config, pool.clone(), rpc_source.clone(), signer.clone())?,
+                collection_service(&config, pool.clone(), rpc_source.clone(), signer.clone()).await?,
                 PgOutboundRepository::new(pool.clone()),
                 rpc_source.clone(),
                 collection_collector_config(&config),
@@ -443,13 +480,17 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
     })
 }
 
-fn runtime_seed_config(config: &AppConfig) -> RuntimeSeedConfig {
+fn runtime_seed_config(
+    config: &AppConfig,
+    relayer_address: Option<EvmAddress>,
+) -> RuntimeSeedConfig {
     RuntimeSeedConfig {
         signer_key_ref: config.signer.key_ref.clone(),
         chain_id: config.chain.chain_id,
         token_address: config.chain.token_address,
         treasury_address: config.chain.treasury_address,
         problem_funds_address: config.chain.problem_funds_address,
+        relayer_address,
         start_block: config.chain.start_block,
     }
 }
@@ -558,7 +599,88 @@ where
     )?)
 }
 
-fn collection_service<S>(
+async fn collection_strategy_config<S: SignerProvider>(
+    config: &AppConfig,
+    signer: &S,
+) -> Result<CollectionStrategyConfig, RuntimeError> {
+    if !config.collection.method.is_gasless() {
+        return Ok(CollectionStrategyConfig::Standard);
+    }
+
+    let key_ref = config
+        .collection
+        .relayer_key_ref
+        .as_deref()
+        .ok_or_else(|| {
+            RuntimeError::Config(crate::config::ConfigError::Missing {
+                key: "COLLECTION_RELAYER_KEY_REF",
+            })
+        })?;
+    let derivation_path = &config.collection.relayer_derivation_path;
+    let address = signer
+        .derive_address(key_ref, derivation_path)
+        .await
+        .map_err(|error| RuntimeError::Signer(Box::new(error)))?;
+
+    let relayer = RelayerConfig::new(key_ref, derivation_path, address);
+
+    match config.collection.method {
+        crate::domain::CollectionMethod::Standard => Ok(CollectionStrategyConfig::Standard),
+        crate::domain::CollectionMethod::Eip3009 => {
+            let token_name = config
+                .collection
+                .token_name
+                .clone()
+                .unwrap_or_else(|| "USD Coin".to_string());
+            let token_version = config
+                .collection
+                .token_version
+                .clone()
+                .unwrap_or_else(|| "2".to_string());
+            Ok(CollectionStrategyConfig::Eip3009 {
+                token_name,
+                token_version,
+                relayer,
+            })
+        }
+        crate::domain::CollectionMethod::PolygonMetaTx => {
+            let token_name = config
+                .collection
+                .token_name
+                .clone()
+                .unwrap_or_else(|| "(PoS) Tether USD".to_string());
+            let token_version = config
+                .collection
+                .token_version
+                .clone()
+                .unwrap_or_else(|| "1".to_string());
+            Ok(CollectionStrategyConfig::PolygonMetaTx {
+                token_name,
+                token_version,
+                relayer,
+            })
+        }
+        crate::domain::CollectionMethod::Eip2612 => {
+            let token_name = config
+                .collection
+                .token_name
+                .clone()
+                .unwrap_or_else(|| config.chain.token_symbol.clone());
+            let token_version = config
+                .collection
+                .token_version
+                .clone()
+                .unwrap_or_else(|| "1".to_string());
+            Ok(CollectionStrategyConfig::Eip2612 {
+                token_name,
+                token_version,
+                relayer,
+            })
+        }
+    }
+}
+
+async fn collection_service<S>(
     config: &AppConfig,
     pool: PgPool,
     rpc_source: RpcRangeSource,
@@ -567,8 +689,10 @@ fn collection_service<S>(
 where
     S: SignerProvider,
 {
+    let strategy = collection_strategy_config(config, &signer).await?;
+    let service_config = collection_service_config(config).with_strategy(strategy);
     Ok(CollectionService::new(
-        collection_service_config(config),
+        service_config,
         PgOrderRepository::new(pool.clone()),
         PgCollectionRepository::new(pool.clone()),
         PgOutboundRepository::new(pool.clone()),

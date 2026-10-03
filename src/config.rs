@@ -8,11 +8,12 @@ use std::{
     time::Duration,
 };
 
-use crate::domain::{EvmAddress, RawAmount};
+use crate::domain::{CollectionMethod, EvmAddress, RawAmount};
 
 const DEFAULT_COLLECTION_GAS_LIMIT: u64 = 80_000;
 const DEFAULT_COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 0;
 const DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 0;
+const DEFAULT_COLLECTION_RELAYER_DERIVATION_PATH: &str = "m/44'/60'/0'/0/0";
 const DEFAULT_COLLECTION_COLLECTOR_REPLACEMENT_STUCK_AFTER_SECS: u64 = 30 * 60;
 const DEFAULT_SIGNER_REMOTE_REQUEST_TIMEOUT_SECS: u64 = 15;
 const DEFAULT_TRANSFER_LOG_POLL_INTERVAL_MS: u64 = 5_000;
@@ -281,6 +282,11 @@ pub struct CollectionConfig {
     pub max_fee_per_gas_wei: RawAmount,
     /// Optional floor. Runtime collection signing estimates current fees from RPC.
     pub max_priority_fee_per_gas_wei: RawAmount,
+    pub method: CollectionMethod,
+    pub relayer_key_ref: Option<String>,
+    pub relayer_derivation_path: String,
+    pub token_name: Option<String>,
+    pub token_version: Option<String>,
 }
 
 impl Default for CollectionConfig {
@@ -291,6 +297,11 @@ impl Default for CollectionConfig {
             max_priority_fee_per_gas_wei: RawAmount::from(
                 DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI,
             ),
+            method: CollectionMethod::Standard,
+            relayer_key_ref: None,
+            relayer_derivation_path: DEFAULT_COLLECTION_RELAYER_DERIVATION_PATH.to_string(),
+            token_name: None,
+            token_version: None,
         }
     }
 }
@@ -568,6 +579,31 @@ impl AppConfig {
             },
             collection: {
                 let defaults = CollectionConfig::default();
+                let method = parse_optional_collection_method(
+                    &values,
+                    &["COLLECTION_METHOD"],
+                    defaults.method,
+                )?;
+                let relayer_key_ref = values
+                    .optional(&["COLLECTION_RELAYER_KEY_REF"])
+                    .map(str::to_string);
+                let relayer_derivation_path = values
+                    .optional(&["COLLECTION_RELAYER_DERIVATION_PATH"])
+                    .map(str::to_string)
+                    .unwrap_or(defaults.relayer_derivation_path);
+                let token_name = values
+                    .optional(&["COLLECTION_TOKEN_NAME"])
+                    .map(str::to_string);
+                let token_version = values
+                    .optional(&["COLLECTION_TOKEN_VERSION"])
+                    .map(str::to_string);
+
+                if method.is_gasless() && relayer_key_ref.is_none() {
+                    return Err(ConfigError::Missing {
+                        key: "COLLECTION_RELAYER_KEY_REF",
+                    });
+                }
+
                 CollectionConfig {
                     gas_limit: parse_optional_u64(
                         &values,
@@ -584,6 +620,11 @@ impl AppConfig {
                         &["COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI"],
                         defaults.max_priority_fee_per_gas_wei,
                     )?,
+                    method,
+                    relayer_key_ref,
+                    relayer_derivation_path,
+                    token_name,
+                    token_version,
                 }
             },
             collector: {
@@ -916,6 +957,17 @@ fn parse_optional_duration_secs(
         .parse::<u64>()
         .map_err(|_| ConfigError::invalid(keys[0], value, "expected unsigned integer seconds"))?;
     Ok(Duration::from_secs(secs))
+}
+
+fn parse_optional_collection_method(
+    values: &EnvPairs,
+    keys: &[&'static str],
+    default: CollectionMethod,
+) -> Result<CollectionMethod, ConfigError> {
+    let Some(value) = values.optional(keys) else {
+        return Ok(default);
+    };
+    CollectionMethod::parse(value).map_err(|err| ConfigError::invalid(keys[0], value, err))
 }
 
 fn parse_required_address(

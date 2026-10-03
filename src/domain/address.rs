@@ -200,7 +200,7 @@ where
     value.parse().map_err(de::Error::custom)
 }
 
-fn decode_prefixed_fixed<const N: usize>(
+pub fn decode_prefixed_fixed<const N: usize>(
     input: &str,
     kind: &'static str,
 ) -> Result<[u8; N], HexParseError> {
@@ -242,7 +242,7 @@ fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn encode_lower_prefixed(bytes: &[u8]) -> String {
+pub fn encode_lower_prefixed(bytes: &[u8]) -> String {
     const TABLE: &[u8; 16] = b"0123456789abcdef";
 
     let mut output = String::with_capacity(2 + bytes.len() * 2);
