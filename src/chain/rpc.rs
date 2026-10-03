@@ -1280,6 +1280,11 @@ fn parse_topic_address(value: &str, field: &'static str) -> Result<EvmAddress, C
             "{field} must contain 64 hex chars"
         )));
     }
+    if !hex[..24].chars().all(|c| c == '0') {
+        return Err(ChainError::malformed_rpc_response(format!(
+            "{field} contains non-zero padding in high 12 bytes"
+        )));
+    }
     parse_address(&format!("0x{}", &hex[24..]), field)
 }
 
@@ -1997,5 +2002,15 @@ mod tests {
 
     fn block_hash(byte: u8) -> BlockHash {
         BlockHash::from_bytes([byte; 32])
+    }
+
+    #[test]
+    fn parse_topic_address_validates_zero_padding() {
+        let valid_topic = "0x0000000000000000000000001111111111111111111111111111111111111111";
+        assert!(parse_topic_address(valid_topic, "test").is_ok());
+
+        let malformed_padding = "0x0000000000000000000000011111111111111111111111111111111111111111";
+        let err = parse_topic_address(malformed_padding, "test").unwrap_err();
+        assert!(err.to_string().contains("contains non-zero padding"));
     }
 }

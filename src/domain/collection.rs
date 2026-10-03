@@ -113,6 +113,18 @@ impl CollectionTxPlan {
                 replacement: replacement.purpose,
             });
         }
+        if replacement.fees.max_fee_per_gas <= self.fees.max_fee_per_gas {
+            return Err(CollectionReplacementError::MaxFeeNotBumped {
+                existing: self.fees.max_fee_per_gas,
+                replacement: replacement.fees.max_fee_per_gas,
+            });
+        }
+        if replacement.fees.max_priority_fee_per_gas <= self.fees.max_priority_fee_per_gas {
+            return Err(CollectionReplacementError::PriorityFeeNotBumped {
+                existing: self.fees.max_priority_fee_per_gas,
+                replacement: replacement.fees.max_priority_fee_per_gas,
+            });
+        }
         Ok(())
     }
 }
@@ -142,6 +154,16 @@ pub enum CollectionReplacementError {
     PurposeChanged {
         existing: CollectionPurpose,
         replacement: CollectionPurpose,
+    },
+    #[error("collection replacement max fee per gas must exceed previous fee ({existing} -> {replacement})")]
+    MaxFeeNotBumped {
+        existing: RawAmount,
+        replacement: RawAmount,
+    },
+    #[error("collection replacement max priority fee per gas must exceed previous fee ({existing} -> {replacement})")]
+    PriorityFeeNotBumped {
+        existing: RawAmount,
+        replacement: RawAmount,
     },
 }
 

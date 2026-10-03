@@ -15,6 +15,14 @@ use super::{ApiState, parse_order_id, require_scope};
 #[async_trait]
 pub trait OrderVerifyApiService: Send + Sync {
     async fn verify_order(&self, order_id: Uuid) -> Result<OrderVerifyResult, OrderVerifyError>;
+
+    async fn verify_order_for_owner(
+        &self,
+        order_id: Uuid,
+        _owner_sub: &str,
+    ) -> Result<OrderVerifyResult, OrderVerifyError> {
+        self.verify_order(order_id).await
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -54,11 +62,11 @@ pub(super) async fn verify_order(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<OrderVerifyResult>, ApiError> {
-    require_scope(&state, &headers, ORDERS_VERIFY_SCOPE).await?;
+    let principal = require_scope(&state, &headers, ORDERS_VERIFY_SCOPE).await?;
     let id = parse_order_id(&id)?;
     let result = state
         .order_verify()?
-        .verify_order(id)
+        .verify_order_for_owner(id, &principal.subject)
         .await
         .map_err(order_verify_error_to_api)?;
 

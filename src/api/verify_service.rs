@@ -46,6 +46,29 @@ where
             complete_to_block: result.complete_to_block,
         })
     }
+
+    async fn verify_order_for_owner(
+        &self,
+        order_id: uuid::Uuid,
+        owner_sub: &str,
+    ) -> Result<OrderVerifyResult, OrderVerifyError> {
+        let result = ManualOrderVerifyService::verify_order_for_owner(self, order_id, owner_sub)
+            .await
+            .map_err(order_verify_error)?;
+
+        Ok(OrderVerifyResult {
+            order_id: result.order_id,
+            status: match result.status {
+                ManualVerifyStatus::Confirmed => OrderVerifyStatus::Confirmed,
+                ManualVerifyStatus::Confirming => OrderVerifyStatus::Confirming,
+                ManualVerifyStatus::NoCoverage => OrderVerifyStatus::NoCoverage,
+            },
+            matched_payments: result.matched_payments,
+            paid_amount_raw: result.paid_amount_raw,
+            confirmations: result.confirmations,
+            complete_to_block: result.complete_to_block,
+        })
+    }
 }
 
 fn order_verify_error(error: ManualVerifyError) -> OrderVerifyError {

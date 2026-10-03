@@ -147,9 +147,6 @@ pub enum PaymentScannerError {
     #[error("lease timestamp overflow")]
     LeaseTimestampOverflow,
 
-    #[error("KV reorg epoch {epoch} has no last_reorg_from")]
-    MissingKvReorgBlock { epoch: u64 },
-
     #[error(
         "canonical block hash mismatch for payment block {block_number}: stored {stored_hash}, canonical {canonical_hash}"
     )]
@@ -157,15 +154,6 @@ pub enum PaymentScannerError {
         block_number: u64,
         stored_hash: BlockHash,
         canonical_hash: BlockHash,
-    },
-
-    #[error(
-        "KV reorg epoch regressed for {stream:?}: repository has {seen_epoch}, KVDB has {kv_epoch}"
-    )]
-    KvReorgEpochRegression {
-        stream: StreamId,
-        seen_epoch: u64,
-        kv_epoch: u64,
     },
 
     #[error(transparent)]

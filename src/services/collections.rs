@@ -674,6 +674,9 @@ where
                     from_address: job.collection.from_address,
                     to_address: job.collection.to_address,
                     nonce: reserved_nonce.nonce,
+                    gas_limit: fees.gas_limit,
+                    max_fee_per_gas: fees.max_fee_per_gas,
+                    max_priority_fee_per_gas: fees.max_priority_fee_per_gas,
                     tx_hash: signed.tx_hash,
                     signed_tx: signed.raw_tx.clone(),
                     replacement_of: None,
@@ -785,8 +788,20 @@ where
                     collection_id: collection.id,
                 })?;
         let nonce = raw_amount_to_u64(job.outbound.nonce)?;
-        let fees = self.current_collection_fees().await?;
-        let bumped_fees = bump_collection_fees(fees)?;
+        let previous_fees = CollectionFees::new(
+            job.outbound.gas_limit,
+            job.outbound.max_fee_per_gas,
+            job.outbound.max_priority_fee_per_gas,
+        );
+        let current_fees = self.current_collection_fees().await?;
+        let bumped_from_prev = bump_collection_fees(previous_fees)?;
+        let replacement_fees = CollectionFees::new(
+            current_fees.gas_limit.max(bumped_from_prev.gas_limit),
+            current_fees.max_fee_per_gas.max(bumped_from_prev.max_fee_per_gas),
+            current_fees
+                .max_priority_fee_per_gas
+                .max(bumped_from_prev.max_priority_fee_per_gas),
+        );
         let original_plan = CollectionTxPlan::new(
             collection.chain_id,
             nonce,
@@ -794,10 +809,10 @@ where
             collection.to_address,
             amount,
             CollectionPurpose::TreasurySweep,
-            fees,
+            previous_fees,
         );
         let replacement_plan = CollectionTxPlan {
-            fees: bumped_fees,
+            fees: replacement_fees,
             ..original_plan
         };
         original_plan
@@ -809,9 +824,9 @@ where
             .ensure_prefunded_gas(PrefundedGasCheck {
                 chain_id: collection.chain_id,
                 from_address: collection.from_address,
-                gas_limit: bumped_fees.gas_limit,
-                max_fee_per_gas: bumped_fees.max_fee_per_gas,
-                max_priority_fee_per_gas: bumped_fees.max_priority_fee_per_gas,
+                gas_limit: replacement_fees.gas_limit,
+                max_fee_per_gas: replacement_fees.max_fee_per_gas,
+                max_priority_fee_per_gas: replacement_fees.max_priority_fee_per_gas,
             })
             .await?;
         self.signer.health_check().await?;
@@ -825,9 +840,9 @@ where
             nonce,
             collection.token_address,
             RawAmount::ZERO,
-            bumped_fees.gas_limit,
-            bumped_fees.max_fee_per_gas,
-            bumped_fees.max_priority_fee_per_gas,
+            replacement_fees.gas_limit,
+            replacement_fees.max_fee_per_gas,
+            replacement_fees.max_priority_fee_per_gas,
             erc20_transfer_data(collection.to_address, amount),
         )?;
         let signed = self
@@ -851,6 +866,9 @@ where
                     from_address: collection.from_address,
                     to_address: collection.to_address,
                     nonce: job.outbound.nonce,
+                    gas_limit: replacement_fees.gas_limit,
+                    max_fee_per_gas: replacement_fees.max_fee_per_gas,
+                    max_priority_fee_per_gas: replacement_fees.max_priority_fee_per_gas,
                     tx_hash: signed.tx_hash,
                     signed_tx: signed.raw_tx.clone(),
                     replacement_of: Some(job.outbound.id),
@@ -1370,6 +1388,9 @@ mod tests {
             from_address: child_address(),
             to_address: treasury(),
             nonce: RawAmount::from(7),
+            gas_limit: 65_000,
+            max_fee_per_gas: RawAmount::from(30_000_000_000),
+            max_priority_fee_per_gas: RawAmount::from(1_500_000_000),
             tx_hash: tx_hash(0xab),
             signed_tx: b"old-signed".to_vec(),
             replacement_of: None,
@@ -1445,6 +1466,76 @@ mod tests {
         assert_eq!(
             service.audit.event_types(),
             vec!["collection.replaced".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_collection_job_bumps_fees_even_when_network_fees_drop() {
+        let service = service(Fixture::default());
+        let old_tx = NewSignedOutboundTx {
+            id: Uuid::from_u128(200),
+            chain_id: 1,
+            purpose: OutboundTxPurpose::Collect,
+            from_address: child_address(),
+            to_address: treasury(),
+            nonce: RawAmount::from(7),
+            gas_limit: 65_000,
+            max_fee_per_gas: RawAmount::from(100_000_000_000),
+            max_priority_fee_per_gas: RawAmount::from(10_000_000_000),
+            tx_hash: tx_hash(0xab),
+            signed_tx: b"old-signed".to_vec(),
+            replacement_of: None,
+            replacement_reason: None,
+        };
+        let mut collection_job = collection_job(Some(RawAmount::from(1_000)));
+        collection_job.collection.status = CollectionRecordStatus::Confirming;
+        collection_job.collection.outbound_tx_id = Some(old_tx.id);
+        collection_job.collection.attempt_count = 2;
+        collection_job.collection.amount_raw = Some(RawAmount::from(1_000));
+        {
+            let mut state = service
+                .collections
+                .state
+                .lock()
+                .expect("fake collection repo mutex poisoned");
+            state
+                .jobs_by_collection_id
+                .insert(collection_job.collection.id, collection_job.clone());
+        }
+        let mut old_outbound = outbound_record(old_tx);
+        old_outbound.status = OutboundTxStatus::Broadcast;
+        old_outbound.last_broadcast_at = Some(now() - time::Duration::hours(2));
+
+        let outcome = service
+            .replace_collection_job(
+                "collector-1",
+                ReceiptCheckableOutboundTx {
+                    collection_id: collection_job.collection.id,
+                    outbound: old_outbound.clone(),
+                },
+                "receipt missing beyond replacement threshold",
+            )
+            .await
+            .unwrap();
+
+        let PrepareCollectionJobOutcome::Prepared { outbound, .. } = outcome else {
+            panic!("expected replacement to produce a prepared job");
+        };
+
+        let signed_requests = service.signer.signed_requests();
+        assert_eq!(signed_requests.len(), 1);
+        assert_eq!(
+            signed_requests[0].max_fee_per_gas,
+            RawAmount::from(110_000_000_000)
+        );
+        assert_eq!(
+            signed_requests[0].max_priority_fee_per_gas,
+            RawAmount::from(11_000_000_000)
+        );
+        assert_eq!(outbound.max_fee_per_gas, RawAmount::from(110_000_000_000));
+        assert_eq!(
+            outbound.max_priority_fee_per_gas,
+            RawAmount::from(11_000_000_000)
         );
     }
 
@@ -2293,6 +2384,9 @@ mod tests {
             from_address: tx.from_address,
             to_address: tx.to_address,
             nonce: tx.nonce,
+            gas_limit: tx.gas_limit,
+            max_fee_per_gas: tx.max_fee_per_gas,
+            max_priority_fee_per_gas: tx.max_priority_fee_per_gas,
             tx_hash: tx.tx_hash,
             signed_tx: tx.signed_tx,
             status: OutboundTxStatus::Signed,

@@ -56,13 +56,29 @@ where
         &self,
         order_id: Uuid,
     ) -> Result<ManualVerifyResult, ManualVerifyError> {
+        self.verify_order_internal(order_id, None).await
+    }
+
+    pub async fn verify_order_for_owner(
+        &self,
+        order_id: Uuid,
+        owner_sub: &str,
+    ) -> Result<ManualVerifyResult, ManualVerifyError> {
+        self.verify_order_internal(order_id, Some(owner_sub)).await
+    }
+
+    async fn verify_order_internal(
+        &self,
+        order_id: Uuid,
+        owner_sub: Option<&str>,
+    ) -> Result<ManualVerifyResult, ManualVerifyError> {
         self.config.validate()?;
 
-        let view = self
-            .orders
-            .get_order_view(order_id)
-            .await?
-            .ok_or(ManualVerifyError::OrderNotFound { order_id })?;
+        let view = match owner_sub {
+            Some(sub) => self.orders.get_order_view_for_owner(order_id, sub).await?,
+            None => self.orders.get_order_view(order_id).await?,
+        }
+        .ok_or(ManualVerifyError::OrderNotFound { order_id })?;
         let stream = StreamId::new(view.order.chain_id, view.order.token_address);
         let from_block = view.payment_window.window_from_block.number;
         let head = self.head_reader.latest_head().await?;

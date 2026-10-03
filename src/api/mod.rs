@@ -390,10 +390,6 @@ pub fn router(config: AppConfig) -> Router {
             "runtime services were not bootstrapped; use runtime::build_api_runtime",
         ),
         DependencyCheck::failed(
-            DependencyName::Kvdb,
-            "runtime services were not bootstrapped; use runtime::build_api_runtime",
-        ),
-        DependencyCheck::failed(
             DependencyName::Signer,
             "runtime services were not bootstrapped; use runtime::build_api_runtime",
         ),

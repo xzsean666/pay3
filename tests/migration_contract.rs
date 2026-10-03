@@ -11,6 +11,8 @@ const COLLECTION_OWNER_SUB: &str =
     include_str!("../src/db/migrations/20260507000300_collection_owner_sub.sql");
 const ORDER_PAYMENT_OVERRIDES: &str =
     include_str!("../src/db/migrations/20260622000100_order_payment_overrides.sql");
+const OUTBOUND_GAS_FEES: &str =
+    include_str!("../src/db/migrations/20261003000100_outbound_gas_fees.sql");
 
 #[test]
 fn migrator_embeds_initial_schema() {
@@ -25,7 +27,8 @@ fn migrator_embeds_initial_schema() {
             20260507000100,
             20260507000200,
             20260507000300,
-            20260622000100
+            20260622000100,
+            20261003000100
         ]
     );
 }
@@ -149,6 +152,25 @@ fn order_payment_override_migration_records_manual_problem_payment_acceptance() 
     ] {
         assert!(
             ORDER_PAYMENT_OVERRIDES.contains(fragment),
+            "missing {fragment}"
+        );
+    }
+}
+
+#[test]
+fn outbound_gas_fees_migration_adds_eip1559_fee_fields_and_constraints() {
+    for fragment in [
+        "ALTER TABLE outbound_transactions",
+        "ADD COLUMN gas_limit bigint NOT NULL DEFAULT 80000",
+        "ADD COLUMN max_fee_per_gas numeric(78, 0) NOT NULL DEFAULT 0",
+        "ADD COLUMN max_priority_fee_per_gas numeric(78, 0) NOT NULL DEFAULT 0",
+        "ADD CONSTRAINT outbound_gas_limit_positive CHECK (gas_limit > 0)",
+        "ADD CONSTRAINT outbound_max_fee_per_gas_non_negative CHECK (max_fee_per_gas >= 0)",
+        "ADD CONSTRAINT outbound_max_priority_fee_per_gas_non_negative CHECK (max_priority_fee_per_gas >= 0)",
+        "ADD CONSTRAINT outbound_priority_fee_le_max_fee CHECK (max_priority_fee_per_gas <= max_fee_per_gas)",
+    ] {
+        assert!(
+            OUTBOUND_GAS_FEES.contains(fragment),
             "missing {fragment}"
         );
     }

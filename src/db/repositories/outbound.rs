@@ -26,6 +26,9 @@ const OUTBOUND_COLUMNS: &str = r#"
     from_address,
     to_address,
     nonce,
+    gas_limit,
+    max_fee_per_gas,
+    max_priority_fee_per_gas,
     tx_hash,
     signed_tx,
     status,
@@ -595,13 +598,16 @@ async fn insert_signed_tx_row(
             from_address,
             to_address,
             nonce,
+            gas_limit,
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
             tx_hash,
             signed_tx,
             status,
             replacement_of,
             replacement_reason
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'signed', $9, $10)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'signed', $12, $13)
         RETURNING {OUTBOUND_COLUMNS}
         "#
     );
@@ -613,6 +619,9 @@ async fn insert_signed_tx_row(
         .bind(outbound.from_address.to_lower_hex())
         .bind(outbound.to_address.to_lower_hex())
         .bind(raw_amount_to_decimal(outbound.nonce)?)
+        .bind(u64_to_i64(outbound.gas_limit, "outbound.gas_limit")?)
+        .bind(raw_amount_to_decimal(outbound.max_fee_per_gas)?)
+        .bind(raw_amount_to_decimal(outbound.max_priority_fee_per_gas)?)
         .bind(outbound.tx_hash.to_lower_hex())
         .bind(&outbound.signed_tx)
         .bind(replacement_of.or(outbound.replacement_of))
@@ -722,6 +731,15 @@ fn outbound_record_from_row(row: &PgRow) -> Result<OutboundTxRecord, RepositoryE
         from_address: parse_address(row.try_get::<String, _>("from_address")?, "from_address")?,
         to_address: parse_address(row.try_get::<String, _>("to_address")?, "to_address")?,
         nonce: decimal_to_raw_amount(row.try_get("nonce")?, "outbound_transactions.nonce")?,
+        gas_limit: i64_to_u64(row.try_get("gas_limit")?, "outbound_transactions.gas_limit")?,
+        max_fee_per_gas: decimal_to_raw_amount(
+            row.try_get("max_fee_per_gas")?,
+            "outbound_transactions.max_fee_per_gas",
+        )?,
+        max_priority_fee_per_gas: decimal_to_raw_amount(
+            row.try_get("max_priority_fee_per_gas")?,
+            "outbound_transactions.max_priority_fee_per_gas",
+        )?,
         tx_hash: parse_hash(row.try_get::<String, _>("tx_hash")?, "tx_hash")?,
         signed_tx: row.try_get("signed_tx")?,
         status: OutboundTxStatus::try_from(status.as_str())?,

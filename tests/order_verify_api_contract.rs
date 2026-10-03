@@ -145,7 +145,7 @@ async fn verify_maps_coverage_failure_to_503() {
 #[tokio::test]
 async fn verify_maps_dependency_unavailable_to_503() {
     let service = Arc::new(FakeVerifyService::err(
-        OrderVerifyError::DependencyUnavailable("kvdb unavailable".to_string()),
+        OrderVerifyError::DependencyUnavailable("database unavailable".to_string()),
     ));
 
     let response = request_verify(
@@ -250,6 +250,7 @@ fn success_result() -> OrderVerifyResult {
 struct FakeVerifyService {
     result: Mutex<Option<Result<OrderVerifyResult, OrderVerifyError>>>,
     calls: Mutex<Vec<Uuid>>,
+    owner_calls: Mutex<Vec<(Uuid, String)>>,
 }
 
 impl FakeVerifyService {
@@ -257,6 +258,7 @@ impl FakeVerifyService {
         Self {
             result: Mutex::new(Some(Ok(result))),
             calls: Mutex::new(Vec::new()),
+            owner_calls: Mutex::new(Vec::new()),
         }
     }
 
@@ -264,11 +266,16 @@ impl FakeVerifyService {
         Self {
             result: Mutex::new(Some(Err(error))),
             calls: Mutex::new(Vec::new()),
+            owner_calls: Mutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> Vec<Uuid> {
         self.calls.lock().unwrap().clone()
+    }
+
+    fn owner_calls(&self) -> Vec<(Uuid, String)> {
+        self.owner_calls.lock().unwrap().clone()
     }
 }
 
@@ -282,4 +289,34 @@ impl OrderVerifyApiService for FakeVerifyService {
             .take()
             .expect("fake verify result must be configured")
     }
+
+    async fn verify_order_for_owner(
+        &self,
+        order_id: Uuid,
+        owner_sub: &str,
+    ) -> Result<OrderVerifyResult, OrderVerifyError> {
+        self.owner_calls
+            .lock()
+            .unwrap()
+            .push((order_id, owner_sub.to_string()));
+        self.verify_order(order_id).await
+    }
+}
+
+#[tokio::test]
+async fn verify_passes_authenticated_principal_subject_as_owner() {
+    let service = Arc::new(FakeVerifyService::ok(success_result()));
+
+    let response = request_verify(
+        service.clone(),
+        valid_order_path(),
+        Some(token(ORDERS_VERIFY_SCOPE)),
+    )
+    .await;
+
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(
+        service.owner_calls(),
+        vec![(order_id(), "merchant-1".to_string())]
+    );
 }
