@@ -8,18 +8,18 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--verify-readiness" || arg == "--check-config") {
-        let config = AppConfig::from_env()?;
+        let config = AppConfig::from_yaml_or_env()?;
         config.validate_profile()?;
         println!(
-            "Configuration pre-flight validation SUCCESS: profile={:?}, role={:?}, chain_id={}, token={}",
-            config.profile, config.runtime.role, config.chain.chain_id, config.chain.token_address
+            "Configuration pre-flight validation SUCCESS: profile={:?}, role={:?}, tokens={}, chain_id={}, token={}",
+            config.profile, config.runtime.role, config.tokens.len(), config.chain.chain_id, config.chain.token_address
         );
         return Ok(());
     }
 
     init_tracing();
 
-    let config = AppConfig::from_env()?;
+    let config = AppConfig::from_yaml_or_env()?;
     config.validate_profile()?;
 
     let runtime = runtime::build_api_runtime(config.clone()).await?;

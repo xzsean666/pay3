@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::domain::{CollectionMethod, EvmAddress, RawAmount};
 
 const DEFAULT_COLLECTION_GAS_LIMIT: u64 = 80_000;
@@ -30,6 +32,14 @@ const LOCAL_SIGNER_SECRET_KEYS: &[&str] = &[
     "LOCAL_SIGNER_PRIVATE_KEY",
     "DEPLOYER_PRIVATE_KEY",
 ];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenInstanceConfig {
+    pub chain: ChainConfig,
+    pub collection: CollectionConfig,
+    pub transfer_log: TransferLogConfig,
+    pub collector: CollectorConfig,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AppProfile {
@@ -72,6 +82,7 @@ pub struct AppConfig {
     pub collection: CollectionConfig,
     pub collector: CollectorConfig,
     pub signer: SignerConfig,
+    pub tokens: Vec<TokenInstanceConfig>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -242,7 +253,7 @@ fn is_https_url(value: &str) -> bool {
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChainConfig {
     pub chain_id: u64,
     pub token_address: EvmAddress,
@@ -400,6 +411,12 @@ pub enum ConfigError {
     Validation {
         errors: Vec<String>,
     },
+    Yaml {
+        error: String,
+    },
+    Io {
+        error: String,
+    },
 }
 
 impl ConfigError {
@@ -422,13 +439,326 @@ impl fmt::Display for ConfigError {
             Self::Validation { errors } => {
                 write!(f, "invalid profile config: {}", errors.join("; "))
             }
+            Self::Yaml { error } => write!(f, "failed to parse YAML configuration: {error}"),
+            Self::Io { error } => write!(f, "failed to read configuration file: {error}"),
         }
     }
 }
 
 impl Error for ConfigError {}
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MultiTokenConfigFile {
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub server: Option<ServerYamlConfig>,
+    pub database: DatabaseYamlConfig,
+    pub signer: SignerYamlConfig,
+    #[serde(default)]
+    pub auth: Option<AuthYamlConfig>,
+    pub tokens: Vec<TokenYamlConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct ServerYamlConfig {
+    #[serde(default)]
+    pub bind_addr: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DatabaseYamlConfig {
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SignerYamlConfig {
+    pub mode: String,
+    #[serde(default)]
+    pub key_ref: Option<String>,
+    #[serde(default)]
+    pub mnemonic: Option<String>,
+    #[serde(default)]
+    pub allow_local_signer: Option<bool>,
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    #[serde(default)]
+    pub bearer_token: Option<String>,
+    #[serde(default)]
+    pub allow_insecure_remote_signer: Option<bool>,
+    #[serde(default)]
+    pub relayer_base_derivation_path: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct AuthYamlConfig {
+    #[serde(default)]
+    pub jwks_url: Option<String>,
+    #[serde(default)]
+    pub secret: Option<String>,
+    #[serde(default)]
+    pub issuer: Option<String>,
+    #[serde(default)]
+    pub audience: Option<String>,
+    #[serde(default)]
+    pub key_id: Option<String>,
+    #[serde(default)]
+    pub public_key_pem: Option<String>,
+    #[serde(default)]
+    pub algorithm: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct TokenYamlConfig {
+    pub chain_id: u64,
+    pub token_address: String,
+    #[serde(default, alias = "token_symbol")]
+    pub symbol: Option<String>,
+    #[serde(default, alias = "token_decimals")]
+    pub decimals: Option<u8>,
+    pub treasury_address: String,
+    #[serde(default)]
+    pub problem_funds_address: Option<String>,
+    #[serde(default)]
+    pub start_block: Option<u64>,
+    #[serde(default)]
+    pub min_confirmations: Option<u64>,
+    #[serde(alias = "rpc_http_urls")]
+    pub rpc_urls: Vec<String>,
+    #[serde(default)]
+    pub collection_method: Option<String>,
+    #[serde(default)]
+    pub relayer_key_ref: Option<String>,
+    #[serde(default)]
+    pub relayer_derivation_path: Option<String>,
+    #[serde(default)]
+    pub token_name: Option<String>,
+    #[serde(default)]
+    pub token_version: Option<String>,
+}
+
 impl AppConfig {
+    pub fn from_yaml_or_env() -> Result<Self, ConfigError> {
+        if let Ok(path) = env::var("PAY3_CONFIG_FILE").or_else(|_| env::var("PAY3_CONFIG_PATH")) {
+            return Self::from_yaml_file(path);
+        }
+        if std::path::Path::new("pay3.yaml").exists() {
+            return Self::from_yaml_file("pay3.yaml");
+        }
+        if std::path::Path::new("pay3.yml").exists() {
+            return Self::from_yaml_file("pay3.yml");
+        }
+        Self::from_env()
+    }
+
+    pub fn from_yaml_file(path: impl AsRef<std::path::Path>) -> Result<Self, ConfigError> {
+        let content = std::fs::read_to_string(path.as_ref()).map_err(|err| ConfigError::Io {
+            error: format!("{}: {}", path.as_ref().display(), err),
+        })?;
+        Self::from_yaml_str(&content)
+    }
+
+    pub fn from_yaml_str(yaml: &str) -> Result<Self, ConfigError> {
+        let parsed: MultiTokenConfigFile =
+            serde_yaml::from_str(yaml).map_err(|err| ConfigError::Yaml {
+                error: err.to_string(),
+            })?;
+
+        let profile = match parsed.server.as_ref().and_then(|s| s.profile.as_deref()) {
+            Some(p) => AppProfile::parse(p)?,
+            None => AppProfile::Development,
+        };
+
+        let role = match parsed.server.as_ref().and_then(|s| s.role.as_deref()) {
+            Some(r) => RuntimeRole::parse(r)?,
+            None => RuntimeRole::All,
+        };
+        let runtime = RuntimeConfig {
+            role,
+            workers: WorkerEnableConfig {
+                transfer_log_ingestor: true,
+                transfer_log_retention: true,
+                runtime_readiness: true,
+                order_expiry: true,
+                payment_scanner: true,
+                collection_enqueuer: true,
+                collection_collector: true,
+            },
+        };
+
+        let bind_str = parsed
+            .server
+            .as_ref()
+            .and_then(|s| s.bind_addr.as_deref())
+            .unwrap_or("0.0.0.0:8080");
+        let bind_addr = bind_str
+            .parse::<SocketAddr>()
+            .map_err(|e| ConfigError::invalid("server.bind_addr", bind_str, e.to_string()))?;
+        let http = HttpConfig { bind_addr };
+
+        let database = DatabaseConfig {
+            url: parsed.database.url,
+        };
+
+        let kvdb = KvdbConfig {
+            path: PathBuf::from(""),
+            manual_rebuild_floor_block: None,
+        };
+
+        let auth_yaml = parsed.auth.unwrap_or_default();
+        let issuer = auth_yaml.issuer.unwrap_or_else(|| "pay3-issuer".to_string());
+        let audience = auth_yaml.audience.unwrap_or_else(|| "pay3-api".to_string());
+        let key_id = auth_yaml.key_id;
+        let jwks_url = auth_yaml.jwks_url;
+        let legacy_secret_present = auth_yaml.secret.is_some();
+        let key_source = if let Some(url) = &jwks_url {
+            JwtKeySource::RemoteJwks { url: url.clone() }
+        } else if let Some(pem) = auth_yaml.public_key_pem {
+            let algo = match auth_yaml.algorithm.as_deref() {
+                Some(a) => JwtAlgorithm::parse(a)?,
+                None => JwtAlgorithm::Rs256,
+            };
+            JwtKeySource::PublicKeyPem {
+                algorithm: algo,
+                key_id: key_id.clone().unwrap_or_else(|| "default".to_string()),
+                public_key_pem: pem,
+            }
+        } else if let Some(sec) = auth_yaml.secret {
+            JwtKeySource::Hs256 {
+                secret: sec,
+                key_id: key_id.clone(),
+            }
+        } else {
+            JwtKeySource::Hs256 {
+                secret: "development-secret-with-sufficient-entropy-for-testing".to_string(),
+                key_id: None,
+            }
+        };
+        let jwt = JwtConfig {
+            issuer,
+            audience,
+            key_id,
+            key_source,
+            legacy_secret_present,
+            jwks_url,
+        };
+
+        let signer_mode = SignerMode::parse(&parsed.signer.mode)?;
+        let signer_key_ref = parsed
+            .signer
+            .key_ref
+            .unwrap_or_else(|| "default".to_string());
+        let relayer_base_path = parsed
+            .signer
+            .relayer_base_derivation_path
+            .unwrap_or_else(|| "m/44'/60'/99'/0".to_string());
+        let signer = SignerConfig {
+            mode: signer_mode,
+            key_ref: signer_key_ref.clone(),
+            mnemonic: parsed.signer.mnemonic,
+            allow_local_signer: parsed.signer.allow_local_signer.unwrap_or(false),
+            secret_material_present: false,
+            remote_endpoint: parsed.signer.endpoint,
+            remote_request_timeout: Duration::from_secs(
+                DEFAULT_SIGNER_REMOTE_REQUEST_TIMEOUT_SECS,
+            ),
+            remote_bearer_token: parsed.signer.bearer_token,
+            allow_insecure_remote_signer: parsed
+                .signer
+                .allow_insecure_remote_signer
+                .unwrap_or(false),
+        };
+
+        if parsed.tokens.is_empty() {
+            return Err(ConfigError::Validation {
+                errors: vec!["at least one token must be configured in tokens list".to_string()],
+            });
+        }
+
+        let mut tokens = Vec::with_capacity(parsed.tokens.len());
+        for (idx, t) in parsed.tokens.into_iter().enumerate() {
+            let token_address = EvmAddress::parse_hex(&t.token_address).map_err(|e| {
+                ConfigError::invalid("token_address", &t.token_address, e.to_string())
+            })?;
+            let treasury_address = EvmAddress::parse_hex(&t.treasury_address).map_err(|e| {
+                ConfigError::invalid("treasury_address", &t.treasury_address, e.to_string())
+            })?;
+            let problem_funds_address = match t.problem_funds_address {
+                Some(p) => EvmAddress::parse_hex(&p).map_err(|e| {
+                    ConfigError::invalid("problem_funds_address", &p, e.to_string())
+                })?,
+                None => treasury_address,
+            };
+            let method = match t.collection_method {
+                Some(m) => CollectionMethod::parse(&m)
+                    .map_err(|e| ConfigError::invalid("collection_method", &m, e))?,
+                None => CollectionMethod::Auto,
+            };
+            let relayer_key_ref = t.relayer_key_ref.or_else(|| Some(signer_key_ref.clone()));
+            let relayer_derivation_path = t
+                .relayer_derivation_path
+                .unwrap_or_else(|| format!("{relayer_base_path}/{idx}"));
+
+            let chain = ChainConfig {
+                chain_id: t.chain_id,
+                token_address,
+                token_decimals: t.decimals.unwrap_or(18),
+                token_symbol: t.symbol.unwrap_or_else(|| "TOKEN".to_string()),
+                treasury_address,
+                problem_funds_address,
+                rpc_http_urls: t.rpc_urls,
+                start_block: t.start_block.unwrap_or(1),
+                min_confirmations: t.min_confirmations.unwrap_or(12),
+                allow_full_history_replay: false,
+            };
+            let collection = CollectionConfig {
+                gas_limit: DEFAULT_COLLECTION_GAS_LIMIT,
+                max_fee_per_gas_wei: RawAmount::from(DEFAULT_COLLECTION_MAX_FEE_PER_GAS_WEI),
+                max_priority_fee_per_gas_wei: RawAmount::from(
+                    DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI,
+                ),
+                method,
+                relayer_key_ref,
+                relayer_derivation_path,
+                token_name: t.token_name,
+                token_version: t.token_version,
+            };
+            let transfer_log = TransferLogConfig::default();
+            let collector = CollectorConfig::default();
+            tokens.push(TokenInstanceConfig {
+                chain,
+                collection,
+                transfer_log,
+                collector,
+            });
+        }
+
+        let first = &tokens[0];
+        let chain = first.chain.clone();
+        let collection = first.collection.clone();
+        let transfer_log = first.transfer_log.clone();
+        let collector = first.collector.clone();
+
+        Ok(AppConfig {
+            profile,
+            runtime,
+            http,
+            database,
+            kvdb,
+            jwt,
+            chain,
+            transfer_log,
+            collection,
+            collector,
+            signer,
+            tokens,
+        })
+    }
+
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_pairs(env::vars())
     }
@@ -459,7 +789,7 @@ impl AppConfig {
                 )
             })?;
 
-        Ok(Self {
+        let mut config = Self {
             profile,
             runtime: RuntimeConfig {
                 role: RuntimeRole::parse(
@@ -533,24 +863,26 @@ impl AppConfig {
                 legacy_secret_present: values.optional(&["JWT_SECRET"]).is_some(),
                 jwks_url: values.optional_owned(&["JWT_JWKS_URL"]),
             },
-            chain: ChainConfig {
-                chain_id: parse_required_u64(&values, &["CHAIN_ID"])?,
-                token_address: parse_required_address(&values, &["TOKEN_ADDRESS"])?,
-                token_decimals: parse_required_u8(&values, &["TOKEN_DECIMALS"])?,
-                token_symbol: values
-                    .optional(&["TOKEN_SYMBOL"])
-                    .unwrap_or("TOKEN")
-                    .to_string(),
-                treasury_address: parse_required_address(&values, &["TREASURY_ADDRESS"])?,
-                problem_funds_address: parse_required_address(&values, &["PROBLEM_FUNDS_ADDRESS"])?,
-                rpc_http_urls: parse_required_list(&values, &["RPC_HTTP_URLS", "RPC_URLS"])?,
-                start_block: parse_required_u64(&values, &["START_BLOCK", "SCAN_FROM_BLOCK"])?,
-                min_confirmations: parse_required_u64(&values, &["MIN_CONFIRMATIONS"])?,
-                allow_full_history_replay: parse_optional_bool(
-                    &values,
-                    &["ALLOW_FULL_HISTORY_REPLAY"],
-                    false,
-                )?,
+            chain: {
+                ChainConfig {
+                    chain_id: parse_required_u64(&values, &["CHAIN_ID"])?,
+                    token_address: parse_required_address(&values, &["TOKEN_ADDRESS"])?,
+                    token_decimals: parse_required_u8(&values, &["TOKEN_DECIMALS"])?,
+                    token_symbol: values
+                        .optional(&["TOKEN_SYMBOL"])
+                        .unwrap_or("TOKEN")
+                        .to_string(),
+                    treasury_address: parse_required_address(&values, &["TREASURY_ADDRESS"])?,
+                    problem_funds_address: parse_required_address(&values, &["PROBLEM_FUNDS_ADDRESS"])?,
+                    rpc_http_urls: parse_required_list(&values, &["RPC_HTTP_URLS", "RPC_URLS"])?,
+                    start_block: parse_required_u64(&values, &["START_BLOCK", "SCAN_FROM_BLOCK"])?,
+                    min_confirmations: parse_required_u64(&values, &["MIN_CONFIRMATIONS"])?,
+                    allow_full_history_replay: parse_optional_bool(
+                        &values,
+                        &["ALLOW_FULL_HISTORY_REPLAY"],
+                        false,
+                    )?,
+                }
             },
             transfer_log: {
                 let defaults = TransferLogConfig::default();
@@ -675,7 +1007,17 @@ impl AppConfig {
                     false,
                 )?,
             },
-        })
+            tokens: Vec::new(),
+        };
+
+        config.tokens = vec![TokenInstanceConfig {
+            chain: config.chain.clone(),
+            collection: config.collection.clone(),
+            transfer_log: config.transfer_log.clone(),
+            collector: config.collector.clone(),
+        }];
+
+        Ok(config)
     }
 
     pub fn validate_profile(&self) -> Result<(), ConfigError> {
@@ -745,19 +1087,41 @@ impl AppConfig {
             errors.push("worker runtime role has no enabled workers".to_string());
         }
 
-        if self.collection.max_priority_fee_per_gas_wei > self.collection.max_fee_per_gas_wei {
-            errors.push(
-                "COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI must be <= COLLECTION_MAX_FEE_PER_GAS_WEI"
-                    .to_string(),
-            );
+        if self.tokens.is_empty() {
+            errors.push("at least one token must be configured".to_string());
         }
 
-        if self.chain.problem_funds_address == EvmAddress::ZERO {
-            errors.push("PROBLEM_FUNDS_ADDRESS must not be zero".to_string());
-        }
+        let mut seen_tokens = BTreeSet::new();
+        for (idx, token) in self.tokens.iter().enumerate() {
+            let key = (token.chain.chain_id, token.chain.token_address);
+            if !seen_tokens.insert(key) {
+                errors.push(format!(
+                    "duplicate token instance on chain {} with address {}",
+                    token.chain.chain_id, token.chain.token_address
+                ));
+            }
 
-        if self.chain.problem_funds_address == self.chain.treasury_address {
-            errors.push("PROBLEM_FUNDS_ADDRESS must differ from TREASURY_ADDRESS".to_string());
+            let prefix = if self.tokens.len() > 1 {
+                format!("token[{idx}]: ")
+            } else {
+                String::new()
+            };
+
+            if token.collection.max_priority_fee_per_gas_wei > token.collection.max_fee_per_gas_wei {
+                errors.push(format!(
+                    "{prefix}COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI must be <= COLLECTION_MAX_FEE_PER_GAS_WEI"
+                ));
+            }
+
+            if token.chain.problem_funds_address == EvmAddress::ZERO {
+                errors.push(format!("{prefix}PROBLEM_FUNDS_ADDRESS must not be zero"));
+            }
+
+            if token.chain.problem_funds_address == token.chain.treasury_address {
+                errors.push(format!(
+                    "{prefix}PROBLEM_FUNDS_ADDRESS must differ from TREASURY_ADDRESS"
+                ));
+            }
         }
 
         if !self.profile.is_production() {
@@ -778,24 +1142,31 @@ impl AppConfig {
             );
         }
 
-        let distinct_rpc_urls = self
-            .chain
-            .rpc_http_urls
-            .iter()
-            .map(|url| url.trim())
-            .collect::<BTreeSet<_>>()
-            .len();
-        if distinct_rpc_urls < 2 {
-            errors.push(
-                "production profile requires at least two distinct RPC providers".to_string(),
-            );
-        }
+        for (idx, token) in self.tokens.iter().enumerate() {
+            let prefix = if self.tokens.len() > 1 {
+                format!("token[{idx}]: ")
+            } else {
+                String::new()
+            };
 
-        if self.chain.start_block == 0 && !self.chain.allow_full_history_replay {
-            errors.push(
-                "production profile forbids START_BLOCK=0 unless ALLOW_FULL_HISTORY_REPLAY=true"
-                    .to_string(),
-            );
+            let distinct_rpc_urls = token
+                .chain
+                .rpc_http_urls
+                .iter()
+                .map(|url| url.trim())
+                .collect::<BTreeSet<_>>()
+                .len();
+            if distinct_rpc_urls < 2 {
+                errors.push(format!(
+                    "{prefix}production profile requires at least two distinct RPC providers"
+                ));
+            }
+
+            if token.chain.start_block == 0 && !token.chain.allow_full_history_replay {
+                errors.push(format!(
+                    "{prefix}production profile forbids START_BLOCK=0 unless ALLOW_FULL_HISTORY_REPLAY=true"
+                ));
+            }
         }
 
         if self.jwt.legacy_secret_present {

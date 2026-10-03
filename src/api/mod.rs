@@ -52,23 +52,23 @@ use crate::{
 };
 
 #[derive(Clone)]
-struct ApiState {
-    dependencies: SharedDependencyRegistry,
-    metrics: MetricsRecorder,
-    auth: Option<Arc<JwtVerifier>>,
-    orders: Option<Arc<dyn OrderApiService>>,
-    order_verify: Option<Arc<dyn verify::OrderVerifyApiService>>,
-    collections: Option<Arc<dyn CollectionApiService>>,
-    order_response_config: Option<OrderResponseConfig>,
-    rate_limiter: Option<Arc<FixedWindowRateLimiter>>,
+pub struct ApiState {
+    pub(crate) dependencies: SharedDependencyRegistry,
+    pub(crate) metrics: MetricsRecorder,
+    pub(crate) auth: Option<Arc<JwtVerifier>>,
+    pub(crate) orders: Option<Arc<dyn OrderApiService>>,
+    pub(crate) order_verify: Option<Arc<dyn verify::OrderVerifyApiService>>,
+    pub(crate) collections: Option<Arc<dyn CollectionApiService>>,
+    pub(crate) order_response_config: Option<OrderResponseConfig>,
+    pub(crate) rate_limiter: Option<Arc<FixedWindowRateLimiter>>,
 }
 
 impl ApiState {
-    fn new(dependencies: SharedDependencyRegistry) -> Self {
+    pub fn new(dependencies: SharedDependencyRegistry) -> Self {
         Self::new_with_metrics(dependencies, MetricsRecorder::default())
     }
 
-    fn new_with_metrics(dependencies: SharedDependencyRegistry, metrics: MetricsRecorder) -> Self {
+    pub fn new_with_metrics(dependencies: SharedDependencyRegistry, metrics: MetricsRecorder) -> Self {
         Self {
             dependencies,
             metrics,
@@ -81,11 +81,11 @@ impl ApiState {
         }
     }
 
-    fn readiness(&self) -> ReadinessReport {
+    pub fn readiness(&self) -> ReadinessReport {
         self.dependencies.readiness()
     }
 
-    fn with_orders(
+    pub fn with_orders(
         mut self,
         auth: Arc<JwtVerifier>,
         orders: Arc<dyn OrderApiService>,
@@ -97,7 +97,7 @@ impl ApiState {
         self
     }
 
-    fn with_order_verify(
+    pub fn with_order_verify(
         mut self,
         auth: Arc<JwtVerifier>,
         order_verify: Arc<dyn verify::OrderVerifyApiService>,
@@ -107,7 +107,7 @@ impl ApiState {
         self
     }
 
-    fn with_collections(
+    pub fn with_collections(
         mut self,
         auth: Arc<JwtVerifier>,
         collections: Arc<dyn CollectionApiService>,
@@ -161,7 +161,7 @@ impl ApiState {
 }
 
 #[derive(Debug)]
-struct FixedWindowRateLimiter {
+pub(crate) struct FixedWindowRateLimiter {
     limit_per_minute: u32,
     state: Mutex<FixedWindowState>,
 }
@@ -228,6 +228,14 @@ impl OrderResponseConfig {
             token_decimals: config.chain.token_decimals,
             token_symbol: config.chain.token_symbol.clone(),
             problem_funds_address: config.chain.problem_funds_address,
+        }
+    }
+
+    pub fn from_chain_config(chain: &crate::config::ChainConfig) -> Self {
+        Self {
+            token_decimals: chain.token_decimals,
+            token_symbol: chain.token_symbol.clone(),
+            problem_funds_address: chain.problem_funds_address,
         }
     }
 }
@@ -491,15 +499,11 @@ where
     router_from_state(state)
 }
 
-fn router_from_state(state: ApiState) -> Router {
+pub fn token_service_router_from_state(state: ApiState) -> Router {
     let include_order_routes = state.orders.is_some();
     let include_order_verify_route = state.order_verify.is_some();
     let include_collection_routes = state.collections.is_some();
-    let mut router = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
-        .route("/metrics", get(metrics))
-        .fallback(not_found);
+    let mut router = Router::new();
 
     if include_order_routes {
         router = router
@@ -535,6 +539,91 @@ fn router_from_state(state: ApiState) -> Router {
             record_request_latency,
         ))
         .with_state(state)
+}
+
+fn router_from_state(state: ApiState) -> Router {
+    let service_router = token_service_router_from_state(state.clone());
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
+        .fallback(not_found)
+        .with_state(state)
+        .merge(service_router)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TokenSummary {
+    pub chain_id: u64,
+    pub token_address: EvmAddress,
+    pub token_symbol: String,
+    pub token_decimals: u8,
+    pub treasury_address: EvmAddress,
+    pub problem_funds_address: EvmAddress,
+    pub relayer_address: Option<EvmAddress>,
+    pub collection_method: String,
+    pub start_block: u64,
+    pub min_confirmations: u64,
+}
+
+#[derive(Clone)]
+pub struct MultiTokenRouteEntry {
+    pub chain_id: u64,
+    pub token_address: EvmAddress,
+    pub summary: TokenSummary,
+    pub state: ApiState,
+}
+
+pub fn build_multi_token_router(
+    global_state: ApiState,
+    tokens: Vec<MultiTokenRouteEntry>,
+) -> Router {
+    let summaries: Vec<TokenSummary> = tokens.iter().map(|t| t.summary.clone()).collect();
+    let mut main_router = Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(metrics))
+        .route(
+            "/v1/tokens",
+            get({
+                let summaries = summaries.clone();
+                move || {
+                    let summaries = summaries.clone();
+                    async move { Json(serde_json::json!({ "tokens": summaries })) }
+                }
+            }),
+        )
+        .fallback(not_found)
+        .with_state(global_state);
+
+    for entry in &tokens {
+        let token_router = token_service_router_from_state(entry.state.clone());
+        let lower_addr = entry.token_address.to_string().to_ascii_lowercase();
+        let checksum_addr = entry.token_address.to_string();
+
+        main_router = main_router.nest(&format!("/{lower_addr}"), token_router.clone());
+        if checksum_addr != lower_addr {
+            main_router = main_router.nest(&format!("/{checksum_addr}"), token_router.clone());
+        }
+
+        main_router = main_router.nest(
+            &format!("/{}/{lower_addr}", entry.chain_id),
+            token_router.clone(),
+        );
+        if checksum_addr != lower_addr {
+            main_router = main_router.nest(
+                &format!("/{}/{checksum_addr}", entry.chain_id),
+                token_router.clone(),
+            );
+        }
+    }
+
+    if tokens.len() == 1 {
+        let single_token_router = token_service_router_from_state(tokens[0].state.clone());
+        main_router = main_router.merge(single_token_router);
+    }
+
+    main_router
 }
 
 async fn healthz() -> Json<HealthzResponse> {

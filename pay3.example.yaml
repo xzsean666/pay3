@@ -1,0 +1,101 @@
+# ==============================================================================
+# Pay3 Native Multi-Chain Multi-Token Configuration Template
+# ==============================================================================
+# This YAML orchestration file allows running and managing multiple tokens
+# across one or multiple EVM chains under a single database and unified gateway.
+#
+# Usage:
+#   1. Copy to pay3.yaml (or point via PAY3_CONFIG_FILE=/path/to/pay3.yaml)
+#   2. Run: pay3
+#
+# Routing Invariants:
+#   - Root APIs:
+#       GET  /healthz     (Service liveness)
+#       GET  /readyz      (Dependency readiness check)
+#       GET  /metrics     (Prometheus metrics)
+#       GET  /v1/tokens   (List all active token instances and status)
+#   - Token-specific APIs:
+#       POST /{token_address}/v1/orders
+#       GET  /{token_address}/v1/orders/{id}
+#       POST /{token_address}/v1/orders/{id}/verify
+#       POST /{token_address}/v1/collections
+#       GET  /{token_address}/v1/collections/{id}
+#       (Also accessible via /{chain_id}/{token_address}/v1/... for explicit multi-chain routing)
+# ==============================================================================
+
+server:
+  bind_addr: "0.0.0.0:8080"
+  profile: "production"    # "development" | "staging" | "production"
+
+database:
+  url: "postgres://pay3_user:pay3_secure_password@postgres:5432/pay3"
+
+signer:
+  # Master Signer: shared across all tokens.
+  # Production requires "external" | "kms" | "hsm". Local/Fake only permitted in non-production.
+  mode: "external"
+  key_ref: "master-key"
+  endpoint: "https://vault-signer.internal:8443"
+  bearer_token: "signer-vault-token-xyz"
+  # Base derivation path for independent relayer addresses:
+  # Each token auto-allocates: m/44'/60'/99'/0/{index}
+  relayer_base_derivation_path: "m/44'/60'/99'/0"
+
+auth:
+  issuer: "https://auth.company.internal"
+  audience: "pay3-api"
+  jwks_url: "https://auth.company.internal/.well-known/jwks.json"
+
+tokens:
+  # ----------------------------------------------------------------------------
+  # Token 1: USDT on Polygon PoS (Chain ID 137)
+  # ----------------------------------------------------------------------------
+  - chain_id: 137
+    token_address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
+    token_symbol: "USDT"
+    token_decimals: 6
+    treasury_address: "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"
+    problem_funds_address: "0x8ba1f109551bD432803012645Ac136ddd64DBA72"
+    rpc_http_urls:
+      - "https://polygon-rpc.node1.internal:8545"
+      - "https://polygon-rpc.node2.internal:8545"
+    start_block: 65000000
+    min_confirmations: 64
+    collection_method: "standard"
+    # Relayer path defaults to m/44'/60'/99'/0/0
+
+  # ----------------------------------------------------------------------------
+  # Token 2: USDC on Arbitrum One (Chain ID 42161)
+  # ----------------------------------------------------------------------------
+  - chain_id: 42161
+    token_address: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+    token_symbol: "USDC"
+    token_decimals: 6
+    treasury_address: "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"
+    problem_funds_address: "0x8ba1f109551bD432803012645Ac136ddd64DBA72"
+    rpc_http_urls:
+      - "https://arb-mainnet.node1.internal:8545"
+      - "https://arb-mainnet.node2.internal:8545"
+    start_block: 260000000
+    min_confirmations: 30
+    collection_method: "eip3009"
+    token_name: "USD Coin"
+    token_version: "2"
+    # Relayer path defaults to m/44'/60'/99'/0/1
+
+  # ----------------------------------------------------------------------------
+  # Token 3: USDT on BNB Smart Chain (Chain ID 56)
+  # ----------------------------------------------------------------------------
+  - chain_id: 56
+    token_address: "0x55d398326f99059fF775485246999027B3197955"
+    token_symbol: "USDT"
+    token_decimals: 18
+    treasury_address: "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"
+    problem_funds_address: "0x8ba1f109551bD432803012645Ac136ddd64DBA72"
+    rpc_http_urls:
+      - "https://bsc-dataseed1.node.internal:8545"
+      - "https://bsc-dataseed2.node.internal:8545"
+    start_block: 43000000
+    min_confirmations: 20
+    collection_method: "standard"
+    # Relayer path defaults to m/44'/60'/99'/0/2

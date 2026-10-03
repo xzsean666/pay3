@@ -7,17 +7,22 @@ use thiserror::Error;
 use tokio::task::JoinHandle;
 
 use crate::{
-    api::{self, OrderResponseConfig},
+    api::{
+        build_multi_token_router, verify::OrderVerifyApiService, ApiState,
+        CollectionApiService, MultiTokenRouteEntry, OrderApiService, OrderResponseConfig,
+        TokenSummary,
+    },
     auth::JwtVerifier,
     chain::{ChainError, RpcRangeSource, TransferLogCapacityLimits, TransferLogRange},
     config::{
         AppConfig, ConfigError, JwtAlgorithm, JwtKeySource, RuntimeRole, SignerMode,
-        WorkerEnableConfig,
+        TokenInstanceConfig, WorkerEnableConfig,
     },
     db::{
         migrations::{
-            run_schema_migrations, seed_runtime_config, MigrationBootstrapError,
-            RuntimeSeedConfig, MIGRATOR,
+            run_schema_migrations, seed_multi_runtime_config,
+            MigrationBootstrapError, MultiRuntimeSeedConfig, RuntimeSeedConfig, TokenSeedConfig,
+            MIGRATOR,
         },
         repositories::{
             ExpiredOrderRepository, PgAuditRepository, PgCollectionRepository,
@@ -346,55 +351,55 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
     let pool = PgPool::connect(&config.database.url).await?;
     run_schema_migrations(&pool).await?;
 
-    let rpc_source = RpcRangeSource::from_http_urls(
-        config.chain.chain_id,
-        &config.chain.rpc_http_urls,
-        min_rpc_provider_count(&config),
-    )?;
-    rpc_source.manager().validate_chain_ids().await?;
-
     let signer = runtime_signer(&config)?;
     ensure_runtime_signer_health(&signer).await?;
 
-    let relayer_address = if let Some(key_ref) = &config.collection.relayer_key_ref {
-        Some(
-            SignerProvider::derive_address(
-                &signer,
-                key_ref,
-                &config.collection.relayer_derivation_path,
+    let mut relayer_addresses = Vec::with_capacity(config.tokens.len());
+    let mut token_seed_configs = Vec::with_capacity(config.tokens.len());
+    for token in &config.tokens {
+        let relayer_address = if let Some(key_ref) = &token.collection.relayer_key_ref {
+            Some(
+                SignerProvider::derive_address(
+                    &signer,
+                    key_ref,
+                    &token.collection.relayer_derivation_path,
+                )
+                .await
+                .map_err(|error| RuntimeError::Signer(Box::new(error)))?,
             )
-            .await
-            .map_err(|error| RuntimeError::Signer(Box::new(error)))?,
-        )
-    } else {
-        None
-    };
-    seed_runtime_config(&pool, &runtime_seed_config(&config, relayer_address)).await?;
+        } else {
+            None
+        };
+        relayer_addresses.push(relayer_address);
+        token_seed_configs.push(TokenSeedConfig {
+            chain_id: token.chain.chain_id,
+            token_address: token.chain.token_address,
+            treasury_address: token.chain.treasury_address,
+            problem_funds_address: token.chain.problem_funds_address,
+            relayer_address,
+            start_block: token.chain.start_block,
+        });
+    }
+
+    seed_multi_runtime_config(
+        &pool,
+        &MultiRuntimeSeedConfig {
+            signer_key_ref: config.signer.key_ref.clone(),
+            tokens: token_seed_configs,
+        },
+    )
+    .await?;
 
     let metrics = MetricsRecorder::default();
-
-    let stream = StreamId::new(config.chain.chain_id, config.chain.token_address);
     let static_dependencies = StaticDependencyRegistry::all_healthy();
     refresh_migration_dependency_status(&static_dependencies, &pool).await;
     let dependency_registry =
         RuntimeDependencyRegistry::new(static_dependencies.clone(), metrics.clone());
-    let readiness = RuntimeReadinessResources {
-        dependencies: static_dependencies.clone(),
-        pool: pool.clone(),
-        rpc_source: rpc_source.clone(),
-        stream,
-        signer: signer.clone(),
-    };
-    refresh_runtime_dependency_status(&readiness).await;
+
     let mut background_tasks = BackgroundTasks::new();
     let workers = &config.runtime.workers;
     let runtime_workers_enabled = config.runtime.workers_enabled();
-    if config.runtime.api_enabled() && workers.runtime_readiness {
-        background_tasks.push(tokio::spawn(runtime_readiness_loop(
-            readiness,
-            std::time::Duration::from_millis(RUNTIME_READINESS_POLL_INTERVAL_MS),
-        )));
-    }
+
     if runtime_workers_enabled && workers.order_expiry {
         background_tasks.push(tokio::spawn(order_expiry_loop(
             PgOrderRepository::new(pool.clone()),
@@ -402,77 +407,130 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
             ORDER_EXPIRY_BATCH_LIMIT,
         )));
     }
-    if runtime_workers_enabled && workers.payment_scanner {
-        background_tasks.push(spawn_payment_scanner_loop_with_metrics(
-            payment_scanner_worker(&config, pool.clone(), rpc_source.clone()),
-            std::time::Duration::from_millis(PAYMENT_SCANNER_POLL_INTERVAL_MS),
-            metrics.clone(),
-        )?);
-    }
 
     let auth = jwt_verifier(&config).await?;
     if let Some(refresher) = auth.spawn_background_refresher() {
         background_tasks.push(refresher);
     }
-    let orders = Arc::new(order_service(
-        &config,
-        pool.clone(),
-        rpc_source.clone(),
-        signer.clone(),
-    )?);
-    let collections = Arc::new(
-        collection_service(
-            &config,
+    let shared_auth = Arc::new(auth);
+
+    let mut route_entries = Vec::with_capacity(config.tokens.len());
+
+    for (token, &relayer_address) in config.tokens.iter().zip(relayer_addresses.iter()) {
+        let rpc_source = RpcRangeSource::from_http_urls(
+            token.chain.chain_id,
+            &token.chain.rpc_http_urls,
+            min_rpc_provider_count_for_token(&config, token),
+        )?;
+        rpc_source.manager().validate_chain_ids().await?;
+
+        let stream = StreamId::new(token.chain.chain_id, token.chain.token_address);
+        let readiness = RuntimeReadinessResources {
+            dependencies: static_dependencies.clone(),
+            pool: pool.clone(),
+            rpc_source: rpc_source.clone(),
+            stream,
+            signer: signer.clone(),
+        };
+        refresh_runtime_dependency_status(&readiness).await;
+        if config.runtime.api_enabled() && workers.runtime_readiness {
+            background_tasks.push(tokio::spawn(runtime_readiness_loop(
+                readiness,
+                std::time::Duration::from_millis(RUNTIME_READINESS_POLL_INTERVAL_MS),
+            )));
+        }
+
+        let orders: Arc<dyn OrderApiService> = Arc::new(order_service_for_token(
+            token,
             pool.clone(),
             rpc_source.clone(),
             signer.clone(),
-        )
-        .await?,
-    );
-    if runtime_workers_enabled && workers.collection_enqueuer {
-        background_tasks.push(tokio::spawn(auto_collection_enqueue_loop(
-            pool.clone(),
-            collection_service(&config, pool.clone(), rpc_source.clone(), signer.clone()).await?,
-            config.chain.chain_id,
-            config.chain.token_address,
-            config.chain.problem_funds_address,
-            std::time::Duration::from_millis(COLLECTION_ENQUEUER_POLL_INTERVAL_MS),
-            COLLECTION_ENQUEUER_BATCH_LIMIT,
-        )));
-    }
-    if runtime_workers_enabled && workers.collection_collector {
-        background_tasks.push(spawn_collection_collector_loop_with_metrics(
-            CollectionCollectorWorker::new(
-                collection_service(&config, pool.clone(), rpc_source.clone(), signer.clone()).await?,
-                PgOutboundRepository::new(pool.clone()),
-                rpc_source.clone(),
-                collection_collector_config(&config),
-            ),
-            std::time::Duration::from_millis(COLLECTION_COLLECTOR_POLL_INTERVAL_MS),
-            metrics.clone(),
         )?);
-    }
-    let order_verify = Arc::new(ManualOrderVerifyService::new(
-        PgOrderRepository::new(pool.clone()),
-        PgVerifiedPaymentRecorder::new(pool),
-        rpc_source.clone(),
-        rpc_source,
-        SystemClock,
-        ManualVerifyConfig::new(
-            TRANSFER_LOG_MAX_LOGS_PER_PAGE,
-            config.chain.min_confirmations,
-        ),
-    ));
 
-    let router = api::router_with_runtime_services_and_metrics(
-        dependency_registry,
-        metrics,
-        auth,
-        orders,
-        order_verify,
-        collections,
-        OrderResponseConfig::from_config(&config),
-    );
+        let collections: Arc<dyn CollectionApiService> = Arc::new(
+            collection_service_for_token(
+                token,
+                pool.clone(),
+                rpc_source.clone(),
+                signer.clone(),
+            )
+            .await?,
+        );
+
+        let order_verify: Arc<dyn OrderVerifyApiService> = Arc::new(ManualOrderVerifyService::new(
+            PgOrderRepository::new(pool.clone()),
+            PgVerifiedPaymentRecorder::new(pool.clone()),
+            rpc_source.clone(),
+            rpc_source.clone(),
+            SystemClock,
+            ManualVerifyConfig::new(
+                TRANSFER_LOG_MAX_LOGS_PER_PAGE,
+                token.chain.min_confirmations,
+            ),
+        ));
+
+        if runtime_workers_enabled && workers.payment_scanner {
+            background_tasks.push(spawn_payment_scanner_loop_with_metrics(
+                payment_scanner_worker_for_token(token, pool.clone(), rpc_source.clone()),
+                std::time::Duration::from_millis(PAYMENT_SCANNER_POLL_INTERVAL_MS),
+                metrics.clone(),
+            )?);
+        }
+
+        if runtime_workers_enabled && workers.collection_enqueuer {
+            background_tasks.push(tokio::spawn(auto_collection_enqueue_loop(
+                pool.clone(),
+                collection_service_for_token(token, pool.clone(), rpc_source.clone(), signer.clone()).await?,
+                token.chain.chain_id,
+                token.chain.token_address,
+                token.chain.problem_funds_address,
+                std::time::Duration::from_millis(COLLECTION_ENQUEUER_POLL_INTERVAL_MS),
+                COLLECTION_ENQUEUER_BATCH_LIMIT,
+            )));
+        }
+
+        if runtime_workers_enabled && workers.collection_collector {
+            background_tasks.push(spawn_collection_collector_loop_with_metrics(
+                CollectionCollectorWorker::new(
+                    collection_service_for_token(token, pool.clone(), rpc_source.clone(), signer.clone()).await?,
+                    PgOutboundRepository::new(pool.clone()),
+                    rpc_source.clone(),
+                    collection_collector_config_for_token(token),
+                ),
+                std::time::Duration::from_millis(COLLECTION_COLLECTOR_POLL_INTERVAL_MS),
+                metrics.clone(),
+            )?);
+        }
+
+        let order_response_config = OrderResponseConfig::from_chain_config(&token.chain);
+        let token_state = ApiState::new_with_metrics(Arc::new(static_dependencies.clone()), metrics.clone())
+            .with_orders(shared_auth.clone(), orders, order_response_config)
+            .with_order_verify(shared_auth.clone(), order_verify)
+            .with_collections(shared_auth.clone(), collections);
+
+        let summary = TokenSummary {
+            chain_id: token.chain.chain_id,
+            token_address: token.chain.token_address,
+            token_symbol: token.chain.token_symbol.clone(),
+            token_decimals: token.chain.token_decimals,
+            treasury_address: token.chain.treasury_address,
+            problem_funds_address: token.chain.problem_funds_address,
+            relayer_address,
+            collection_method: token.collection.method.as_str().to_string(),
+            start_block: token.chain.start_block,
+            min_confirmations: token.chain.min_confirmations,
+        };
+
+        route_entries.push(MultiTokenRouteEntry {
+            chain_id: token.chain.chain_id,
+            token_address: token.chain.token_address,
+            summary,
+            state: token_state,
+        });
+    }
+
+    let global_api_state = ApiState::new_with_metrics(Arc::new(dependency_registry), metrics);
+    let router = build_multi_token_router(global_api_state, route_entries);
 
     Ok(ApiRuntime {
         router,
@@ -480,6 +538,7 @@ pub async fn build_api_runtime(config: AppConfig) -> Result<ApiRuntime, RuntimeE
     })
 }
 
+#[allow(dead_code)]
 fn runtime_seed_config(
     config: &AppConfig,
     relayer_address: Option<EvmAddress>,
@@ -578,8 +637,8 @@ fn runtime_signer(config: &AppConfig) -> Result<RuntimeSigner, RuntimeError> {
     }
 }
 
-fn order_service<D>(
-    config: &AppConfig,
+fn order_service_for_token<D>(
+    token: &TokenInstanceConfig,
     pool: PgPool,
     rpc_source: RpcRangeSource,
     deriver: D,
@@ -589,8 +648,8 @@ where
 {
     Ok(OrderService::new(
         OrderServiceConfig::new(
-            config.chain.chain_id,
-            config.chain.token_address,
+            token.chain.chain_id,
+            token.chain.token_address,
             LATE_PAYMENT_MONITOR_SECONDS,
         ),
         PgOrderRepository::new(pool),
@@ -599,29 +658,42 @@ where
     )?)
 }
 
-async fn collection_strategy_config<S: SignerProvider>(
+#[allow(dead_code)]
+fn order_service<D>(
     config: &AppConfig,
+    pool: PgPool,
+    rpc_source: RpcRangeSource,
+    deriver: D,
+) -> Result<OrderService<PgOrderRepository, D, RpcRangeSource>, RuntimeError>
+where
+    D: AddressDeriver,
+{
+    order_service_for_token(&config.tokens[0], pool, rpc_source, deriver)
+}
+
+async fn collection_strategy_config_for_token<S: SignerProvider>(
+    token: &TokenInstanceConfig,
     signer: &S,
     rpc_source: &RpcRangeSource,
 ) -> Result<CollectionStrategyConfig, RuntimeError> {
-    let has_relayer = config.collection.relayer_key_ref.is_some();
+    let has_relayer = token.collection.relayer_key_ref.is_some();
     let resolution = crate::domain::resolve_optimal_collection_strategy_with_probe(
-        config.chain.chain_id,
-        config.chain.token_address,
-        &config.chain.token_symbol,
+        token.chain.chain_id,
+        token.chain.token_address,
+        &token.chain.token_symbol,
         has_relayer,
-        config.collection.method,
-        config.collection.token_name.clone(),
-        config.collection.token_version.clone(),
+        token.collection.method,
+        token.collection.token_name.clone(),
+        token.collection.token_version.clone(),
         Some(rpc_source),
     )
     .await;
 
     tracing::info!(
-        chain_id = config.chain.chain_id,
-        token_address = %config.chain.token_address,
-        token_symbol = %config.chain.token_symbol,
-        configured_method = config.collection.method.as_str(),
+        chain_id = token.chain.chain_id,
+        token_address = %token.chain.token_address,
+        token_symbol = %token.chain.token_symbol,
+        configured_method = token.collection.method.as_str(),
         effective_method = resolution.method.as_str(),
         reason = resolution.reason,
         "resolved collection strategy"
@@ -631,7 +703,7 @@ async fn collection_strategy_config<S: SignerProvider>(
         return Ok(CollectionStrategyConfig::Standard);
     }
 
-    let key_ref = config
+    let key_ref = token
         .collection
         .relayer_key_ref
         .as_deref()
@@ -640,7 +712,7 @@ async fn collection_strategy_config<S: SignerProvider>(
                 key: "COLLECTION_RELAYER_KEY_REF",
             })
         })?;
-    let derivation_path = &config.collection.relayer_derivation_path;
+    let derivation_path = &token.collection.relayer_derivation_path;
     let address = signer
         .derive_address(key_ref, derivation_path)
         .await
@@ -672,8 +744,17 @@ async fn collection_strategy_config<S: SignerProvider>(
     }
 }
 
-async fn collection_service<S>(
+#[allow(dead_code)]
+async fn collection_strategy_config<S: SignerProvider>(
     config: &AppConfig,
+    signer: &S,
+    rpc_source: &RpcRangeSource,
+) -> Result<CollectionStrategyConfig, RuntimeError> {
+    collection_strategy_config_for_token(&config.tokens[0], signer, rpc_source).await
+}
+
+async fn collection_service_for_token<S>(
+    token: &TokenInstanceConfig,
     pool: PgPool,
     rpc_source: RpcRangeSource,
     signer: S,
@@ -681,8 +762,8 @@ async fn collection_service<S>(
 where
     S: SignerProvider,
 {
-    let strategy = collection_strategy_config(config, &signer, &rpc_source).await?;
-    let service_config = collection_service_config(config).with_strategy(strategy);
+    let strategy = collection_strategy_config_for_token(token, &signer, &rpc_source).await?;
+    let service_config = collection_service_config_for_token(token).with_strategy(strategy);
     Ok(CollectionService::new(
         service_config,
         PgOrderRepository::new(pool.clone()),
@@ -695,20 +776,50 @@ where
     )?)
 }
 
-fn collection_service_config(config: &AppConfig) -> CollectionServiceConfig {
+#[allow(dead_code)]
+async fn collection_service<S>(
+    config: &AppConfig,
+    pool: PgPool,
+    rpc_source: RpcRangeSource,
+    signer: S,
+) -> Result<RuntimeCollectionService<S>, RuntimeError>
+where
+    S: SignerProvider,
+{
+    collection_service_for_token(&config.tokens[0], pool, rpc_source, signer).await
+}
+
+fn collection_service_config_for_token(token: &TokenInstanceConfig) -> CollectionServiceConfig {
     CollectionServiceConfig::new(
-        config.chain.chain_id,
-        config.chain.token_address,
-        config.chain.treasury_address,
-        config.chain.problem_funds_address,
+        token.chain.chain_id,
+        token.chain.token_address,
+        token.chain.treasury_address,
+        token.chain.problem_funds_address,
         CollectionFees::new(
-            config.collection.gas_limit,
-            config.collection.max_fee_per_gas_wei,
-            config.collection.max_priority_fee_per_gas_wei,
+            token.collection.gas_limit,
+            token.collection.max_fee_per_gas_wei,
+            token.collection.max_priority_fee_per_gas_wei,
         ),
     )
 }
 
+#[cfg(test)]
+fn collection_service_config(config: &AppConfig) -> CollectionServiceConfig {
+    collection_service_config_for_token(&config.tokens[0])
+}
+
+fn collection_collector_config_for_token(token: &TokenInstanceConfig) -> CollectionCollectorConfig {
+    CollectionCollectorConfig::new(format!(
+        "collection-collector-{}-{}-{}",
+        token.chain.chain_id,
+        token.chain.token_address,
+        std::process::id()
+    ))
+    .with_replacement_stuck_after(token.collector.replacement_stuck_after)
+    .with_min_confirmations(token.chain.min_confirmations)
+}
+
+#[cfg(test)]
 fn collection_collector_config(config: &AppConfig) -> CollectionCollectorConfig {
     CollectionCollectorConfig::new(format!("collection-collector-{}", std::process::id()))
         .with_replacement_stuck_after(config.collector.replacement_stuck_after)
@@ -1040,12 +1151,12 @@ fn raw_amount_from_db_text(value: String) -> Result<RawAmount, RuntimeError> {
     })
 }
 
-fn payment_scanner_worker(
-    config: &AppConfig,
+fn payment_scanner_worker_for_token(
+    token: &TokenInstanceConfig,
     pool: PgPool,
     rpc_source: RpcRangeSource,
 ) -> RuntimePaymentScannerWorker {
-    let stream = StreamId::new(config.chain.chain_id, config.chain.token_address);
+    let stream = StreamId::new(token.chain.chain_id, token.chain.token_address);
     let fallback = RepositoryPaymentWindowLookup::new(
         PgOrderRepository::new(pool.clone()),
         TRANSFER_LOG_MAX_DB_FALLBACK_ADDRESSES,
@@ -1056,7 +1167,7 @@ fn payment_scanner_worker(
         rpc_source.clone(),
         PaymentMatchingConfig {
             stream,
-            min_confirmations: config.chain.min_confirmations,
+            min_confirmations: token.chain.min_confirmations,
             page_limit: TRANSFER_LOG_MAX_LOGS_PER_PAGE,
             max_unique_to_addresses_per_batch: TRANSFER_LOG_MAX_UNIQUE_TO_ADDRESSES_PER_BATCH,
         },
@@ -1068,13 +1179,27 @@ fn payment_scanner_worker(
         rpc_source,
         SystemClock,
         PaymentScannerConfig::new(
-            format!("payment-scanner-{}", std::process::id()),
+            format!(
+                "payment-scanner-{}-{}-{}",
+                token.chain.chain_id,
+                token.chain.token_address,
+                std::process::id()
+            ),
             stream,
             time::Duration::seconds(PAYMENT_SCANNER_LEASE_SECONDS),
         )
-        .with_batch_size_blocks(config.transfer_log.batch_size_blocks)
-        .with_max_batch_size_blocks(config.transfer_log.max_batch_size_blocks),
+        .with_batch_size_blocks(token.transfer_log.batch_size_blocks)
+        .with_max_batch_size_blocks(token.transfer_log.max_batch_size_blocks),
     )
+}
+
+#[allow(dead_code)]
+fn payment_scanner_worker(
+    config: &AppConfig,
+    pool: PgPool,
+    rpc_source: RpcRangeSource,
+) -> RuntimePaymentScannerWorker {
+    payment_scanner_worker_for_token(&config.tokens[0], pool, rpc_source)
 }
 
 async fn ensure_runtime_signer_health<S>(signer: &S) -> Result<(), RuntimeError>
@@ -1247,6 +1372,10 @@ async fn order_expiry_loop(
 
 fn min_rpc_provider_count(config: &AppConfig) -> usize {
     if config.profile.is_production() { 2 } else { 1 }
+}
+
+fn min_rpc_provider_count_for_token(config: &AppConfig, _token: &TokenInstanceConfig) -> usize {
+    min_rpc_provider_count(config)
 }
 
 #[cfg(test)]

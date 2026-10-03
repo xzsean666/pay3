@@ -18,6 +18,22 @@ pub struct RuntimeSeedConfig {
     pub start_block: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TokenSeedConfig {
+    pub chain_id: u64,
+    pub token_address: EvmAddress,
+    pub treasury_address: EvmAddress,
+    pub problem_funds_address: EvmAddress,
+    pub relayer_address: Option<EvmAddress>,
+    pub start_block: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiRuntimeSeedConfig {
+    pub signer_key_ref: String,
+    pub tokens: Vec<TokenSeedConfig>,
+}
+
 #[derive(Debug, Error)]
 pub enum MigrationBootstrapError {
     #[error("migration failed: {0}")]
@@ -37,18 +53,41 @@ pub async fn seed_runtime_config(
     pool: &PgPool,
     config: &RuntimeSeedConfig,
 ) -> Result<(), MigrationBootstrapError> {
+    seed_multi_runtime_config(
+        pool,
+        &MultiRuntimeSeedConfig {
+            signer_key_ref: config.signer_key_ref.clone(),
+            tokens: vec![TokenSeedConfig {
+                chain_id: config.chain_id,
+                token_address: config.token_address,
+                treasury_address: config.treasury_address,
+                problem_funds_address: config.problem_funds_address,
+                relayer_address: config.relayer_address,
+                start_block: config.start_block,
+            }],
+        },
+    )
+    .await
+}
+
+pub async fn seed_multi_runtime_config(
+    pool: &PgPool,
+    config: &MultiRuntimeSeedConfig,
+) -> Result<(), MigrationBootstrapError> {
     let mut tx = pool.begin().await?;
-    seed_wallet_cursor(&mut tx, config).await?;
-    seed_chain_cursor(&mut tx, config).await?;
-    seed_treasury_address(&mut tx, config).await?;
-    seed_relayer_address(&mut tx, config).await?;
+    seed_wallet_cursor_key(&mut tx, &config.signer_key_ref).await?;
+    for token in &config.tokens {
+        seed_token_chain_cursor(&mut tx, token).await?;
+        seed_token_treasury_address(&mut tx, token).await?;
+        seed_token_relayer_address(&mut tx, token).await?;
+    }
     tx.commit().await?;
     Ok(())
 }
 
-async fn seed_wallet_cursor(
+async fn seed_wallet_cursor_key(
     tx: &mut Transaction<'_, Postgres>,
-    config: &RuntimeSeedConfig,
+    signer_key_ref: &str,
 ) -> Result<(), MigrationBootstrapError> {
     let result = sqlx::query(
         r#"
@@ -67,7 +106,7 @@ async fn seed_wallet_cursor(
         WHERE wallet_cursors.signer_key_ref IN ('unconfigured', EXCLUDED.signer_key_ref)
         "#,
     )
-    .bind(&config.signer_key_ref)
+    .bind(signer_key_ref)
     .execute(&mut **tx)
     .await?;
 
@@ -81,12 +120,12 @@ async fn seed_wallet_cursor(
     Ok(())
 }
 
-async fn seed_chain_cursor(
+async fn seed_token_chain_cursor(
     tx: &mut Transaction<'_, Postgres>,
-    config: &RuntimeSeedConfig,
+    token: &TokenSeedConfig,
 ) -> Result<(), MigrationBootstrapError> {
-    let chain_id = i64::try_from(config.chain_id)?;
-    let start_block = i64::try_from(config.start_block)?;
+    let chain_id = i64::try_from(token.chain_id)?;
+    let start_block = i64::try_from(token.start_block)?;
     let last_scanned_block = start_block.saturating_sub(1).max(0);
 
     sqlx::query(
@@ -102,7 +141,7 @@ async fn seed_chain_cursor(
         "#,
     )
     .bind(chain_id)
-    .bind(config.token_address.to_string())
+    .bind(token.token_address.to_string())
     .bind(last_scanned_block)
     .execute(&mut **tx)
     .await?;
@@ -110,11 +149,11 @@ async fn seed_chain_cursor(
     Ok(())
 }
 
-async fn seed_treasury_address(
+async fn seed_token_treasury_address(
     tx: &mut Transaction<'_, Postgres>,
-    config: &RuntimeSeedConfig,
+    token: &TokenSeedConfig,
 ) -> Result<(), MigrationBootstrapError> {
-    for address in [config.treasury_address, config.problem_funds_address] {
+    for address in [token.treasury_address, token.problem_funds_address] {
         sqlx::query(
             r#"
             INSERT INTO treasury_addresses (
@@ -126,8 +165,8 @@ async fn seed_treasury_address(
             ON CONFLICT (chain_id, token_address, treasury_address) DO NOTHING
             "#,
         )
-        .bind(i64::try_from(config.chain_id)?)
-        .bind(config.token_address.to_string())
+        .bind(i64::try_from(token.chain_id)?)
+        .bind(token.token_address.to_string())
         .bind(address.to_string())
         .execute(&mut **tx)
         .await?;
@@ -136,11 +175,11 @@ async fn seed_treasury_address(
     Ok(())
 }
 
-async fn seed_relayer_address(
+async fn seed_token_relayer_address(
     tx: &mut Transaction<'_, Postgres>,
-    config: &RuntimeSeedConfig,
+    token: &TokenSeedConfig,
 ) -> Result<(), MigrationBootstrapError> {
-    if let Some(relayer_address) = config.relayer_address {
+    if let Some(relayer_address) = token.relayer_address {
         sqlx::query(
             r#"
             INSERT INTO relayer_addresses (
@@ -151,7 +190,7 @@ async fn seed_relayer_address(
             ON CONFLICT (chain_id, relayer_address) DO NOTHING
             "#,
         )
-        .bind(i64::try_from(config.chain_id)?)
+        .bind(i64::try_from(token.chain_id)?)
         .bind(relayer_address.to_string())
         .execute(&mut **tx)
         .await?;
