@@ -453,6 +453,7 @@ pub struct MultiTokenConfigFile {
     pub version: Option<String>,
     #[serde(default)]
     pub server: Option<ServerYamlConfig>,
+    #[serde(default)]
     pub database: DatabaseYamlConfig,
     pub signer: SignerYamlConfig,
     #[serde(default)]
@@ -470,9 +471,10 @@ pub struct ServerYamlConfig {
     pub role: Option<String>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct DatabaseYamlConfig {
-    pub url: String,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -541,6 +543,43 @@ pub struct TokenYamlConfig {
     pub token_version: Option<String>,
 }
 
+pub(crate) fn expand_env_vars(raw: &str) -> String {
+    let mut result = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '$' && chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let mut var_expr = String::new();
+            let mut closed = false;
+            for c in chars.by_ref() {
+                if c == '}' {
+                    closed = true;
+                    break;
+                }
+                var_expr.push(c);
+            }
+            if closed {
+                if let Some((var_name, default_val)) = var_expr.split_once(":-") {
+                    let val = env::var(var_name.trim()).unwrap_or_else(|_| default_val.to_string());
+                    result.push_str(&val);
+                } else {
+                    let val = env::var(var_expr.trim()).unwrap_or_default();
+                    result.push_str(&val);
+                }
+            } else {
+                result.push('$');
+                result.push('{');
+                result.push_str(&var_expr);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
 impl AppConfig {
     pub fn from_yaml_or_env() -> Result<Self, ConfigError> {
         if let Ok(path) = env::var("PAY3_CONFIG_FILE").or_else(|_| env::var("PAY3_CONFIG_PATH")) {
@@ -563,8 +602,9 @@ impl AppConfig {
     }
 
     pub fn from_yaml_str(yaml: &str) -> Result<Self, ConfigError> {
+        let expanded = expand_env_vars(yaml);
         let parsed: MultiTokenConfigFile =
-            serde_yaml::from_str(yaml).map_err(|err| ConfigError::Yaml {
+            serde_yaml::from_str(&expanded).map_err(|err| ConfigError::Yaml {
                 error: err.to_string(),
             })?;
 
@@ -600,9 +640,18 @@ impl AppConfig {
             .map_err(|e| ConfigError::invalid("server.bind_addr", bind_str, e.to_string()))?;
         let http = HttpConfig { bind_addr };
 
-        let database = DatabaseConfig {
-            url: parsed.database.url,
-        };
+        let database_url = parsed
+            .database
+            .url
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| env::var("DATABASE_URL").ok().filter(|s| !s.trim().is_empty()))
+            .ok_or_else(|| ConfigError::Missing {
+                key: "DATABASE_URL",
+            })?;
+        let database = DatabaseConfig { url: database_url };
 
         let kvdb = KvdbConfig {
             path: PathBuf::from(""),
@@ -610,15 +659,38 @@ impl AppConfig {
         };
 
         let auth_yaml = parsed.auth.unwrap_or_default();
-        let issuer = auth_yaml.issuer.unwrap_or_else(|| "pay3-issuer".to_string());
-        let audience = auth_yaml.audience.unwrap_or_else(|| "pay3-api".to_string());
-        let key_id = auth_yaml.key_id;
-        let jwks_url = auth_yaml.jwks_url;
-        let legacy_secret_present = auth_yaml.secret.is_some();
+        let issuer = auth_yaml
+            .issuer
+            .or_else(|| env::var("JWT_ISSUER").ok())
+            .unwrap_or_else(|| "pay3-issuer".to_string());
+        let audience = auth_yaml
+            .audience
+            .or_else(|| env::var("JWT_AUDIENCE").ok())
+            .unwrap_or_else(|| "pay3-api".to_string());
+        let key_id = auth_yaml.key_id.or_else(|| env::var("JWT_KEY_ID").ok());
+        let jwks_url = auth_yaml.jwks_url.or_else(|| env::var("JWT_JWKS_URL").ok());
+        let secret = auth_yaml
+            .secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| env::var("JWT_SECRET").ok().filter(|s| !s.trim().is_empty()));
+        let public_key_pem = auth_yaml
+            .public_key_pem
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| env::var("JWT_PUBLIC_KEY_PEM").ok().filter(|s| !s.trim().is_empty()));
+        let legacy_secret_present = secret.is_some() || env::var("JWT_SECRET").is_ok();
+
         let key_source = if let Some(url) = &jwks_url {
             JwtKeySource::RemoteJwks { url: url.clone() }
-        } else if let Some(pem) = auth_yaml.public_key_pem {
-            let algo = match auth_yaml.algorithm.as_deref() {
+        } else if let Some(pem) = public_key_pem {
+            let env_algo = env::var("JWT_ALGORITHM").ok();
+            let algo_str = auth_yaml.algorithm.as_deref().or(env_algo.as_deref());
+            let algo = match algo_str {
                 Some(a) => JwtAlgorithm::parse(a)?,
                 None => JwtAlgorithm::Rs256,
             };
@@ -627,7 +699,7 @@ impl AppConfig {
                 key_id: key_id.clone().unwrap_or_else(|| "default".to_string()),
                 public_key_pem: pem,
             }
-        } else if let Some(sec) = auth_yaml.secret {
+        } else if let Some(sec) = secret {
             JwtKeySource::Hs256 {
                 secret: sec,
                 key_id: key_id.clone(),
@@ -656,21 +728,67 @@ impl AppConfig {
             .signer
             .relayer_base_derivation_path
             .unwrap_or_else(|| "m/44'/60'/99'/0".to_string());
+
+        let mnemonic = parsed
+            .signer
+            .mnemonic
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| env::var("SIGNER_MNEMONIC").ok().filter(|s| !s.trim().is_empty()));
+
+        let secret_material_present = mnemonic.is_some()
+            || env::var("SIGNER_MNEMONIC").is_ok()
+            || env::var("LOCAL_SIGNER_MNEMONIC").is_ok()
+            || env::var("SIGNER_PRIVATE_KEY").is_ok();
+
+        let remote_bearer_token = parsed
+            .signer
+            .bearer_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                env::var("SIGNER_REMOTE_BEARER_TOKEN")
+                    .or_else(|_| env::var("SIGNER_BEARER_TOKEN"))
+                    .ok()
+                    .filter(|s| !s.trim().is_empty())
+            });
+
+        let allow_local_signer = parsed
+            .signer
+            .allow_local_signer
+            .or_else(|| {
+                env::var("ALLOW_LOCAL_SIGNER")
+                    .ok()
+                    .and_then(|v| v.parse::<bool>().ok())
+            })
+            .unwrap_or(false);
+
+        let allow_insecure_remote_signer = parsed
+            .signer
+            .allow_insecure_remote_signer
+            .or_else(|| {
+                env::var("ALLOW_INSECURE_REMOTE_SIGNER")
+                    .ok()
+                    .and_then(|v| v.parse::<bool>().ok())
+            })
+            .unwrap_or(false);
+
         let signer = SignerConfig {
             mode: signer_mode,
             key_ref: signer_key_ref.clone(),
-            mnemonic: parsed.signer.mnemonic,
-            allow_local_signer: parsed.signer.allow_local_signer.unwrap_or(false),
-            secret_material_present: false,
+            mnemonic,
+            allow_local_signer,
+            secret_material_present,
             remote_endpoint: parsed.signer.endpoint,
             remote_request_timeout: Duration::from_secs(
                 DEFAULT_SIGNER_REMOTE_REQUEST_TIMEOUT_SECS,
             ),
-            remote_bearer_token: parsed.signer.bearer_token,
-            allow_insecure_remote_signer: parsed
-                .signer
-                .allow_insecure_remote_signer
-                .unwrap_or(false),
+            remote_bearer_token,
+            allow_insecure_remote_signer,
         };
 
         if parsed.tokens.is_empty() {

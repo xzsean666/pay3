@@ -422,3 +422,74 @@ async fn single_token_router_preserves_root_compatibility() {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[test]
+fn yaml_interpolates_env_variables_and_defaults() {
+    unsafe {
+        std::env::set_var("TEST_PAY3_DB_URL", "postgres://user:pass@127.0.0.1:5432/injected_db");
+        std::env::set_var("TEST_PAY3_SIGNER_TOKEN", "injected-secret-vault-token");
+    }
+
+    let yaml = r#"
+server:
+  bind_addr: "127.0.0.1:${TEST_PORT:-8080}"
+database:
+  url: "${TEST_PAY3_DB_URL}"
+signer:
+  mode: "external"
+  key_ref: "master-key"
+  endpoint: "https://vault.internal:8443"
+  bearer_token: "${TEST_PAY3_SIGNER_TOKEN}"
+auth:
+  jwks_url: "https://auth.company.internal/.well-known/jwks.json"
+tokens:
+  - chain_id: 137
+    token_address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
+    treasury_address: "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"
+    rpc_http_urls:
+      - "http://127.0.0.1:8545"
+"#;
+
+    let config = AppConfig::from_yaml_str(yaml).expect("should parse with interpolated env vars");
+    assert_eq!(config.database.url, "postgres://user:pass@127.0.0.1:5432/injected_db");
+    assert_eq!(
+        config.signer.remote_bearer_token.as_deref(),
+        Some("injected-secret-vault-token")
+    );
+    assert_eq!(config.http.bind_addr.port(), 8080);
+}
+
+#[test]
+fn yaml_omitted_secrets_auto_fall_back_to_env() {
+    unsafe {
+        std::env::set_var("DATABASE_URL", "postgres://fallback_user:secret@127.0.0.1:5432/fallback_db");
+        std::env::set_var("SIGNER_REMOTE_BEARER_TOKEN", "fallback-secret-bearer-token");
+    }
+
+    let yaml = r#"
+server:
+  bind_addr: "127.0.0.1:8080"
+# database is completely omitted in YAML!
+signer:
+  mode: "external"
+  key_ref: "master-key"
+  endpoint: "https://vault.internal:8443"
+  # bearer_token is completely omitted in YAML!
+auth:
+  jwks_url: "https://auth.company.internal/.well-known/jwks.json"
+tokens:
+  - chain_id: 137
+    token_address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
+    treasury_address: "0x71C7656EC7ab88b098defB751B7401B5f6d8976F"
+    rpc_http_urls:
+      - "http://127.0.0.1:8545"
+"#;
+
+    let config = AppConfig::from_yaml_str(yaml).expect("should fall back to env vars");
+    assert_eq!(config.database.url, "postgres://fallback_user:secret@127.0.0.1:5432/fallback_db");
+    assert_eq!(
+        config.signer.remote_bearer_token.as_deref(),
+        Some("fallback-secret-bearer-token")
+    );
+}
+

@@ -19,6 +19,7 @@ Thumbs.db
 .env.*
 !.env.example
 !.env.production.example
+!.env.secrets.example
 *.log
 
 # Temporary files

@@ -71,6 +71,7 @@
 ### 创建文件
 - `docs/AI/tasks/TASK-032.md`
 - `pay3.example.yaml`
+- `.env.secrets.example`
 - `tests/multi_token_runtime.rs`
 
 ### 修改文件
@@ -89,8 +90,8 @@
 ## 4. 已运行的验证命令及结果
 
 - `cargo check --all-targets`: **通过**。零错误，零警告。
-- `cargo test --all-targets`: **通过**。全量 236 个测试全部绿色通过。
-- `PAY3_CONFIG_FILE=pay3.example.yaml cargo run --bin pay3 -- --verify-readiness`: **通过**。成功解析 3 个跨链代币配置并验证通过。
+- `cargo test --all-targets`: **通过**。全量 238 个测试全部绿色通过（含 7 项多 Token 与环境变量插值/回退测试）。
+- `DATABASE_URL="..." SIGNER_REMOTE_BEARER_TOKEN="..." PAY3_CONFIG_FILE=pay3.example.yaml cargo run --bin pay3 -- --verify-readiness`: **通过**。机密注入与 3 币矩阵验证全部通过。
 - `bash scripts/verify_production_readiness.sh --env-file .env.production.example`: **通过**。21 checks passed, 0 failed.
 
 ---

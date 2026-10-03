@@ -1,26 +1,26 @@
 # ==============================================================================
 # Pay3 Native Multi-Chain Multi-Token Configuration Template
 # ==============================================================================
-# This YAML orchestration file allows running and managing multiple tokens
-# across one or multiple EVM chains under a single database and unified gateway.
+# 【配置分离与机密安全规范 (Security & Configuration Standard)】:
+#   1. 只有隐私机密信息 (Secrets) 存放在 .env 或容器环境变量：
+#      - DATABASE_URL: PostgreSQL 用户名密码连接串
+#      - SIGNER_REMOTE_BEARER_TOKEN: 外部 KMS / Vault 签名服务鉴权 Token
+#      - (仅非生产/开发环境可选) SIGNER_MNEMONIC / JWT_SECRET
 #
-# Usage:
-#   1. Copy to pay3.yaml (or point via PAY3_CONFIG_FILE=/path/to/pay3.yaml)
-#   2. Run: pay3
+#   2. 其他所有系统拓扑、业务与多链多代币矩阵统一在此 YAML 中声明式编排：
+#      - 服务监听与环境模式 (server: bind_addr, profile, role)
+#      - 认证身份元数据 (auth: issuer, audience, jwks_url)
+#      - 签名器拓扑 (signer: mode, key_ref, endpoint, relayer_base_derivation_path)
+#      - 多链多代币矩阵 (tokens: chain_id, token_address, rpc_http_urls, treasury, etc.)
 #
-# Routing Invariants:
-#   - Root APIs:
-#       GET  /healthz     (Service liveness)
-#       GET  /readyz      (Dependency readiness check)
-#       GET  /metrics     (Prometheus metrics)
-#       GET  /v1/tokens   (List all active token instances and status)
-#   - Token-specific APIs:
-#       POST /{token_address}/v1/orders
-#       GET  /{token_address}/v1/orders/{id}
-#       POST /{token_address}/v1/orders/{id}/verify
-#       POST /{token_address}/v1/collections
-#       GET  /{token_address}/v1/collections/{id}
-#       (Also accessible via /{chain_id}/{token_address}/v1/... for explicit multi-chain routing)
+#   3. 动态环境变量插值与自动回退：
+#      - YAML 中任何字段均支持 `${VAR}` 或 `${VAR:-default}` 动态插值；
+#      - 机密字段（如 database.url、signer.bearer_token）在 YAML 中若直接省略，
+#        系统将自动从对应的标准环境变量（$DATABASE_URL、$SIGNER_REMOTE_BEARER_TOKEN 等）回退注入。
+#
+# 运行方式:
+#   1. 在 .env 中配置机密环境变量 (例如: DATABASE_URL, SIGNER_REMOTE_BEARER_TOKEN)
+#   2. 运行: pay3 (默认自动加载同目录下的 pay3.yaml)
 # ==============================================================================
 
 server:
@@ -28,17 +28,19 @@ server:
   profile: "production"    # "development" | "staging" | "production"
 
 database:
-  url: "postgres://pay3_user:pay3_secure_password@postgres:5432/pay3"
+  # 隐私机密信息：数据库账号密码敏感，推荐通过环境变量注入：
+  # 可直接省略此字段，或显式引用 ${DATABASE_URL}
+  url: "${DATABASE_URL}"
 
 signer:
-  # Master Signer: shared across all tokens.
-  # Production requires "external" | "kms" | "hsm". Local/Fake only permitted in non-production.
+  # Master Signer: 所有代币共享单一 Master Signer / 母私钥
+  # 生产环境强制要求 "external" | "kms" | "hsm" 外部签名机，严禁明文私钥/助记词
   mode: "external"
   key_ref: "master-key"
   endpoint: "https://vault-signer.internal:8443"
-  bearer_token: "signer-vault-token-xyz"
-  # Base derivation path for independent relayer addresses:
-  # Each token auto-allocates: m/44'/60'/99'/0/{index}
+  # 隐私机密信息：Signer Bearer Token 推荐通过环境变量注入：
+  bearer_token: "${SIGNER_REMOTE_BEARER_TOKEN}"
+  # 各代币独立 Relayer 派生基准路径（自动按 m/44'/60'/99'/0/{index} 分配，杜绝 Nonce 竞争）
   relayer_base_derivation_path: "m/44'/60'/99'/0"
 
 auth:
@@ -62,7 +64,7 @@ tokens:
     start_block: 65000000
     min_confirmations: 64
     collection_method: "standard"
-    # Relayer path defaults to m/44'/60'/99'/0/0
+    # Relayer 自动派生地址路径: m/44'/60'/99'/0/0
 
   # ----------------------------------------------------------------------------
   # Token 2: USDC on Arbitrum One (Chain ID 42161)
@@ -81,7 +83,7 @@ tokens:
     collection_method: "eip3009"
     token_name: "USD Coin"
     token_version: "2"
-    # Relayer path defaults to m/44'/60'/99'/0/1
+    # Relayer 自动派生地址路径: m/44'/60'/99'/0/1
 
   # ----------------------------------------------------------------------------
   # Token 3: USDT on BNB Smart Chain (Chain ID 56)
@@ -98,4 +100,4 @@ tokens:
     start_block: 43000000
     min_confirmations: 20
     collection_method: "standard"
-    # Relayer path defaults to m/44'/60'/99'/0/2
+    # Relayer 自动派生地址路径: m/44'/60'/99'/0/2
