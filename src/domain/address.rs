@@ -47,6 +47,10 @@ impl EvmAddress {
     pub fn to_lower_hex(self) -> String {
         encode_lower_prefixed(self.as_bytes())
     }
+
+    pub fn parse_hex(s: &str) -> Result<Self, HexParseError> {
+        s.parse()
+    }
 }
 
 impl FromStr for EvmAddress {

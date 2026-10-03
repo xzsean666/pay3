@@ -603,7 +603,28 @@ async fn collection_strategy_config<S: SignerProvider>(
     config: &AppConfig,
     signer: &S,
 ) -> Result<CollectionStrategyConfig, RuntimeError> {
-    if !config.collection.method.is_gasless() {
+    let has_relayer = config.collection.relayer_key_ref.is_some();
+    let resolution = crate::domain::resolve_optimal_collection_strategy(
+        config.chain.chain_id,
+        config.chain.token_address,
+        &config.chain.token_symbol,
+        has_relayer,
+        config.collection.method,
+        config.collection.token_name.clone(),
+        config.collection.token_version.clone(),
+    );
+
+    tracing::info!(
+        chain_id = config.chain.chain_id,
+        token_address = %config.chain.token_address,
+        token_symbol = %config.chain.token_symbol,
+        configured_method = config.collection.method.as_str(),
+        effective_method = resolution.method.as_str(),
+        reason = resolution.reason,
+        "resolved collection strategy"
+    );
+
+    if !resolution.method.is_gasless() {
         return Ok(CollectionStrategyConfig::Standard);
     }
 
@@ -624,59 +645,27 @@ async fn collection_strategy_config<S: SignerProvider>(
 
     let relayer = RelayerConfig::new(key_ref, derivation_path, address);
 
-    match config.collection.method {
-        crate::domain::CollectionMethod::Standard => Ok(CollectionStrategyConfig::Standard),
-        crate::domain::CollectionMethod::Eip3009 => {
-            let token_name = config
-                .collection
-                .token_name
-                .clone()
-                .unwrap_or_else(|| "USD Coin".to_string());
-            let token_version = config
-                .collection
-                .token_version
-                .clone()
-                .unwrap_or_else(|| "2".to_string());
-            Ok(CollectionStrategyConfig::Eip3009 {
-                token_name,
-                token_version,
-                relayer,
-            })
+    match resolution.method {
+        crate::domain::CollectionMethod::Auto | crate::domain::CollectionMethod::Standard => {
+            Ok(CollectionStrategyConfig::Standard)
         }
+        crate::domain::CollectionMethod::Eip3009 => Ok(CollectionStrategyConfig::Eip3009 {
+            token_name: resolution.token_name,
+            token_version: resolution.token_version,
+            relayer,
+        }),
         crate::domain::CollectionMethod::PolygonMetaTx => {
-            let token_name = config
-                .collection
-                .token_name
-                .clone()
-                .unwrap_or_else(|| "(PoS) Tether USD".to_string());
-            let token_version = config
-                .collection
-                .token_version
-                .clone()
-                .unwrap_or_else(|| "1".to_string());
             Ok(CollectionStrategyConfig::PolygonMetaTx {
-                token_name,
-                token_version,
+                token_name: resolution.token_name,
+                token_version: resolution.token_version,
                 relayer,
             })
         }
-        crate::domain::CollectionMethod::Eip2612 => {
-            let token_name = config
-                .collection
-                .token_name
-                .clone()
-                .unwrap_or_else(|| config.chain.token_symbol.clone());
-            let token_version = config
-                .collection
-                .token_version
-                .clone()
-                .unwrap_or_else(|| "1".to_string());
-            Ok(CollectionStrategyConfig::Eip2612 {
-                token_name,
-                token_version,
-                relayer,
-            })
-        }
+        crate::domain::CollectionMethod::Eip2612 => Ok(CollectionStrategyConfig::Eip2612 {
+            token_name: resolution.token_name,
+            token_version: resolution.token_version,
+            relayer,
+        }),
     }
 }
 

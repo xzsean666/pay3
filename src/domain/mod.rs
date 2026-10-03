@@ -24,6 +24,7 @@ pub use permit::{
     eip2612_struct_hash, eip3009_struct_hash, eip712_digest, eip712_domain_separator,
     encode_eip2612_permit, encode_eip3009_transfer_with_authorization,
     encode_polygon_execute_meta_transaction, polygon_meta_tx_domain_separator,
-    polygon_meta_tx_struct_hash, CollectionMethod, TypedSignature,
+    polygon_meta_tx_struct_hash, resolve_optimal_collection_strategy, CollectionMethod,
+    OptimalStrategyResolution, TypedSignature,
 };
 pub use wallet::{DerivationSegment, DerivationSegmentError, MAX_DERIVATION_INDEX};

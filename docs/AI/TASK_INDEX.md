@@ -62,3 +62,4 @@ TODO -> IN_PROGRESS -> REVIEW -> DONE
 | **TASK-027** | 参考 evm-call 优化多 RPC 连接池 | 并发启动探测、故障快速漂移与按需法定多数，适配公开 RPC 池 | TASK-025, TASK-026 | `DONE` | [TASK-027.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-027.md) |
 | **TASK-028** | 全面审计缺陷修复与生产架构优化 | 修复卡死归集 Gas 底线计算、核验接口租户隔离、Topic 零填充校验及清理 KVDB 遗留 | TASK-027 | `DONE` | [TASK-028.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-028.md) |
 | **TASK-029** | 全功能可插拔免 Gas (Permit / Meta-Tx) 资金归集架构 | 支持 EIP-3009 (原生 USDC)、Polygon MetaTx (USDT) 与 EIP-2612，Relayer 独立代付原生 Gas | TASK-028 | `DONE` | [TASK-029.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-029.md) |
+| **TASK-030** | 智能自动推导与选择最优归集方案 | 支持 `COLLECTION_METHOD=auto`，基于链与代币知识库自适应匹配 EIP-3009/MetaTx/Permit/Standard | TASK-029 | `DONE` | [TASK-030.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-030.md) |

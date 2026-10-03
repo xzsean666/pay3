@@ -6,8 +6,8 @@
 
 ## 1. 当前上下文
 
-- **当前 Goal**: 全功能可插拔免 Gas (Permit / Meta-Tx) 资金归集架构（支持 EIP-3009 原生 USDC、Polygon PoS MetaTx USDT 与 EIP-2612 Permit，由独立 Relayer 钱包代付原生 Gas）
-- **当前 Task**: [TASK-029: 全功能可插拔免 Gas (Permit / Meta-Tx) 资金归集架构](file:///ssd0/git/pay3/docs/AI/tasks/TASK-029.md)
+- **当前 Goal**: 智能自动推导与选择最优归集方案（支持 `COLLECTION_METHOD=auto`，自适应匹配各链 USDT/USDC 的最优免 Gas 方案）
+- **当前 Task**: [TASK-030: 智能自动推导与选择最优归集方案](file:///ssd0/git/pay3/docs/AI/tasks/TASK-030.md)
 - **当前状态**: `DONE`
 
 ---
@@ -93,6 +93,20 @@
     - **运行时装配 (`src/runtime.rs`, `src/config.rs`)**:
       - 环境变量配置解析 `COLLECTION_METHOD`、`COLLECTION_RELAYER_KEY_REF`、`COLLECTION_RELAYER_DERIVATION_PATH`、`COLLECTION_TOKEN_NAME`、`COLLECTION_TOKEN_VERSION`。
       - 启动时自动派生 Relayer 地址并注册进 DB `relayer_addresses` 表。
+16. **完成 TASK-030：智能自动推导与选择最优归集方案 (`COLLECTION_METHOD=auto`)**:
+    - **自适应策略解析器 (`src/domain/permit.rs`)**:
+      - `CollectionMethod` 增加 `Auto` 变体并作为默认配置；
+      - 内置覆盖以太坊、Polygon、Arbitrum、Optimism、Base、Avalanche 等主流 EVM 链的稳定币预置知识库（Preset Matrix）；
+      - 实现 `resolve_optimal_collection_strategy(...)` 决策算法：优先 EIP-3009 > PolygonMetaTx > EIP-2612 > Standard；
+      - 未配置 Relayer 或代币不支持 permit 时平滑安全降级为 `Standard`；
+      - 支持用户自定义 `token_name` 与 `token_version` 参数覆盖。
+    - **配置与运行时集成 (`src/config.rs`, `src/runtime.rs`, `src/domain/address.rs`)**:
+      - `DEFAULT_COLLECTION_METHOD` 设置为 `CollectionMethod::Auto`；
+      - `EvmAddress` 增加 `parse_hex` 解析辅助；
+      - 启动时自动解析决策并打印结构化 trace 日志；
+    - **测试回归**:
+      - 增加 `resolve_optimal_strategy_presets_and_fallbacks` 单元测试，覆盖 11 种典型分支；
+      - 全量 204+ 测试与预检门禁脚本 100% 验证通过。
 
 ---
 
@@ -101,6 +115,7 @@
 ### 创建文件
 - `docs/AI/tasks/TASK-028.md`
 - `docs/AI/tasks/TASK-029.md`
+- `docs/AI/tasks/TASK-030.md`
 - `src/db/migrations/20261003000100_outbound_gas_fees.sql`
 - `src/db/migrations/20261003000200_collection_relayers.sql`
 - `src/domain/permit.rs`
@@ -129,7 +144,7 @@
 ## 4. 已运行的验证命令及结果
 
 - `cargo check --all-targets`: **通过**。零错误，零警告。
-- `cargo test`: **通过**。全量 203+ 个单元测试、契约测试、集成测试全部绿色通过。
+- `cargo test`: **通过**。全量 204+ 个单元测试、契约测试、集成测试全部绿色通过。
 - `bash scripts/verify_production_readiness.sh --env-file .env.production.example`: **通过**。21 checks passed, 0 failed.
 
 ---
@@ -137,21 +152,22 @@
 ## 5. 未解决问题与剩余工作
 
 - **无未解决问题**。
-- `docs/AI/TASK_INDEX.md` 中所有 29 个任务卡（TASK-001 ~ TASK-029）全部处于 `DONE` 状态。
-- USDT/USDC Permit / Meta-Tx 免 Gas 归集闭环完整落地，生产级高可靠运行。
+- `docs/AI/TASK_INDEX.md` 中所有 30 个任务卡（TASK-001 ~ TASK-030）全部处于 `DONE` 状态。
+- 系统已实现完全智能自适应免 Gas 归集（USDC EIP-3009 / Polygon USDT MetaTx / L2 USDT EIP-2612 / Standard 回退）。
 
 ---
 
 ## 6. 下一步任务与读取入口
 
-- **项目状态**: **100% 生产就绪、审计加固与免 Gas 归集扩展完成 (Production Ready, Audited & Permit Enabled)**
+- **项目状态**: **100% 生产就绪、审计加固、免 Gas 归集与自适应最佳策略落地 (Production Ready, Audited & Auto Optimal Sweep)**
 - **读取入口**:
   1. [docs/PRODUCTION_READINESS.md](file:///ssd0/git/pay3/docs/PRODUCTION_READINESS.md) (生产验收结论与上线命令)
   2. [docs/RUNBOOK.md](file:///ssd0/git/pay3/docs/RUNBOOK.md) (故障排查与运维指南)
   3. [docs/DEPLOYMENT.md](file:///ssd0/git/pay3/docs/DEPLOYMENT.md) (生产部署架构)
   4. [docs/AI/ARCHITECTURE.md](file:///ssd0/git/pay3/docs/AI/ARCHITECTURE.md) (系统架构)
   5. [docs/AI/TASK_INDEX.md](file:///ssd0/git/pay3/docs/AI/TASK_INDEX.md) (全量任务卡索引)
-  6. [docs/AI/tasks/TASK-029.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-029.md) (免 Gas 归集方案实现卡)
+  6. [docs/AI/tasks/TASK-030.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-030.md) (自适应最优归集方案卡)
+
 
 
 

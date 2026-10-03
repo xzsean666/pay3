@@ -11,9 +11,13 @@ use crate::domain::{EvmAddress, RawAmount};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CollectionMethod {
+    /// Automatically resolve the best collection strategy based on the chain ID,
+    /// token address/symbol, and whether a relayer is configured.
+    #[default]
+    Auto,
+
     /// Standard ERC-20 `transfer(treasury, amount)`.
     /// Sent directly by the child address, requiring native gas on child address.
-    #[default]
     Standard,
 
     /// EIP-3009 `transferWithAuthorization(from, to, value, validAfter, validBefore, nonce, v, r, s)`.
@@ -33,11 +37,12 @@ pub enum CollectionMethod {
 
 impl CollectionMethod {
     pub const fn is_gasless(self) -> bool {
-        !matches!(self, Self::Standard)
+        matches!(self, Self::Eip3009 | Self::PolygonMetaTx | Self::Eip2612)
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Auto => "auto",
             Self::Standard => "standard",
             Self::Eip3009 => "eip3009",
             Self::PolygonMetaTx => "polygon_meta_tx",
@@ -47,14 +52,266 @@ impl CollectionMethod {
 
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "auto" | "default" | "optimal" => Ok(Self::Auto),
             "standard" | "direct" | "erc20" => Ok(Self::Standard),
             "eip3009" | "eip_3009" | "usdc" => Ok(Self::Eip3009),
             "polygon_meta_tx" | "polygon" | "meta_tx" | "pos_meta_tx" => Ok(Self::PolygonMetaTx),
             "eip2612" | "eip_2612" | "permit" => Ok(Self::Eip2612),
             _ => Err(format!(
-                "expected one of standard, eip3009, polygon_meta_tx, eip2612; got '{value}'"
+                "expected one of auto, standard, eip3009, polygon_meta_tx, eip2612; got '{value}'"
             )),
         }
+    }
+}
+
+/// Resolved optimal collection strategy outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OptimalStrategyResolution {
+    pub method: CollectionMethod,
+    pub token_name: String,
+    pub token_version: String,
+    pub reason: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PresetTokenInfo {
+    method: CollectionMethod,
+    token_name: &'static str,
+    token_version: &'static str,
+    reason: &'static str,
+}
+
+fn lookup_preset_or_heuristic(
+    chain_id: u64,
+    token_address: EvmAddress,
+    token_symbol: &str,
+) -> PresetTokenInfo {
+    let addr_lower = token_address.to_lower_hex();
+
+    // 1. Exact preset matching by (chain_id, token_address)
+    let preset = match (chain_id, addr_lower.as_str()) {
+        // Ethereum Mainnet (1)
+        (1, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip3009,
+            token_name: "USD Coin",
+            token_version: "2",
+            reason: "Ethereum Mainnet Native USDC supports EIP-3009 transferWithAuthorization",
+        }),
+        (1, "0xdac17f958d2ee523a2206206994597c13d831ec7") => Some(PresetTokenInfo {
+            method: CollectionMethod::Standard,
+            token_name: "Tether USD",
+            token_version: "1",
+            reason: "Ethereum Mainnet legacy USDT lacks permit/meta-tx support, falling back to standard transfer",
+        }),
+        (1, "0x6b175474e89094c44da98b954eedeac495271d0f") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip2612,
+            token_name: "Dai Stablecoin",
+            token_version: "1",
+            reason: "Ethereum Mainnet DAI supports EIP-2612 permit",
+        }),
+
+        // Polygon PoS (137)
+        (137, "0xc2132d05d31c914a87c6611c10748aeb04b58e8f") => Some(PresetTokenInfo {
+            method: CollectionMethod::PolygonMetaTx,
+            token_name: "(PoS) Tether USD",
+            token_version: "1",
+            reason: "Polygon PoS Native USDT supports executeMetaTransaction",
+        }),
+        (137, "0x3c499c542cef5e3811e1192ce70d8cc03d5c3359") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip3009,
+            token_name: "USD Coin",
+            token_version: "2",
+            reason: "Polygon PoS Native USDC supports EIP-3009 transferWithAuthorization",
+        }),
+        (137, "0x2791bca1f2de4661ed88a30c99a7a9449aa84174") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip3009,
+            token_name: "USD Coin (PoS)",
+            token_version: "1",
+            reason: "Polygon PoS Bridged USDC.e supports EIP-3009 transferWithAuthorization",
+        }),
+        (137, "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip2612,
+            token_name: "(PoS) Dai Stablecoin",
+            token_version: "1",
+            reason: "Polygon PoS DAI supports EIP-2612 permit",
+        }),
+
+        // Arbitrum One (42161)
+        (42161, "0xaf88d065e77c8cc2239327c5edb3a432268e5831") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip3009,
+            token_name: "USD Coin",
+            token_version: "2",
+            reason: "Arbitrum One Native USDC supports EIP-3009 transferWithAuthorization",
+        }),
+        (42161, "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip2612,
+            token_name: "Tether USD",
+            token_version: "1",
+            reason: "Arbitrum One Native USDT supports EIP-2612 permit",
+        }),
+        (42161, "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8") => Some(PresetTokenInfo {
+            method: CollectionMethod::Standard,
+            token_name: "Bridged USDC",
+            token_version: "1",
+            reason: "Arbitrum One legacy USDC.e lacks permit support, falling back to standard transfer",
+        }),
+
+        // Optimism (10)
+        (10, "0x0b2c639c533813f4aa9d7837caf62653d097ff85") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip3009,
+            token_name: "USD Coin",
+            token_version: "2",
+            reason: "Optimism Native USDC supports EIP-3009 transferWithAuthorization",
+        }),
+        (10, "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip2612,
+            token_name: "Tether USD",
+            token_version: "1",
+            reason: "Optimism Native USDT supports EIP-2612 permit",
+        }),
+
+        // Base (8453)
+        (8453, "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip3009,
+            token_name: "USD Coin",
+            token_version: "2",
+            reason: "Base Native USDC supports EIP-3009 transferWithAuthorization",
+        }),
+
+        // Avalanche C-Chain (43114)
+        (43114, "0xb97ef9ef8734c71904d8002f8b6bc66dd9c48a6e") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip3009,
+            token_name: "USD Coin",
+            token_version: "2",
+            reason: "Avalanche Native USDC supports EIP-3009 transferWithAuthorization",
+        }),
+        (43114, "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7") => Some(PresetTokenInfo {
+            method: CollectionMethod::Eip2612,
+            token_name: "Tether USDt",
+            token_version: "1",
+            reason: "Avalanche Native USDT supports EIP-2612 permit",
+        }),
+
+        // BNB Smart Chain (56)
+        (56, "0x55d398326f99059ff775485246999027b3197955") => Some(PresetTokenInfo {
+            method: CollectionMethod::Standard,
+            token_name: "Tether USD",
+            token_version: "1",
+            reason: "BNB Smart Chain BEP-20 USDT lacks native permit, falling back to standard transfer",
+        }),
+        (56, "0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d") => Some(PresetTokenInfo {
+            method: CollectionMethod::Standard,
+            token_name: "Binance-Peg USD Coin",
+            token_version: "1",
+            reason: "BNB Smart Chain BEP-20 USDC lacks native permit, falling back to standard transfer",
+        }),
+
+        _ => None,
+    };
+
+    if let Some(info) = preset {
+        return info;
+    }
+
+    // 2. Heuristic fallback based on token symbol
+    let sym = token_symbol.trim();
+    if sym.eq_ignore_ascii_case("USDC") || sym.eq_ignore_ascii_case("USDC.e") {
+        if chain_id == 56 {
+            PresetTokenInfo {
+                method: CollectionMethod::Standard,
+                token_name: "Binance-Peg USD Coin",
+                token_version: "1",
+                reason: "BNB Smart Chain USDC lacks native permit, falling back to standard transfer",
+            }
+        } else {
+            PresetTokenInfo {
+                method: CollectionMethod::Eip3009,
+                token_name: "USD Coin",
+                token_version: "2",
+                reason: "Symbol matches Circle Native USDC standard, auto-selecting EIP-3009",
+            }
+        }
+    } else if sym.eq_ignore_ascii_case("USDT") {
+        if chain_id == 137 {
+            PresetTokenInfo {
+                method: CollectionMethod::PolygonMetaTx,
+                token_name: "(PoS) Tether USD",
+                token_version: "1",
+                reason: "Polygon PoS USDT matches NativeMetaTransaction, auto-selecting PolygonMetaTx",
+            }
+        } else if chain_id == 42161 || chain_id == 10 || chain_id == 43114 {
+            PresetTokenInfo {
+                method: CollectionMethod::Eip2612,
+                token_name: "Tether USD",
+                token_version: "1",
+                reason: "L2/Alt-L1 USDT matches EIP-2612 permit standard, auto-selecting Eip2612",
+            }
+        } else {
+            PresetTokenInfo {
+                method: CollectionMethod::Standard,
+                token_name: "Tether USD",
+                token_version: "1",
+                reason: "Token lacks confirmed permit standard on this chain, falling back to standard transfer",
+            }
+        }
+    } else {
+        PresetTokenInfo {
+            method: CollectionMethod::Standard,
+            token_name: "ERC20",
+            token_version: "1",
+            reason: "Unrecognized token without permit configuration, safely falling back to standard transfer",
+        }
+    }
+}
+
+/// Resolves the optimal collection strategy based on the chain, token, relayer status,
+/// and configured preferences.
+pub fn resolve_optimal_collection_strategy(
+    chain_id: u64,
+    token_address: EvmAddress,
+    token_symbol: &str,
+    has_relayer: bool,
+    configured_method: CollectionMethod,
+    custom_token_name: Option<String>,
+    custom_token_version: Option<String>,
+) -> OptimalStrategyResolution {
+    let preset = lookup_preset_or_heuristic(chain_id, token_address, token_symbol);
+
+    let (effective_method, reason) = match configured_method {
+        CollectionMethod::Auto => {
+            if !has_relayer {
+                (
+                    CollectionMethod::Standard,
+                    "No relayer configured for gasless collection, using standard transfer",
+                )
+            } else {
+                (preset.method, preset.reason)
+            }
+        }
+        explicit => {
+            let reason = match explicit {
+                CollectionMethod::Auto => unreachable!(),
+                CollectionMethod::Standard => "Explicitly configured to standard transfer",
+                CollectionMethod::Eip3009 => {
+                    "Explicitly configured to EIP-3009 transferWithAuthorization"
+                }
+                CollectionMethod::PolygonMetaTx => {
+                    "Explicitly configured to Polygon executeMetaTransaction"
+                }
+                CollectionMethod::Eip2612 => "Explicitly configured to EIP-2612 permit",
+            };
+            (explicit, reason)
+        }
+    };
+
+    let token_name = custom_token_name.unwrap_or_else(|| preset.token_name.to_string());
+    let token_version = custom_token_version.unwrap_or_else(|| preset.token_version.to_string());
+
+    OptimalStrategyResolution {
+        method: effective_method,
+        token_name,
+        token_version,
+        reason,
     }
 }
 
@@ -509,4 +766,163 @@ mod tests {
         assert_eq!(&calldata[4 + 32 * 5..4 + 32 * 6], &[0x77; 32]); // r
         assert_eq!(&calldata[4 + 32 * 6..4 + 32 * 7], &[0x88; 32]); // s
     }
+
+    #[test]
+    fn resolve_optimal_strategy_presets_and_fallbacks() {
+        let usdc_eth =
+            EvmAddress::parse_hex("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap();
+        let usdt_eth =
+            EvmAddress::parse_hex("0xdac17f958d2ee523a2206206994597c13d831ec7").unwrap();
+        let usdt_poly =
+            EvmAddress::parse_hex("0xc2132d05d31c914a87c6611c10748aeb04b58e8f").unwrap();
+        let usdc_poly =
+            EvmAddress::parse_hex("0x3c499c542cef5e3811e1192ce70d8cc03d5c3359").unwrap();
+        let usdt_arb =
+            EvmAddress::parse_hex("0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9").unwrap();
+        let usdc_arb =
+            EvmAddress::parse_hex("0xaf88d065e77c8cc2239327c5edb3a432268e5831").unwrap();
+        let usdt_op =
+            EvmAddress::parse_hex("0x94b008aa00579c1307b0ef2c499ad98a8ce58e58").unwrap();
+        let usdt_bsc =
+            EvmAddress::parse_hex("0x55d398326f99059ff775485246999027b3197955").unwrap();
+
+        // 1. USDC on Ethereum -> Eip3009
+        let res = resolve_optimal_collection_strategy(
+            1,
+            usdc_eth,
+            "USDC",
+            true,
+            CollectionMethod::Auto,
+            None,
+            None,
+        );
+        assert_eq!(res.method, CollectionMethod::Eip3009);
+        assert_eq!(res.token_name, "USD Coin");
+        assert_eq!(res.token_version, "2");
+
+        // 2. USDT on Ethereum -> Standard (lacks permit)
+        let res = resolve_optimal_collection_strategy(
+            1,
+            usdt_eth,
+            "USDT",
+            true,
+            CollectionMethod::Auto,
+            None,
+            None,
+        );
+        assert_eq!(res.method, CollectionMethod::Standard);
+
+        // 3. USDT on Polygon -> PolygonMetaTx
+        let res = resolve_optimal_collection_strategy(
+            137,
+            usdt_poly,
+            "USDT",
+            true,
+            CollectionMethod::Auto,
+            None,
+            None,
+        );
+        assert_eq!(res.method, CollectionMethod::PolygonMetaTx);
+        assert_eq!(res.token_name, "(PoS) Tether USD");
+        assert_eq!(res.token_version, "1");
+
+        // 4. USDC on Polygon -> Eip3009
+        let res = resolve_optimal_collection_strategy(
+            137,
+            usdc_poly,
+            "USDC",
+            true,
+            CollectionMethod::Auto,
+            None,
+            None,
+        );
+        assert_eq!(res.method, CollectionMethod::Eip3009);
+
+        // 5. USDT on Arbitrum -> Eip2612
+        let res = resolve_optimal_collection_strategy(
+            42161,
+            usdt_arb,
+            "USDT",
+            true,
+            CollectionMethod::Auto,
+            None,
+            None,
+        );
+        assert_eq!(res.method, CollectionMethod::Eip2612);
+
+        // 6. USDC on Arbitrum -> Eip3009
+        let res = resolve_optimal_collection_strategy(
+            42161,
+            usdc_arb,
+            "USDC",
+            true,
+            CollectionMethod::Auto,
+            None,
+            None,
+        );
+        assert_eq!(res.method, CollectionMethod::Eip3009);
+
+        // 7. USDT on Optimism -> Eip2612
+        let res = resolve_optimal_collection_strategy(
+            10,
+            usdt_op,
+            "USDT",
+            true,
+            CollectionMethod::Auto,
+            None,
+            None,
+        );
+        assert_eq!(res.method, CollectionMethod::Eip2612);
+
+        // 8. USDT on BSC -> Standard
+        let res = resolve_optimal_collection_strategy(
+            56,
+            usdt_bsc,
+            "USDT",
+            true,
+            CollectionMethod::Auto,
+            None,
+            None,
+        );
+        assert_eq!(res.method, CollectionMethod::Standard);
+
+        // 9. When relayer is NOT configured -> falls back to Standard
+        let res = resolve_optimal_collection_strategy(
+            137,
+            usdt_poly,
+            "USDT",
+            false,
+            CollectionMethod::Auto,
+            None,
+            None,
+        );
+        assert_eq!(res.method, CollectionMethod::Standard);
+
+        // 10. Explicit configuration override
+        let res = resolve_optimal_collection_strategy(
+            137,
+            usdt_poly,
+            "USDT",
+            true,
+            CollectionMethod::Standard,
+            None,
+            None,
+        );
+        assert_eq!(res.method, CollectionMethod::Standard);
+
+        // 11. Custom token_name / version override
+        let res = resolve_optimal_collection_strategy(
+            137,
+            usdt_poly,
+            "USDT",
+            true,
+            CollectionMethod::Auto,
+            Some("Custom USDT".to_string()),
+            Some("99".to_string()),
+        );
+        assert_eq!(res.method, CollectionMethod::PolygonMetaTx);
+        assert_eq!(res.token_name, "Custom USDT");
+        assert_eq!(res.token_version, "99");
+    }
 }
+

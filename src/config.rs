@@ -297,7 +297,7 @@ impl Default for CollectionConfig {
             max_priority_fee_per_gas_wei: RawAmount::from(
                 DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI,
             ),
-            method: CollectionMethod::Standard,
+            method: CollectionMethod::Auto,
             relayer_key_ref: None,
             relayer_derivation_path: DEFAULT_COLLECTION_RELAYER_DERIVATION_PATH.to_string(),
             token_name: None,
