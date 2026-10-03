@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -708,16 +708,16 @@ impl TransferLogSource for RpcRangeSource {
             parsed_logs.push(parsed);
         }
 
-        let mut headers = BTreeMap::new();
-        for block_number in parsed_logs.iter().map(|log| log.block_number) {
-            if headers.contains_key(&block_number) {
-                continue;
-            }
-            headers.insert(
-                block_number,
-                self.manager.block_by_number(block_number).await?,
-            );
-        }
+        let unique_block_numbers: BTreeSet<u64> =
+            parsed_logs.iter().map(|log| log.block_number).collect();
+        let fetches = unique_block_numbers.into_iter().map(|block_number| async move {
+            let header = self.manager.block_by_number(block_number).await?;
+            Ok::<_, ChainError>((block_number, header))
+        });
+        let headers: BTreeMap<u64, _> = futures_util::future::try_join_all(fetches)
+            .await?
+            .into_iter()
+            .collect();
 
         let mut logs = Vec::with_capacity(parsed_logs.len());
         for parsed in parsed_logs {
@@ -1045,11 +1045,20 @@ fn is_transient_receipt_lookup_error(error: &ChainError) -> bool {
 }
 
 fn transfer_filter(range: TransferLogRange) -> Value {
+    let mut topics = vec![json!(ERC20_TRANSFER_TOPIC)];
+    if let Some(recipient) = range.recipient {
+        let recipient_padded = format!(
+            "0x000000000000000000000000{}",
+            recipient.to_lower_hex().trim_start_matches("0x")
+        );
+        topics.push(Value::Null);
+        topics.push(json!(recipient_padded));
+    }
     json!([{
         "address": range.token_address.to_string(),
         "fromBlock": quantity_hex(range.from_block),
         "toBlock": quantity_hex(range.to_block),
-        "topics": [ERC20_TRANSFER_TOPIC],
+        "topics": topics,
     }])
 }
 

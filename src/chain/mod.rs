@@ -145,6 +145,7 @@ pub struct TransferLogRange {
     pub token_address: EvmAddress,
     pub from_block: u64,
     pub to_block: u64,
+    pub recipient: Option<EvmAddress>,
 }
 
 impl TransferLogRange {
@@ -159,7 +160,13 @@ impl TransferLogRange {
             token_address,
             from_block,
             to_block,
+            recipient: None,
         }
+    }
+
+    pub const fn with_recipient(mut self, recipient: EvmAddress) -> Self {
+        self.recipient = Some(recipient);
+        self
     }
 
     pub fn validate(self) -> Result<(), ChainError> {
@@ -576,6 +583,7 @@ impl TransferLogSource for FakeErc20ChainClient {
                     && log.token_address == range.token_address
                     && log.block.number >= range.from_block
                     && log.block.number <= range.to_block
+                    && range.recipient.is_none_or(|recipient| log.to_address == recipient)
                     && canonical_blocks.get(&log.block.number) == Some(&log.block.hash)
             })
             .cloned()

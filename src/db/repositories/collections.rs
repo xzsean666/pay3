@@ -60,6 +60,8 @@ pub trait CollectionRepository: Send + Sync {
     async fn claim_collection_job(
         &self,
         worker_id: &str,
+        chain_id: u64,
+        token_address: EvmAddress,
     ) -> Result<Option<CollectionJob>, RepositoryError>;
 
     async fn attach_outbound_tx(
@@ -204,14 +206,20 @@ impl CollectionRepository for PgCollectionRepository {
     async fn claim_collection_job(
         &self,
         worker_id: &str,
+        chain_id: u64,
+        token_address: EvmAddress,
     ) -> Result<Option<CollectionJob>, RepositoryError> {
         let lease_seconds = u64_to_i64(self.claim_lease_seconds, "claim_lease_seconds")?;
+        let chain_id_i64 = u64_to_i64(chain_id, "chain_id")?;
+        let token_address_hex = token_address.to_lower_hex();
         let sql = format!(
             r#"
             WITH next_collection AS (
                 SELECT id AS collection_id
                 FROM collections
                 WHERE status = 'queued'
+                  AND chain_id = $3
+                  AND token_address = $4
                   AND (locked_until IS NULL OR locked_until <= now())
                 ORDER BY created_at, id
                 FOR UPDATE SKIP LOCKED
@@ -232,6 +240,8 @@ impl CollectionRepository for PgCollectionRepository {
         let row = sqlx::query(&sql)
             .bind(worker_id)
             .bind(lease_seconds)
+            .bind(chain_id_i64)
+            .bind(&token_address_hex)
             .fetch_optional(&mut *tx)
             .await?;
 

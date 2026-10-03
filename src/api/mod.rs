@@ -3,8 +3,11 @@ mod verify_service;
 
 use std::{
     env,
-    sync::{Arc, Mutex},
-    time::{Duration as StdDuration, Instant},
+    sync::{
+        Arc,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
+    time::Instant,
 };
 
 use async_trait::async_trait;
@@ -163,23 +166,17 @@ impl ApiState {
 #[derive(Debug)]
 pub(crate) struct FixedWindowRateLimiter {
     limit_per_minute: u32,
-    state: Mutex<FixedWindowState>,
-}
-
-#[derive(Debug)]
-struct FixedWindowState {
-    window_started_at: Instant,
-    used: u32,
+    current_window_minute: AtomicU64,
+    counter: AtomicU32,
 }
 
 impl FixedWindowRateLimiter {
     fn per_minute(limit_per_minute: u32) -> Self {
+        let current_minute = current_unix_minute();
         Self {
             limit_per_minute,
-            state: Mutex::new(FixedWindowState {
-                window_started_at: Instant::now(),
-                used: 0,
-            }),
+            current_window_minute: AtomicU64::new(current_minute),
+            counter: AtomicU32::new(0),
         }
     }
 
@@ -196,23 +193,40 @@ impl FixedWindowRateLimiter {
             return false;
         }
 
-        let mut state = self.state.lock().expect("api rate limiter mutex poisoned");
-        if state.window_started_at.elapsed() >= StdDuration::from_secs(60) {
-            state.window_started_at = Instant::now();
-            state.used = 0;
-        }
+        let now_minute = current_unix_minute();
+        loop {
+            let cur = self.current_window_minute.load(Ordering::Acquire);
+            if cur != now_minute {
+                if self
+                    .current_window_minute
+                    .compare_exchange_weak(cur, now_minute, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    self.counter.store(1, Ordering::Release);
+                    return true;
+                }
+                continue;
+            }
 
-        if state.used >= self.limit_per_minute {
-            return false;
+            let prev = self.counter.fetch_add(1, Ordering::AcqRel);
+            if self.current_window_minute.load(Ordering::Acquire) != now_minute {
+                continue;
+            }
+            return prev < self.limit_per_minute;
         }
-
-        state.used = state.used.saturating_add(1);
-        true
     }
 
     fn limit_per_minute(&self) -> u32 {
         self.limit_per_minute
     }
+}
+
+fn current_unix_minute() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 60
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1170,7 +1184,10 @@ fn order_service_error_to_api(error: OrderServiceError) -> ApiError {
         OrderServiceError::ChainHeadUnavailable { .. } => {
             ApiError::service_unavailable("chain_head_unavailable", error.to_string())
         }
-        _ => ApiError::internal(error.to_string()),
+        other => {
+            tracing::error!(error = %other, "internal order service error");
+            ApiError::internal("internal server error")
+        }
     }
 }
 
@@ -1202,8 +1219,17 @@ fn collection_service_error_to_api(error: CollectionServiceError) -> ApiError {
         | CollectionServiceError::GasFunding(_) => {
             ApiError::service_unavailable("collection_dependency_unavailable", message)
         }
-        _ => ApiError::internal(message),
+        other => {
+            tracing::error!(error = %other, "internal collection service error");
+            ApiError::internal("internal server error")
+        }
     }
+}
+
+pub fn order_service_error_to_api_for_test(
+    error: crate::services::orders::OrderServiceError,
+) -> ApiError {
+    order_service_error_to_api(error)
 }
 
 fn json_rejection(rejection: JsonRejection) -> ApiError {

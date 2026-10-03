@@ -65,3 +65,5 @@ TODO -> IN_PROGRESS -> REVIEW -> DONE
 | **TASK-030** | 智能自动推导与选择最优归集方案 | 支持 `COLLECTION_METHOD=auto`，基于链与代币知识库自适应匹配 EIP-3009/MetaTx/Permit/Standard | TASK-029 | `DONE` | [TASK-030.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-030.md) |
 | **TASK-031** | 链上 RPC 动态探查器与自适应代币元数据提取 | 运行时通过只读 eth_call 探查未登记代币的 EIP-3009/MetaTx/Permit 特征并读取 name/version | TASK-030 | `DONE` | [TASK-031.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-031.md) |
 | **TASK-032** | 原生多链多 Token 统一调度引擎 | 单库单私钥下支持 YAML 编排多 Token 矩阵、独立 RPC/Worker 隔离、动态 Axum 路由分发 | TASK-031 | `DONE` | [TASK-032.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-032.md) |
+| **TASK-033** | 全面安全审计缺陷修复与高并发性能优化 | EIP-2612 安全回退、多链 Worker 强隔离、Reorg 自动自愈、精准日志过滤、全表扫描索引补齐与并发优化 | TASK-032 | `DONE` | [TASK-033.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-033.md) |
+

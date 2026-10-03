@@ -230,6 +230,7 @@ pub struct JwtVerifier {
     audience: String,
     state: Arc<RwLock<JwksState>>,
     remote: Option<Arc<RemoteJwksClient>>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
     leeway_seconds: u64,
 }
 
@@ -276,6 +277,7 @@ impl JwtVerifier {
                 StdDuration::from_secs(86400 * 365 * 10),
             ))),
             remote: None,
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             leeway_seconds: 0,
         })
     }
@@ -334,6 +336,7 @@ impl JwtVerifier {
                 StdDuration::from_secs(86400 * 365 * 10),
             ))),
             remote: None,
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             leeway_seconds: 0,
         })
     }
@@ -359,6 +362,7 @@ impl JwtVerifier {
             audience: audience.into(),
             state: Arc::new(RwLock::new(JwksState::new(keys, ttl))),
             remote: Some(Arc::new(client)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             leeway_seconds: 0,
         })
     }
@@ -409,6 +413,18 @@ impl JwtVerifier {
         };
 
         if !needs_fetch {
+            return Ok(());
+        }
+
+        let _lock = self.refresh_lock.lock().await;
+
+        let still_needs_fetch = {
+            let guard = self.state.read().unwrap();
+            let kid_missing = target_kid.is_some_and(|k| !guard.keys.contains_key(k));
+            (guard.is_expired() || kid_missing) && guard.can_refresh(remote.config.refresh_cooldown)
+        };
+
+        if !still_needs_fetch {
             return Ok(());
         }
 

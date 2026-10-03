@@ -104,6 +104,10 @@ impl ApiError {
     pub fn code(&self) -> &str {
         &self.code
     }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl IntoResponse for ApiError {

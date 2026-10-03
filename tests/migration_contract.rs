@@ -15,6 +15,8 @@ const OUTBOUND_GAS_FEES: &str =
     include_str!("../src/db/migrations/20261003000100_outbound_gas_fees.sql");
 const COLLECTION_RELAYERS: &str =
     include_str!("../src/db/migrations/20261003000200_collection_relayers.sql");
+const PERFORMANCE_AUDIT_INDEXES: &str =
+    include_str!("../src/db/migrations/20261003000300_performance_audit_indexes.sql");
 
 #[test]
 fn migrator_embeds_initial_schema() {
@@ -31,10 +33,12 @@ fn migrator_embeds_initial_schema() {
             20260507000300,
             20260622000100,
             20261003000100,
-            20261003000200
+            20261003000200,
+            20261003000300
         ]
     );
 }
+
 
 #[test]
 fn initial_schema_contains_required_tables() {
@@ -194,6 +198,25 @@ fn collection_relayers_migration_adds_relayer_table_and_updates_trigger() {
         );
     }
 }
+
+#[test]
+fn performance_audit_indexes_migration_adds_query_indexes() {
+    for fragment in [
+        "idx_orders_pending_expires_at",
+        "WHERE status IN ('pending', 'partial')",
+        "idx_collections_outbound_tx_id",
+        "WHERE outbound_tx_id IS NOT NULL",
+        "idx_payments_observed_candidates",
+        "WHERE chain_status = 'observed'",
+        "idx_collections_multi_token_claim",
+    ] {
+        assert!(
+            PERFORMANCE_AUDIT_INDEXES.contains(fragment),
+            "missing {fragment}"
+        );
+    }
+}
+
 
 #[test]
 fn initial_schema_does_not_store_raw_chain_logs_in_postgres() {

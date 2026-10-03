@@ -73,11 +73,15 @@ pub trait OutboundRepository: Send + Sync {
     async fn claim_signed_collect_tx_for_broadcast(
         &self,
         worker_id: &str,
+        chain_id: u64,
+        token_address: EvmAddress,
     ) -> Result<Option<BroadcastableOutboundTx>, RepositoryError>;
 
     async fn claim_broadcast_collect_tx_for_receipt(
         &self,
         worker_id: &str,
+        chain_id: u64,
+        token_address: EvmAddress,
     ) -> Result<Option<ReceiptCheckableOutboundTx>, RepositoryError>;
 
     async fn mark_broadcast(&self, tx_id: Uuid) -> Result<OutboundTxRecord, RepositoryError>;
@@ -291,8 +295,12 @@ impl OutboundRepository for PgOutboundRepository {
     async fn claim_signed_collect_tx_for_broadcast(
         &self,
         worker_id: &str,
+        chain_id: u64,
+        token_address: EvmAddress,
     ) -> Result<Option<BroadcastableOutboundTx>, RepositoryError> {
         let lease_seconds = u64_to_i64(self.claim_lease_seconds, "claim_lease_seconds")?;
+        let chain_id_i64 = u64_to_i64(chain_id, "chain_id")?;
+        let token_address_hex = token_address.to_lower_hex();
         let sql = r#"
             WITH next_outbound AS (
                 SELECT c.id AS collection_id,
@@ -302,6 +310,8 @@ impl OutboundRepository for PgOutboundRepository {
                   ON o.id = c.outbound_tx_id
                 WHERE c.status = 'transferring'
                   AND o.status = 'signed'
+                  AND c.chain_id = $3
+                  AND c.token_address = $4
                   AND (c.locked_until IS NULL OR c.locked_until <= now())
                 ORDER BY c.updated_at, c.id
                 FOR UPDATE OF c SKIP LOCKED
@@ -344,6 +354,8 @@ impl OutboundRepository for PgOutboundRepository {
         let row = sqlx::query(sql)
             .bind(worker_id)
             .bind(lease_seconds)
+            .bind(chain_id_i64)
+            .bind(&token_address_hex)
             .fetch_optional(&self.pool)
             .await?;
 
@@ -359,8 +371,12 @@ impl OutboundRepository for PgOutboundRepository {
     async fn claim_broadcast_collect_tx_for_receipt(
         &self,
         worker_id: &str,
+        chain_id: u64,
+        token_address: EvmAddress,
     ) -> Result<Option<ReceiptCheckableOutboundTx>, RepositoryError> {
         let lease_seconds = u64_to_i64(self.claim_lease_seconds, "claim_lease_seconds")?;
+        let chain_id_i64 = u64_to_i64(chain_id, "chain_id")?;
+        let token_address_hex = token_address.to_lower_hex();
         let sql = r#"
             WITH next_outbound AS (
                 SELECT c.id AS collection_id,
@@ -370,6 +386,8 @@ impl OutboundRepository for PgOutboundRepository {
                   ON o.id = c.outbound_tx_id
                 WHERE c.status = 'confirming'
                   AND o.status = 'broadcast'
+                  AND c.chain_id = $3
+                  AND c.token_address = $4
                   AND (c.locked_until IS NULL OR c.locked_until <= now())
                 ORDER BY c.updated_at, c.id
                 FOR UPDATE OF c SKIP LOCKED
@@ -412,6 +430,8 @@ impl OutboundRepository for PgOutboundRepository {
         let row = sqlx::query(sql)
             .bind(worker_id)
             .bind(lease_seconds)
+            .bind(chain_id_i64)
+            .bind(&token_address_hex)
             .fetch_optional(&self.pool)
             .await?;
 
@@ -423,6 +443,7 @@ impl OutboundRepository for PgOutboundRepository {
         })
         .transpose()
     }
+
 
     async fn mark_broadcast(&self, tx_id: Uuid) -> Result<OutboundTxRecord, RepositoryError> {
         let mut tx = self.pool.begin().await?;

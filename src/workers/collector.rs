@@ -14,7 +14,7 @@ use crate::{
         BroadcastableOutboundTx, OutboundRepository, OutboundTxRecord, ReceiptCheckableOutboundTx,
         RepositoryError,
     },
-    domain::TxHash,
+    domain::{EvmAddress, TxHash},
     health::{MetricsRecorder, WorkerName},
     services::{
         collections::{CollectionService, CollectionServiceError, PrepareCollectionJobOutcome},
@@ -25,6 +25,8 @@ use crate::{
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollectionCollectorConfig {
     pub worker_id: String,
+    pub chain_id: u64,
+    pub token_address: EvmAddress,
     pub replacement_stuck_after: Duration,
     pub min_confirmations: u64,
 }
@@ -33,9 +35,17 @@ impl CollectionCollectorConfig {
     pub fn new(worker_id: impl Into<String>) -> Self {
         Self {
             worker_id: worker_id.into(),
+            chain_id: 0,
+            token_address: EvmAddress::from_bytes([0u8; 20]),
             replacement_stuck_after: Duration::ZERO,
             min_confirmations: 0,
         }
+    }
+
+    pub fn with_chain(mut self, chain_id: u64, token_address: EvmAddress) -> Self {
+        self.chain_id = chain_id;
+        self.token_address = token_address;
+        self
     }
 
     pub fn with_replacement_stuck_after(mut self, replacement_stuck_after: Duration) -> Self {
@@ -263,7 +273,11 @@ where
 
         if let Some(recoverable) = self
             .outbound
-            .claim_signed_collect_tx_for_broadcast(worker_id)
+            .claim_signed_collect_tx_for_broadcast(
+                worker_id,
+                self.config.chain_id,
+                self.config.token_address,
+            )
             .await?
         {
             return self.broadcast_outbound(recoverable).await;
@@ -271,7 +285,11 @@ where
 
         if let Some(receipt_checkable) = self
             .outbound
-            .claim_broadcast_collect_tx_for_receipt(worker_id)
+            .claim_broadcast_collect_tx_for_receipt(
+                worker_id,
+                self.config.chain_id,
+                self.config.token_address,
+            )
             .await?
         {
             return self
@@ -1118,6 +1136,8 @@ mod tests {
         async fn claim_signed_collect_tx_for_broadcast(
             &self,
             worker_id: &str,
+            _chain_id: u64,
+            _token_address: EvmAddress,
         ) -> Result<Option<BroadcastableOutboundTx>, RepositoryError> {
             let mut state = self.state.lock().expect("fake outbound mutex poisoned");
             state.claim_calls.push(worker_id.to_string());
@@ -1127,6 +1147,8 @@ mod tests {
         async fn claim_broadcast_collect_tx_for_receipt(
             &self,
             worker_id: &str,
+            _chain_id: u64,
+            _token_address: EvmAddress,
         ) -> Result<Option<ReceiptCheckableOutboundTx>, RepositoryError> {
             let mut state = self.state.lock().expect("fake outbound mutex poisoned");
             state.receipt_claim_calls.push(worker_id.to_string());

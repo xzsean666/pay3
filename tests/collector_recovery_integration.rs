@@ -436,6 +436,8 @@ impl OutboundRepository for MockOutboundRepo {
     async fn claim_signed_collect_tx_for_broadcast(
         &self,
         _worker_id: &str,
+        _chain_id: u64,
+        _token_address: EvmAddress,
     ) -> Result<Option<BroadcastableOutboundTx>, RepositoryError> {
         let mut guard = self.recoverable.lock().unwrap();
         Ok(guard.take())
@@ -444,6 +446,8 @@ impl OutboundRepository for MockOutboundRepo {
     async fn claim_broadcast_collect_tx_for_receipt(
         &self,
         _worker_id: &str,
+        _chain_id: u64,
+        _token_address: EvmAddress,
     ) -> Result<Option<ReceiptCheckableOutboundTx>, RepositoryError> {
         let mut guard = self.receipt_checkable.lock().unwrap();
         Ok(guard.take())

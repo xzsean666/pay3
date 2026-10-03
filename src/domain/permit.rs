@@ -262,10 +262,10 @@ pub fn lookup_preset(chain_id: u64, token_address: EvmAddress) -> Option<PresetT
             reason: "Ethereum Mainnet legacy USDT lacks permit/meta-tx support, falling back to standard transfer",
         }),
         (1, "0x6b175474e89094c44da98b954eedeac495271d0f") => Some(PresetTokenInfo {
-            method: CollectionMethod::Eip2612,
+            method: CollectionMethod::Standard,
             token_name: "Dai Stablecoin",
             token_version: "1",
-            reason: "Ethereum Mainnet DAI supports EIP-2612 permit",
+            reason: "Ethereum Mainnet DAI EIP-2612 permit lacks forwarder transfer capability, safely falling back to standard transfer",
         }),
 
         // Polygon PoS (137)
@@ -288,10 +288,10 @@ pub fn lookup_preset(chain_id: u64, token_address: EvmAddress) -> Option<PresetT
             reason: "Polygon PoS Bridged USDC.e supports EIP-3009 transferWithAuthorization",
         }),
         (137, "0x8f3cf7ad23cd3cadbd9735aff958023239c6a063") => Some(PresetTokenInfo {
-            method: CollectionMethod::Eip2612,
+            method: CollectionMethod::Standard,
             token_name: "(PoS) Dai Stablecoin",
             token_version: "1",
-            reason: "Polygon PoS DAI supports EIP-2612 permit",
+            reason: "Polygon PoS DAI EIP-2612 permit lacks forwarder transfer capability, safely falling back to standard transfer",
         }),
 
         // Arbitrum One (42161)
@@ -302,10 +302,10 @@ pub fn lookup_preset(chain_id: u64, token_address: EvmAddress) -> Option<PresetT
             reason: "Arbitrum One Native USDC supports EIP-3009 transferWithAuthorization",
         }),
         (42161, "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9") => Some(PresetTokenInfo {
-            method: CollectionMethod::Eip2612,
+            method: CollectionMethod::Standard,
             token_name: "Tether USD",
             token_version: "1",
-            reason: "Arbitrum One Native USDT supports EIP-2612 permit",
+            reason: "Arbitrum One USDT EIP-2612 permit lacks forwarder transfer capability, safely falling back to standard transfer",
         }),
         (42161, "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8") => Some(PresetTokenInfo {
             method: CollectionMethod::Standard,
@@ -322,10 +322,10 @@ pub fn lookup_preset(chain_id: u64, token_address: EvmAddress) -> Option<PresetT
             reason: "Optimism Native USDC supports EIP-3009 transferWithAuthorization",
         }),
         (10, "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58") => Some(PresetTokenInfo {
-            method: CollectionMethod::Eip2612,
+            method: CollectionMethod::Standard,
             token_name: "Tether USD",
             token_version: "1",
-            reason: "Optimism Native USDT supports EIP-2612 permit",
+            reason: "Optimism USDT EIP-2612 permit lacks forwarder transfer capability, safely falling back to standard transfer",
         }),
 
         // Base (8453)
@@ -344,10 +344,10 @@ pub fn lookup_preset(chain_id: u64, token_address: EvmAddress) -> Option<PresetT
             reason: "Avalanche Native USDC supports EIP-3009 transferWithAuthorization",
         }),
         (43114, "0x9702230a8ea53601f5cd2dc00fdbc13d4df4a8c7") => Some(PresetTokenInfo {
-            method: CollectionMethod::Eip2612,
+            method: CollectionMethod::Standard,
             token_name: "Tether USDt",
             token_version: "1",
-            reason: "Avalanche Native USDT supports EIP-2612 permit",
+            reason: "Avalanche USDT EIP-2612 permit lacks forwarder transfer capability, safely falling back to standard transfer",
         }),
 
         // BNB Smart Chain (56)
@@ -397,10 +397,10 @@ pub fn lookup_heuristic(chain_id: u64, token_symbol: &str) -> PresetTokenInfo {
             }
         } else if chain_id == 42161 || chain_id == 10 || chain_id == 43114 {
             PresetTokenInfo {
-                method: CollectionMethod::Eip2612,
+                method: CollectionMethod::Standard,
                 token_name: "Tether USD",
                 token_version: "1",
-                reason: "L2/Alt-L1 USDT matches EIP-2612 permit standard, auto-selecting Eip2612",
+                reason: "L2/Alt-L1 USDT permit lacks forwarder transfer capability, safely falling back to standard transfer",
             }
         } else {
             PresetTokenInfo {
@@ -537,6 +537,16 @@ pub async fn resolve_optimal_collection_strategy_with_probe<C: ContractCallClien
             let token_version = custom_token_version
                 .or(probed.token_version)
                 .unwrap_or_else(|| "1".to_string());
+
+            if probed.method == CollectionMethod::Eip2612 {
+                return OptimalStrategyResolution {
+                    method: CollectionMethod::Standard,
+                    token_name,
+                    token_version,
+                    reason: "On-chain contract supports EIP-2612 permit, but gasless sweep requires an on-chain forwarder for atomic transferFrom. Safely falling back to standard transfer",
+                };
+            }
+
             return OptimalStrategyResolution {
                 method: probed.method,
                 token_name,
@@ -1099,7 +1109,7 @@ mod tests {
         );
         assert_eq!(res.method, CollectionMethod::Eip3009);
 
-        // 5. USDT on Arbitrum -> Eip2612
+        // 5. USDT on Arbitrum -> Standard (permit lacks forwarder, falls back safely)
         let res = resolve_optimal_collection_strategy(
             42161,
             usdt_arb,
@@ -1109,7 +1119,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(res.method, CollectionMethod::Eip2612);
+        assert_eq!(res.method, CollectionMethod::Standard);
 
         // 6. USDC on Arbitrum -> Eip3009
         let res = resolve_optimal_collection_strategy(
@@ -1123,7 +1133,7 @@ mod tests {
         );
         assert_eq!(res.method, CollectionMethod::Eip3009);
 
-        // 7. USDT on Optimism -> Eip2612
+        // 7. USDT on Optimism -> Standard (permit lacks forwarder, falls back safely)
         let res = resolve_optimal_collection_strategy(
             10,
             usdt_op,
@@ -1133,7 +1143,7 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(res.method, CollectionMethod::Eip2612);
+        assert_eq!(res.method, CollectionMethod::Standard);
 
         // 8. USDT on BSC -> Standard
         let res = resolve_optimal_collection_strategy(
@@ -1340,6 +1350,37 @@ mod tests {
         assert_eq!(res.token_name, "Custom Circle USDC");
         assert_eq!(res.token_version, "2");
         assert!(res.reason.contains("On-chain contract probe confirmed"));
+    }
+
+    #[tokio::test]
+    async fn resolve_optimal_collection_strategy_with_probe_falls_back_on_eip2612() {
+        let mut caller = MockContractCaller {
+            responses: std::collections::BTreeMap::new(),
+        };
+        caller
+            .responses
+            .insert(EIP2612_DOMAIN_SEPARATOR_SELECTOR.to_vec(), vec![0x11; 32]);
+        caller
+            .responses
+            .insert(EIP2612_NONCES_SELECTOR.to_vec(), vec![0u8; 32]);
+        caller
+            .responses
+            .insert(ERC20_NAME_SELECTOR.to_vec(), encode_abi_string("Custom Token"));
+
+        let res = resolve_optimal_collection_strategy_with_probe(
+            99999,
+            test_address(0x88),
+            "CUST",
+            true,
+            CollectionMethod::Auto,
+            None,
+            None,
+            Some(&caller),
+        )
+        .await;
+
+        assert_eq!(res.method, CollectionMethod::Standard);
+        assert!(res.reason.contains("forwarder"));
     }
 }
 

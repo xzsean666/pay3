@@ -1,4 +1,8 @@
-use std::fmt;
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex},
+};
 
 use alloy_consensus::{SignableTransaction, TxEip1559};
 use alloy_primitives::{B256, TxKind};
@@ -17,6 +21,7 @@ use super::{
 pub struct LocalMnemonicSigner {
     key_ref: String,
     mnemonic: String,
+    signer_cache: Arc<Mutex<HashMap<String, alloy_signer_local::PrivateKeySigner>>>,
 }
 
 impl fmt::Debug for LocalMnemonicSigner {
@@ -43,6 +48,7 @@ impl LocalMnemonicSigner {
         Ok(Self {
             key_ref,
             mnemonic: mnemonic.to_string(),
+            signer_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -64,7 +70,14 @@ impl LocalMnemonicSigner {
         path: &str,
     ) -> Result<alloy_signer_local::PrivateKeySigner, SignerError> {
         validate_derivation_path(path)?;
-        MnemonicBuilder::<English>::default()
+        {
+            let cache = self.signer_cache.lock().unwrap();
+            if let Some(signer) = cache.get(path) {
+                return Ok(signer.clone());
+            }
+        }
+
+        let signer = MnemonicBuilder::<English>::default()
             .phrase(self.mnemonic.clone())
             .derivation_path(path)
             .map_err(|error| SignerError::LocalSigner {
@@ -75,7 +88,11 @@ impl LocalMnemonicSigner {
             .map_err(|error| SignerError::LocalSigner {
                 operation: "derive_address",
                 message: error.to_string(),
-            })
+            })?;
+
+        let mut cache = self.signer_cache.lock().unwrap();
+        cache.insert(path.to_string(), signer.clone());
+        Ok(signer)
     }
 }
 

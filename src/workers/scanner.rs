@@ -483,6 +483,65 @@ where
                     }
                     log_tick_outcome(&outcome);
                 }
+                Err(PaymentScannerError::CanonicalBlockHashMismatch {
+                    block_number,
+                    stored_hash,
+                    canonical_hash,
+                }) => {
+                    let stream = self.config.stream;
+                    tracing::warn!(
+                        chain_id = stream.chain_id,
+                        token_address = %stream.token_address,
+                        worker_id = %self.config.worker_id,
+                        block_number,
+                        %stored_hash,
+                        %canonical_hash,
+                        "canonical block hash mismatch detected in confirmation sweep; triggering automatic reorg healing"
+                    );
+
+                    let next_epoch = match self
+                        .repository
+                        .scan_cursor_state(stream.chain_id, stream.token_address)
+                        .await
+                    {
+                        Ok(Some(state)) => state.seen_kv_reorg_epoch + 1,
+                        _ => 1,
+                    };
+
+                    match self.handle_reorg(next_epoch, block_number).await {
+                        Ok(outcome) => {
+                            tracing::info!(
+                                chain_id = stream.chain_id,
+                                token_address = %stream.token_address,
+                                block_number,
+                                next_epoch,
+                                "successfully healed block reorg, rolled back cursor and marked orphaned payments"
+                            );
+                            if let Some(metrics) = &self.metrics {
+                                metrics.record_worker_success(
+                                    WorkerName::PaymentScanner,
+                                    started_at.elapsed(),
+                                );
+                            }
+                            log_tick_outcome(&outcome);
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                chain_id = stream.chain_id,
+                                token_address = %stream.token_address,
+                                error = %err,
+                                "failed to execute automatic reorg healing"
+                            );
+                            if let Some(metrics) = &self.metrics {
+                                metrics.record_worker_error(
+                                    WorkerName::PaymentScanner,
+                                    started_at.elapsed(),
+                                    err.to_string(),
+                                );
+                            }
+                        }
+                    }
+                }
                 Err(error) => {
                     if let Some(metrics) = &self.metrics {
                         metrics.record_worker_error(

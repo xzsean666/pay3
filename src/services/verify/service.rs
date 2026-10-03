@@ -92,7 +92,8 @@ where
             stream.token_address,
             from_block,
             complete_to_block,
-        );
+        )
+        .with_recipient(view.order.receive_address);
         let logs = self.log_source.transfer_logs(range).await?;
         if logs.len() > self.config.max_logs_per_order {
             return Err(ManualVerifyError::LogLimitExceeded {

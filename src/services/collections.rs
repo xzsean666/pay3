@@ -748,7 +748,15 @@ where
             ));
         }
 
-        let Some(job) = self.collections.claim_collection_job(worker_id).await? else {
+        let Some(job) = self
+            .collections
+            .claim_collection_job(
+                worker_id,
+                self.config.chain_id,
+                self.config.token_address,
+            )
+            .await?
+        else {
             return Ok(PrepareCollectionJobOutcome::NoJob);
         };
 
@@ -2337,6 +2345,8 @@ mod tests {
         async fn claim_collection_job(
             &self,
             _worker_id: &str,
+            _chain_id: u64,
+            _token_address: EvmAddress,
         ) -> Result<Option<CollectionJob>, RepositoryError> {
             Ok(self
                 .state
@@ -2477,6 +2487,8 @@ mod tests {
         async fn claim_signed_collect_tx_for_broadcast(
             &self,
             _worker_id: &str,
+            _chain_id: u64,
+            _token_address: EvmAddress,
         ) -> Result<Option<crate::db::repositories::BroadcastableOutboundTx>, RepositoryError>
         {
             unimplemented!("collection service does not claim signed txs for broadcast")
@@ -2485,6 +2497,8 @@ mod tests {
         async fn claim_broadcast_collect_tx_for_receipt(
             &self,
             _worker_id: &str,
+            _chain_id: u64,
+            _token_address: EvmAddress,
         ) -> Result<Option<crate::db::repositories::ReceiptCheckableOutboundTx>, RepositoryError>
         {
             unimplemented!("collection service does not claim broadcast txs for receipt")

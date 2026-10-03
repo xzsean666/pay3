@@ -815,6 +815,7 @@ fn collection_collector_config_for_token(token: &TokenInstanceConfig) -> Collect
         token.chain.token_address,
         std::process::id()
     ))
+    .with_chain(token.chain.chain_id, token.chain.token_address)
     .with_replacement_stuck_after(token.collector.replacement_stuck_after)
     .with_min_confirmations(token.chain.min_confirmations)
 }
@@ -822,6 +823,10 @@ fn collection_collector_config_for_token(token: &TokenInstanceConfig) -> Collect
 #[cfg(test)]
 fn collection_collector_config(config: &AppConfig) -> CollectionCollectorConfig {
     CollectionCollectorConfig::new(format!("collection-collector-{}", std::process::id()))
+        .with_chain(
+            config.tokens[0].chain.chain_id,
+            config.tokens[0].chain.token_address,
+        )
         .with_replacement_stuck_after(config.collector.replacement_stuck_after)
         .with_min_confirmations(config.chain.min_confirmations)
 }
