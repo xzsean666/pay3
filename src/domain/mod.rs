@@ -21,10 +21,12 @@ pub use kv::{KvReorgEpoch, KvReorgEpochError};
 pub use order::{OrderStatus, OrderStatusDecision, OrderStatusError, recompute_order_status};
 pub use payment::{PaymentChainStatus, PaymentFact, PaymentMatchStatus};
 pub use permit::{
-    eip2612_struct_hash, eip3009_struct_hash, eip712_digest, eip712_domain_separator,
-    encode_eip2612_permit, encode_eip3009_transfer_with_authorization,
+    decode_abi_string, eip2612_struct_hash, eip3009_struct_hash, eip712_digest,
+    eip712_domain_separator, encode_eip2612_permit, encode_eip3009_transfer_with_authorization,
     encode_polygon_execute_meta_transaction, polygon_meta_tx_domain_separator,
-    polygon_meta_tx_struct_hash, resolve_optimal_collection_strategy, CollectionMethod,
-    OptimalStrategyResolution, TypedSignature,
+    polygon_meta_tx_struct_hash, probe_on_chain_token_capabilities,
+    resolve_optimal_collection_strategy, resolve_optimal_collection_strategy_with_probe,
+    CollectionMethod, ContractCallClient, OnChainTokenCapabilities, OptimalStrategyResolution,
+    TypedSignature,
 };
 pub use wallet::{DerivationSegment, DerivationSegmentError, MAX_DERIVATION_INDEX};

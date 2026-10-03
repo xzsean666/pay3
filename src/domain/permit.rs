@@ -3,9 +3,172 @@
 //! executeMetaTransaction, and EIP-2612 permit).
 
 use alloy_primitives::{U256, keccak256};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{EvmAddress, RawAmount};
+
+/// Contract call interface for lightweight on-chain contract probing.
+#[async_trait]
+pub trait ContractCallClient: Send + Sync {
+    async fn call_contract(&self, to: EvmAddress, data: &[u8]) -> Result<Vec<u8>, String>;
+}
+
+/// ERC-20 `name()` selector: `0x06fdde03`
+pub const ERC20_NAME_SELECTOR: [u8; 4] = [0x06, 0xfd, 0xde, 0x03];
+
+/// EIP-712 `version()` selector: `0x54fd4d50`
+pub const ERC20_VERSION_SELECTOR: [u8; 4] = [0x54, 0xfd, 0x4d, 0x50];
+
+/// EIP-3009 `authorizationState(address,bytes32)` selector: `0xe94a0102`
+pub const EIP3009_AUTHORIZATION_STATE_SELECTOR: [u8; 4] = [0xe9, 0x4a, 0x01, 0x02];
+
+/// Polygon `getNonce(address)` selector: `0x2d0335ab`
+pub const POLYGON_GET_NONCE_SELECTOR: [u8; 4] = [0x2d, 0x03, 0x35, 0xab];
+
+/// EIP-2612 / EIP-712 `DOMAIN_SEPARATOR()` selector: `0x3644e515`
+pub const EIP2612_DOMAIN_SEPARATOR_SELECTOR: [u8; 4] = [0x36, 0x44, 0xe5, 0x15];
+
+/// EIP-2612 `nonces(address)` selector: `0x7ecebe00`
+pub const EIP2612_NONCES_SELECTOR: [u8; 4] = [0x7e, 0xce, 0xbe, 0x00];
+
+/// Generates probe calldata for EIP-3009 `authorizationState(address,bytes32)`.
+pub fn eip3009_probe_calldata() -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 64);
+    data.extend_from_slice(&EIP3009_AUTHORIZATION_STATE_SELECTOR);
+    data.extend_from_slice(&[0u8; 64]);
+    data
+}
+
+/// Generates probe calldata for Polygon `getNonce(address)`.
+pub fn polygon_meta_tx_probe_calldata() -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 32);
+    data.extend_from_slice(&POLYGON_GET_NONCE_SELECTOR);
+    data.extend_from_slice(&[0u8; 32]);
+    data
+}
+
+/// Generates probe calldata for EIP-2612 `DOMAIN_SEPARATOR()`.
+pub fn domain_separator_probe_calldata() -> Vec<u8> {
+    EIP2612_DOMAIN_SEPARATOR_SELECTOR.to_vec()
+}
+
+/// Generates probe calldata for EIP-2612 `nonces(address)`.
+pub fn nonces_probe_calldata() -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 32);
+    data.extend_from_slice(&EIP2612_NONCES_SELECTOR);
+    data.extend_from_slice(&[0u8; 32]);
+    data
+}
+
+/// Decodes a string returned from an ABI call (`name()` or `version()`).
+/// Supports standard ABI dynamic strings (offset + length + bytes) as well as
+/// legacy fixed 32-byte `bytes32` strings.
+pub fn decode_abi_string(data: &[u8]) -> Option<String> {
+    if data.len() >= 64 {
+        let len_slice = &data[32..64];
+        if let Some(len) = U256::try_from_be_slice(len_slice).and_then(|u| usize::try_from(u).ok()) {
+            let start: usize = 64;
+            if let Some(end) = start.checked_add(len) {
+                if end <= data.len() {
+                    let str_bytes = &data[start..end];
+                    if let Ok(s) = std::str::from_utf8(str_bytes) {
+                        let trimmed = s.trim();
+                        if !trimmed.is_empty() {
+                            return Some(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if data.len() == 32 {
+        let trimmed_bytes = data.split(|&b| b == 0).next().unwrap_or(&[]);
+        if !trimmed_bytes.is_empty() {
+            if let Ok(s) = std::str::from_utf8(trimmed_bytes) {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Result of probing an on-chain token contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnChainTokenCapabilities {
+    pub method: CollectionMethod,
+    pub token_name: Option<String>,
+    pub token_version: Option<String>,
+    pub reason: String,
+}
+
+/// Probes an on-chain token contract via static `eth_call` to discover its supported
+/// collection interface (EIP-3009, Polygon MetaTx, EIP-2612) and name/version metadata.
+pub async fn probe_on_chain_token_capabilities<C: ContractCallClient>(
+    client: &C,
+    token_address: EvmAddress,
+) -> OnChainTokenCapabilities {
+    let token_name = match client.call_contract(token_address, &ERC20_NAME_SELECTOR).await {
+        Ok(data) => decode_abi_string(&data),
+        Err(_) => None,
+    };
+    let token_version = match client.call_contract(token_address, &ERC20_VERSION_SELECTOR).await {
+        Ok(data) => decode_abi_string(&data),
+        Err(_) => None,
+    };
+
+    // 1. Probe EIP-3009: authorizationState(address,bytes32) -> bool
+    if let Ok(res) = client.call_contract(token_address, &eip3009_probe_calldata()).await {
+        if res.len() == 32 {
+            return OnChainTokenCapabilities {
+                method: CollectionMethod::Eip3009,
+                token_name,
+                token_version: token_version.or_else(|| Some("2".to_string())),
+                reason: "On-chain contract probe confirmed EIP-3009 authorizationState support".to_string(),
+            };
+        }
+    }
+
+    // 2. Probe Polygon MetaTx: getNonce(address) -> uint256
+    if let Ok(res) = client.call_contract(token_address, &polygon_meta_tx_probe_calldata()).await {
+        if res.len() == 32 {
+            return OnChainTokenCapabilities {
+                method: CollectionMethod::PolygonMetaTx,
+                token_name,
+                token_version: token_version.or_else(|| Some("1".to_string())),
+                reason: "On-chain contract probe confirmed Polygon NativeMetaTransaction (getNonce) support".to_string(),
+            };
+        }
+    }
+
+    // 3. Probe EIP-2612: DOMAIN_SEPARATOR() and nonces(address)
+    let domain_res = client.call_contract(token_address, &domain_separator_probe_calldata()).await;
+    let nonces_res = client.call_contract(token_address, &nonces_probe_calldata()).await;
+
+    if let (Ok(dom), Ok(non)) = (domain_res, nonces_res) {
+        if dom.len() == 32 && dom.iter().any(|&b| b != 0) && non.len() == 32 {
+            return OnChainTokenCapabilities {
+                method: CollectionMethod::Eip2612,
+                token_name,
+                token_version: token_version.or_else(|| Some("1".to_string())),
+                reason: "On-chain contract probe confirmed EIP-2612 permit (DOMAIN_SEPARATOR & nonces) support".to_string(),
+            };
+        }
+    }
+
+    // 4. Default fallback to Standard
+    OnChainTokenCapabilities {
+        method: CollectionMethod::Standard,
+        token_name,
+        token_version,
+        reason: "On-chain contract probe did not detect EIP-3009, MetaTx, or EIP-2612 interfaces, safely using standard transfer".to_string(),
+    }
+}
 
 /// Supported fund collection methods.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -74,22 +237,17 @@ pub struct OptimalStrategyResolution {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PresetTokenInfo {
-    method: CollectionMethod,
-    token_name: &'static str,
-    token_version: &'static str,
-    reason: &'static str,
+pub struct PresetTokenInfo {
+    pub method: CollectionMethod,
+    pub token_name: &'static str,
+    pub token_version: &'static str,
+    pub reason: &'static str,
 }
 
-fn lookup_preset_or_heuristic(
-    chain_id: u64,
-    token_address: EvmAddress,
-    token_symbol: &str,
-) -> PresetTokenInfo {
+/// Fast-path preset lookup for standard tokens across major chains.
+pub fn lookup_preset(chain_id: u64, token_address: EvmAddress) -> Option<PresetTokenInfo> {
     let addr_lower = token_address.to_lower_hex();
-
-    // 1. Exact preset matching by (chain_id, token_address)
-    let preset = match (chain_id, addr_lower.as_str()) {
+    match (chain_id, addr_lower.as_str()) {
         // Ethereum Mainnet (1)
         (1, "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48") => Some(PresetTokenInfo {
             method: CollectionMethod::Eip3009,
@@ -207,13 +365,11 @@ fn lookup_preset_or_heuristic(
         }),
 
         _ => None,
-    };
-
-    if let Some(info) = preset {
-        return info;
     }
+}
 
-    // 2. Heuristic fallback based on token symbol
+/// Fallback heuristic matching for symbols.
+pub fn lookup_heuristic(chain_id: u64, token_symbol: &str) -> PresetTokenInfo {
     let sym = token_symbol.trim();
     if sym.eq_ignore_ascii_case("USDC") || sym.eq_ignore_ascii_case("USDC.e") {
         if chain_id == 56 {
@@ -262,6 +418,14 @@ fn lookup_preset_or_heuristic(
             reason: "Unrecognized token without permit configuration, safely falling back to standard transfer",
         }
     }
+}
+
+fn lookup_preset_or_heuristic(
+    chain_id: u64,
+    token_address: EvmAddress,
+    token_symbol: &str,
+) -> PresetTokenInfo {
+    lookup_preset(chain_id, token_address).unwrap_or_else(|| lookup_heuristic(chain_id, token_symbol))
 }
 
 /// Resolves the optimal collection strategy based on the chain, token, relayer status,
@@ -313,6 +477,85 @@ pub fn resolve_optimal_collection_strategy(
         token_version,
         reason,
     }
+}
+
+/// Resolves the optimal collection strategy with optional on-chain dynamic probing.
+/// If the token is not present in the hardcoded preset registry, this will query
+/// the contract directly via `client` to determine if it supports EIP-3009,
+/// Polygon MetaTx, or EIP-2612, and extract the token's on-chain name/version.
+pub async fn resolve_optimal_collection_strategy_with_probe<C: ContractCallClient>(
+    chain_id: u64,
+    token_address: EvmAddress,
+    token_symbol: &str,
+    has_relayer: bool,
+    configured_method: CollectionMethod,
+    custom_token_name: Option<String>,
+    custom_token_version: Option<String>,
+    client: Option<&C>,
+) -> OptimalStrategyResolution {
+    if configured_method != CollectionMethod::Auto {
+        return resolve_optimal_collection_strategy(
+            chain_id,
+            token_address,
+            token_symbol,
+            has_relayer,
+            configured_method,
+            custom_token_name,
+            custom_token_version,
+        );
+    }
+
+    if !has_relayer {
+        return OptimalStrategyResolution {
+            method: CollectionMethod::Standard,
+            token_name: custom_token_name.unwrap_or_else(|| token_symbol.to_string()),
+            token_version: custom_token_version.unwrap_or_else(|| "1".to_string()),
+            reason: "No relayer configured for gasless collection, using standard transfer",
+        };
+    }
+
+    // 1. Fast path: check exact preset registry
+    if let Some(preset) = lookup_preset(chain_id, token_address) {
+        let token_name = custom_token_name.unwrap_or_else(|| preset.token_name.to_string());
+        let token_version =
+            custom_token_version.unwrap_or_else(|| preset.token_version.to_string());
+        return OptimalStrategyResolution {
+            method: preset.method,
+            token_name,
+            token_version,
+            reason: preset.reason,
+        };
+    }
+
+    // 2. Dynamic on-chain probe for unknown tokens
+    if let Some(client) = client {
+        let probed = probe_on_chain_token_capabilities(client, token_address).await;
+        if probed.method != CollectionMethod::Standard {
+            let token_name = custom_token_name
+                .or(probed.token_name)
+                .unwrap_or_else(|| token_symbol.to_string());
+            let token_version = custom_token_version
+                .or(probed.token_version)
+                .unwrap_or_else(|| "1".to_string());
+            return OptimalStrategyResolution {
+                method: probed.method,
+                token_name,
+                token_version,
+                reason: Box::leak(probed.reason.into_boxed_str()),
+            };
+        }
+    }
+
+    // 3. Fallback: heuristic
+    resolve_optimal_collection_strategy(
+        chain_id,
+        token_address,
+        token_symbol,
+        has_relayer,
+        configured_method,
+        custom_token_name,
+        custom_token_version,
+    )
 }
 
 impl std::str::FromStr for CollectionMethod {
@@ -688,6 +931,24 @@ mod tests {
             &keccak256(b"permit(address,address,uint256,uint256,uint8,bytes32,bytes32)")[..4],
             &EIP2612_PERMIT_SELECTOR
         );
+        assert_eq!(&keccak256(b"name()")[..4], &ERC20_NAME_SELECTOR);
+        assert_eq!(&keccak256(b"version()")[..4], &ERC20_VERSION_SELECTOR);
+        assert_eq!(
+            &keccak256(b"authorizationState(address,bytes32)")[..4],
+            &EIP3009_AUTHORIZATION_STATE_SELECTOR
+        );
+        assert_eq!(
+            &keccak256(b"getNonce(address)")[..4],
+            &POLYGON_GET_NONCE_SELECTOR
+        );
+        assert_eq!(
+            &keccak256(b"DOMAIN_SEPARATOR()")[..4],
+            &EIP2612_DOMAIN_SEPARATOR_SELECTOR
+        );
+        assert_eq!(
+            &keccak256(b"nonces(address)")[..4],
+            &EIP2612_NONCES_SELECTOR
+        );
     }
 
     #[test]
@@ -924,5 +1185,162 @@ mod tests {
         assert_eq!(res.token_name, "Custom USDT");
         assert_eq!(res.token_version, "99");
     }
+
+    fn encode_abi_string(s: &str) -> Vec<u8> {
+        let mut out = vec![0u8; 64];
+        out[31] = 0x20;
+        out[63] = s.len() as u8;
+        out.extend_from_slice(s.as_bytes());
+        while out.len() % 32 != 0 {
+            out.push(0);
+        }
+        out
+    }
+
+    #[test]
+    fn decode_abi_string_works_for_dynamic_and_bytes32() {
+        // 1. Dynamic ABI string
+        let dyn_bytes = encode_abi_string("USD Coin");
+        assert_eq!(decode_abi_string(&dyn_bytes), Some("USD Coin".to_string()));
+
+        // 2. Fixed 32-byte bytes32 with trailing nulls
+        let mut fixed_bytes = [0u8; 32];
+        let name = b"Tether USD";
+        fixed_bytes[..name.len()].copy_from_slice(name);
+        assert_eq!(decode_abi_string(&fixed_bytes), Some("Tether USD".to_string()));
+
+        // 3. Empty string
+        let empty_dyn = encode_abi_string("");
+        assert_eq!(decode_abi_string(&empty_dyn), None);
+
+        // 4. Invalid length / garbage
+        assert_eq!(decode_abi_string(&[0u8; 10]), None);
+        assert_eq!(decode_abi_string(&[]), None);
+    }
+
+    struct MockContractCaller {
+        responses: std::collections::BTreeMap<Vec<u8>, Vec<u8>>,
+    }
+
+    #[async_trait]
+    impl ContractCallClient for MockContractCaller {
+        async fn call_contract(&self, _to: EvmAddress, data: &[u8]) -> Result<Vec<u8>, String> {
+            for (prefix, resp) in &self.responses {
+                if data.starts_with(prefix) {
+                    return Ok(resp.clone());
+                }
+            }
+            Err("call reverted".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_on_chain_capabilities_eip3009() {
+        let mut caller = MockContractCaller {
+            responses: std::collections::BTreeMap::new(),
+        };
+        caller
+            .responses
+            .insert(EIP3009_AUTHORIZATION_STATE_SELECTOR.to_vec(), vec![0u8; 32]);
+        caller
+            .responses
+            .insert(ERC20_NAME_SELECTOR.to_vec(), encode_abi_string("USD Coin"));
+        caller
+            .responses
+            .insert(ERC20_VERSION_SELECTOR.to_vec(), encode_abi_string("2"));
+
+        let probe = probe_on_chain_token_capabilities(&caller, test_address(0x55)).await;
+        assert_eq!(probe.method, CollectionMethod::Eip3009);
+        assert_eq!(probe.token_name.as_deref(), Some("USD Coin"));
+        assert_eq!(probe.token_version.as_deref(), Some("2"));
+    }
+
+    #[tokio::test]
+    async fn probe_on_chain_capabilities_polygon_meta_tx() {
+        let mut caller = MockContractCaller {
+            responses: std::collections::BTreeMap::new(),
+        };
+        caller
+            .responses
+            .insert(POLYGON_GET_NONCE_SELECTOR.to_vec(), vec![0u8; 32]);
+        caller.responses.insert(
+            ERC20_NAME_SELECTOR.to_vec(),
+            encode_abi_string("(PoS) Tether USD"),
+        );
+
+        let probe = probe_on_chain_token_capabilities(&caller, test_address(0x55)).await;
+        assert_eq!(probe.method, CollectionMethod::PolygonMetaTx);
+        assert_eq!(probe.token_name.as_deref(), Some("(PoS) Tether USD"));
+        assert_eq!(probe.token_version.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn probe_on_chain_capabilities_eip2612() {
+        let mut caller = MockContractCaller {
+            responses: std::collections::BTreeMap::new(),
+        };
+        caller
+            .responses
+            .insert(EIP2612_DOMAIN_SEPARATOR_SELECTOR.to_vec(), vec![0x11; 32]);
+        caller
+            .responses
+            .insert(EIP2612_NONCES_SELECTOR.to_vec(), vec![0u8; 32]);
+        caller
+            .responses
+            .insert(ERC20_NAME_SELECTOR.to_vec(), encode_abi_string("DAI Token"));
+
+        let probe = probe_on_chain_token_capabilities(&caller, test_address(0x55)).await;
+        assert_eq!(probe.method, CollectionMethod::Eip2612);
+        assert_eq!(probe.token_name.as_deref(), Some("DAI Token"));
+        assert_eq!(probe.token_version.as_deref(), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn probe_on_chain_capabilities_fallback_to_standard() {
+        let caller = MockContractCaller {
+            responses: std::collections::BTreeMap::new(),
+        };
+
+        let probe = probe_on_chain_token_capabilities(&caller, test_address(0x55)).await;
+        assert_eq!(probe.method, CollectionMethod::Standard);
+        assert_eq!(probe.token_name, None);
+        assert_eq!(probe.token_version, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_optimal_collection_strategy_with_probe_unknown_token() {
+        let mut caller = MockContractCaller {
+            responses: std::collections::BTreeMap::new(),
+        };
+        caller
+            .responses
+            .insert(EIP3009_AUTHORIZATION_STATE_SELECTOR.to_vec(), vec![0u8; 32]);
+        caller.responses.insert(
+            ERC20_NAME_SELECTOR.to_vec(),
+            encode_abi_string("Custom Circle USDC"),
+        );
+        caller
+            .responses
+            .insert(ERC20_VERSION_SELECTOR.to_vec(), encode_abi_string("2"));
+
+        let unknown_addr = test_address(0x77);
+        let res = resolve_optimal_collection_strategy_with_probe(
+            99999, // Unknown custom chain
+            unknown_addr,
+            "USDC",
+            true,
+            CollectionMethod::Auto,
+            None,
+            None,
+            Some(&caller),
+        )
+        .await;
+
+        assert_eq!(res.method, CollectionMethod::Eip3009);
+        assert_eq!(res.token_name, "Custom Circle USDC");
+        assert_eq!(res.token_version, "2");
+        assert!(res.reason.contains("On-chain contract probe confirmed"));
+    }
 }
+
 

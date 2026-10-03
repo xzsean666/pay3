@@ -602,9 +602,10 @@ where
 async fn collection_strategy_config<S: SignerProvider>(
     config: &AppConfig,
     signer: &S,
+    rpc_source: &RpcRangeSource,
 ) -> Result<CollectionStrategyConfig, RuntimeError> {
     let has_relayer = config.collection.relayer_key_ref.is_some();
-    let resolution = crate::domain::resolve_optimal_collection_strategy(
+    let resolution = crate::domain::resolve_optimal_collection_strategy_with_probe(
         config.chain.chain_id,
         config.chain.token_address,
         &config.chain.token_symbol,
@@ -612,7 +613,9 @@ async fn collection_strategy_config<S: SignerProvider>(
         config.collection.method,
         config.collection.token_name.clone(),
         config.collection.token_version.clone(),
-    );
+        Some(rpc_source),
+    )
+    .await;
 
     tracing::info!(
         chain_id = config.chain.chain_id,
@@ -678,7 +681,7 @@ async fn collection_service<S>(
 where
     S: SignerProvider,
 {
-    let strategy = collection_strategy_config(config, &signer).await?;
+    let strategy = collection_strategy_config(config, &signer, &rpc_source).await?;
     let service_config = collection_service_config(config).with_strategy(strategy);
     Ok(CollectionService::new(
         service_config,

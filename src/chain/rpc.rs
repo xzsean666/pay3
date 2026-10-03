@@ -922,6 +922,33 @@ impl Erc20ChainClient for RpcRangeSource {
     }
 }
 
+impl RpcRangeSource {
+    pub async fn call_contract(&self, to: EvmAddress, data: &[u8]) -> Result<Vec<u8>, ChainError> {
+        let call_param = json!([{
+            "to": to.to_string(),
+            "data": encode_hex(data),
+        }, "latest"]);
+
+        let ProviderValue { value, .. } = self
+            .manager
+            .request_first_success("eth_call", call_param)
+            .await?;
+        let hex_str = value.as_str().ok_or_else(|| {
+            ChainError::malformed_rpc_response("eth_call result must be a hex string")
+        })?;
+        decode_prefixed_hex(hex_str, "eth_call result", true)
+    }
+}
+
+#[async_trait]
+impl crate::domain::ContractCallClient for RpcRangeSource {
+    async fn call_contract(&self, to: EvmAddress, data: &[u8]) -> Result<Vec<u8>, String> {
+        self.call_contract(to, data)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ParsedFeeHistoryEstimate {
     base_fee_per_gas: Option<U256>,
@@ -1749,6 +1776,7 @@ mod tests {
         gas_price: Option<Value>,
         missing_safe_block: bool,
         failures: BTreeSet<&'static str>,
+        contract_calls: BTreeMap<String, Value>,
         calls: Mutex<Vec<String>>,
     }
 
@@ -1768,6 +1796,7 @@ mod tests {
                 gas_price: None,
                 missing_safe_block: false,
                 failures: BTreeSet::new(),
+                contract_calls: BTreeMap::new(),
                 calls: Mutex::new(Vec::new()),
             }
         }
@@ -1799,6 +1828,16 @@ mod tests {
 
         fn with_broadcast(mut self, tx_hash: TxHash) -> Self {
             self.broadcast = Some(Value::String(tx_hash.to_string()));
+            self
+        }
+
+        fn with_contract_call(
+            mut self,
+            data_prefix: impl Into<String>,
+            return_hex: impl Into<String>,
+        ) -> Self {
+            self.contract_calls
+                .insert(data_prefix.into(), Value::String(return_hex.into()));
             self
         }
 
@@ -1892,10 +1931,21 @@ mod tests {
                     .native_balance
                     .clone()
                     .unwrap_or_else(|| Value::String("0x0".to_string()))),
-                "eth_call" => Ok(self
-                    .balance
-                    .clone()
-                    .unwrap_or_else(|| Value::String("0x0".to_string()))),
+                "eth_call" => {
+                    let matched = params
+                        .get(0)
+                        .and_then(|p| p.get("data"))
+                        .and_then(Value::as_str)
+                        .and_then(|call_data| {
+                            self.contract_calls
+                                .iter()
+                                .find(|(prefix, _)| call_data.starts_with(prefix.as_str()))
+                                .map(|(_, val)| val.clone())
+                        });
+                    Ok(matched
+                        .or_else(|| self.balance.clone())
+                        .unwrap_or_else(|| Value::String("0x0".to_string())))
+                }
                 "eth_getTransactionReceipt" => Ok(self.receipt.clone().unwrap_or(Value::Null)),
                 "eth_sendRawTransaction" => self
                     .broadcast
@@ -2012,5 +2062,21 @@ mod tests {
         let malformed_padding = "0x0000000000000000000000011111111111111111111111111111111111111111";
         let err = parse_topic_address(malformed_padding, "test").unwrap_err();
         assert!(err.to_string().contains("contains non-zero padding"));
+    }
+
+    #[tokio::test]
+    async fn call_contract_dispatches_eth_call_and_decodes_bytes() {
+        let fake = FakeRpcProvider::new("primary", 137).with_contract_call(
+            "0x06fdde03",
+            "0x000000000000000000000000000000000000000000000000000000000000002000000000000000000000000000000000000000000000000000000000000000045465737400000000000000000000000000000000000000000000000000000000",
+        );
+
+        let manager =
+            RpcProviderManager::new(137, vec![Arc::new(fake) as SharedJsonRpcProvider]).unwrap();
+        let source = RpcRangeSource::new(manager);
+
+        let data = vec![0x06, 0xfd, 0xde, 0x03];
+        let bytes: Vec<u8> = source.call_contract(address(0x22), &data).await.unwrap();
+        assert_eq!(bytes.len(), 96);
     }
 }

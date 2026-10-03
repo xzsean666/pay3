@@ -6,8 +6,8 @@
 
 ## 1. 当前上下文
 
-- **当前 Goal**: 智能自动推导与选择最优归集方案（支持 `COLLECTION_METHOD=auto`，自适应匹配各链 USDT/USDC 的最优免 Gas 方案）
-- **当前 Task**: [TASK-030: 智能自动推导与选择最优归集方案](file:///ssd0/git/pay3/docs/AI/tasks/TASK-030.md)
+- **当前 Goal**: 链上 RPC 动态探查器与自适应代币元数据提取（支持通过静态只读 eth_call 探查任意代币的 EIP-3009/MetaTx/Permit 接口及元数据）
+- **当前 Task**: [TASK-031: 链上 RPC 动态探查器与自适应代币元数据提取](file:///ssd0/git/pay3/docs/AI/tasks/TASK-031.md)
 - **当前状态**: `DONE`
 
 ---
@@ -107,6 +107,20 @@
     - **测试回归**:
       - 增加 `resolve_optimal_strategy_presets_and_fallbacks` 单元测试，覆盖 11 种典型分支；
       - 全量 204+ 测试与预检门禁脚本 100% 验证通过。
+17. **完成 TASK-031：链上 RPC 动态探查器与自适应代币元数据提取**:
+    - **合约探查器与 ABI 解码 (`src/domain/permit.rs`)**:
+      - 规范定义标准选择器：`ERC20_NAME_SELECTOR` (`0x06fdde03`)、`ERC20_VERSION_SELECTOR` (`0x54fd4d50`)、`EIP3009_AUTHORIZATION_STATE_SELECTOR` (`0xe94a0102`)、`POLYGON_GET_NONCE_SELECTOR` (`0x2d0335ab`)、`EIP2612_DOMAIN_SEPARATOR_SELECTOR` (`0x3644e515`)、`EIP2612_NONCES_SELECTOR` (`0x7ecebe00`)；
+      - 实现通用 `decode_abi_string`，支持动态 ABI 字符串（偏移量+长度+内容）与定长 `bytes32`；
+      - 抽象并导出 `ContractCallClient` 异步 trait 与 `OnChainTokenCapabilities`；
+      - 实现 `probe_on_chain_token_capabilities`：通过静态只读 `eth_call` 自动探测合约接口，依次探测 EIP-3009 -> Polygon MetaTx -> EIP-2612，并动态读取真实 `name()` 和 `version()`；
+      - 实现 `resolve_optimal_collection_strategy_with_probe`：主流代币走快速预置匹配（0 RPC 开销），未登记未知代币自动执行链上动态探查并绑定最优免 Gas 归集方案，探查失败或不支持时平滑安全降级为 `Standard`；
+    - **RPC 契约与打桩测试扩展 (`src/chain/rpc.rs`)**:
+      - `RpcRangeSource` 实现 `call_contract` 并实现 `ContractCallClient`；
+      - `FakeRpcProvider` 增加 `contract_calls` 与 `with_contract_call` 支持模拟合约只读调用；
+    - **服务装配 (`src/runtime.rs`)**:
+      - `collection_strategy_config` 传入 `rpc_source`，在服务启动时自动探测未知代币能力与元数据并输出审计日志；
+    - **测试验证**:
+      - 补齐 ABI 解码、Canonical Selector、EIP-3009/Polygon MetaTx/EIP-2612 探测与未知链降级的全部单元测试与集成测试；全量 230 项测试与生产预检门禁脚本 100% 通过。
 
 ---
 
@@ -116,6 +130,7 @@
 - `docs/AI/tasks/TASK-028.md`
 - `docs/AI/tasks/TASK-029.md`
 - `docs/AI/tasks/TASK-030.md`
+- `docs/AI/tasks/TASK-031.md`
 - `src/db/migrations/20261003000100_outbound_gas_fees.sql`
 - `src/db/migrations/20261003000200_collection_relayers.sql`
 - `src/domain/permit.rs`
@@ -124,6 +139,7 @@
 - `deploy/signer/reference_signer.py`
 - `docs/AI/TASK_INDEX.md`
 - `docs/AI/SESSION_STATE.md`
+- `src/chain/rpc.rs`
 - `src/config.rs`
 - `src/db/migrations.rs`
 - `src/domain/address.rs`
@@ -144,7 +160,7 @@
 ## 4. 已运行的验证命令及结果
 
 - `cargo check --all-targets`: **通过**。零错误，零警告。
-- `cargo test`: **通过**。全量 204+ 个单元测试、契约测试、集成测试全部绿色通过。
+- `cargo test`: **通过**。全量 230 个测试（211 lib tests + 19 integration tests）全部绿色通过。
 - `bash scripts/verify_production_readiness.sh --env-file .env.production.example`: **通过**。21 checks passed, 0 failed.
 
 ---
@@ -152,21 +168,22 @@
 ## 5. 未解决问题与剩余工作
 
 - **无未解决问题**。
-- `docs/AI/TASK_INDEX.md` 中所有 30 个任务卡（TASK-001 ~ TASK-030）全部处于 `DONE` 状态。
-- 系统已实现完全智能自适应免 Gas 归集（USDC EIP-3009 / Polygon USDT MetaTx / L2 USDT EIP-2612 / Standard 回退）。
+- `docs/AI/TASK_INDEX.md` 中所有 31 个任务卡（TASK-001 ~ TASK-031）全部处于 `DONE` 状态。
+- 系统已实现完全智能自适应链上探查与免 Gas 归集（USDC EIP-3009 / Polygon USDT MetaTx / L2 USDT EIP-2612 / 自动链上探查 / Standard 回退）。
 
 ---
 
 ## 6. 下一步任务与读取入口
 
-- **项目状态**: **100% 生产就绪、审计加固、免 Gas 归集与自适应最佳策略落地 (Production Ready, Audited & Auto Optimal Sweep)**
+- **项目状态**: **100% 生产就绪、审计加固、免 Gas 归集、智能知识库与链上动态探查落地 (Production Ready, Audited & On-chain Probed Auto Optimal Sweep)**
 - **读取入口**:
   1. [docs/PRODUCTION_READINESS.md](file:///ssd0/git/pay3/docs/PRODUCTION_READINESS.md) (生产验收结论与上线命令)
   2. [docs/RUNBOOK.md](file:///ssd0/git/pay3/docs/RUNBOOK.md) (故障排查与运维指南)
   3. [docs/DEPLOYMENT.md](file:///ssd0/git/pay3/docs/DEPLOYMENT.md) (生产部署架构)
   4. [docs/AI/ARCHITECTURE.md](file:///ssd0/git/pay3/docs/AI/ARCHITECTURE.md) (系统架构)
   5. [docs/AI/TASK_INDEX.md](file:///ssd0/git/pay3/docs/AI/TASK_INDEX.md) (全量任务卡索引)
-  6. [docs/AI/tasks/TASK-030.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-030.md) (自适应最优归集方案卡)
+  6. [docs/AI/tasks/TASK-031.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-031.md) (链上动态探查器任务卡)
+
 
 
 
