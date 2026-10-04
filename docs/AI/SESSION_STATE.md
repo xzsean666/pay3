@@ -1,13 +1,13 @@
 # Pay3 当前会话状态 (Session State)
 
-更新时间：2026-10-03
+更新时间：2026-10-04
 
 ---
 
 ## 1. 当前上下文
 
-- **当前 Goal**: 全面安全审计缺陷修复与高并发性能优化（EIP-2612 安全回退、多链 Worker 强隔离、Reorg 自动自愈、精准日志过滤、全表扫描索引补齐与并发优化）
-- **当前 Task**: [TASK-033: 全面安全审计缺陷修复与高并发性能优化](file:///ssd0/git/pay3/docs/AI/tasks/TASK-033.md)
+- **当前 Goal**: 统一本地与远程 SSH 自动化部署与无损升级体系
+- **当前 Task**: [TASK-034: 统一本地与远程 SSH 自动化部署与无损升级脚本](file:///ssd0/git/pay3/docs/AI/tasks/TASK-034.md)
 - **当前状态**: `DONE`
 
 ---
@@ -59,33 +59,36 @@
    - 彻底移除 `Dockerfile`、`Dockerfile.prebuilt`、`Dockerfile.prebuilt.cn` 中的 `KVDB_PATH` 与匿名 `VOLUME ["/var/lib/pay3"]` 声明，保持 100% 容器无状态；
    - `src/config.rs` 中将 `KVDB_PATH` 改为可选注入，`.env.production.example` 移除无用占位符；
    - `.gitignore` 增加忽略 `data/` 本地持久化目录；更新 `docs/DEPLOYMENT.md` 相关说明。
+7. **完成 TASK-034：统一本地与远程 SSH 自动化部署与无损升级脚本**:
+   - 实现 `scripts/deploy.sh`，具备完整的模式选择（`--mode local|ssh`，提供 `--remote` 时自动设为 `ssh`）；
+   - 支持部署目录自动规范化：远端或本地指定父级目录时，自动创建并部署至 `<dir>/pay3`；本地模式下默认使用当前仓库，无需输入文件夹；
+   - 支持传入机密环境变量（`-e / --env-file`）与业务配置（`-c / --config-file` / `pay3.yaml`），自动设置 `chmod 600` 机密保护并通过 `docker-compose.override.yml` 挂载；
+   - 保护数据库持久卷无损升级：`rsync` 增量同步排除 `data/` 目录；采用 `docker compose up -d --build` 原地重启，不执行 `down -v`，启动自动运行 SQLx schema migrations，彻底避免数据丢失；
+   - 包含部署后 `/readyz` 深度就绪检查与超时日志自动回显。
 
 ---
 
 ## 3. 修改、创建与移除的文件清单
 
+### 新增文件
+- `scripts/deploy.sh`
+- `docs/AI/tasks/TASK-034.md`
+
 ### 修改文件
-- `.env.production.example`
-- `.gitignore`
-- `Dockerfile`
-- `Dockerfile.prebuilt`
-- `Dockerfile.prebuilt.cn`
-- `docker-compose.yml`
-- `docker-compose.prebuilt.yml`
-- `docker-compose.prebuilt.cn.yml`
-- `docs/AI/SESSION_STATE.md`
 - `docs/DEPLOYMENT.md`
-- `src/config.rs`
+- `docs/AI/TASK_INDEX.md`
+- `docs/AI/SESSION_STATE.md`
 
 ---
 
 ## 4. 已运行的验证命令及结果
 
-- `cargo check --all-targets`: **通过**。零错误，零警告。
-- `cargo test --all-targets`: **通过**。全量 240+ 项测试 100% 绿色通过。
-- `docker compose config`（全系列 compose 文件）: **通过**。语法与数据卷绑定完全合规。
-- `bash scripts/verify_production_readiness.sh --env-file .env.production.example --skip-connectivity`: **通过**。
-- `bash scripts/verify_production_readiness.sh --test-violations`: **通过**。8/8 拦截率 100%。
+- `bash -n scripts/deploy.sh`: **通过**。语法静态检查通过。
+- `scripts/deploy.sh --help`: **通过**。帮助文档清晰输出。
+- `scripts/deploy.sh -e .env.example -c pay3.example.yaml --dry-run`: **通过**。本地默认免目录部署演练通过。
+- `scripts/deploy.sh --mode local -d /data -e .env.example --dry-run`: **通过**。本地指定目录自动拼接 `/data/pay3` 演练通过。
+- `scripts/deploy.sh --remote root@192.168.1.100 -d /opt -e .env.example -c pay3.example.yaml --dry-run`: **通过**。远程 SSH 模式自动拼接 `/opt/pay3`、rsync 排除规则、override 生成、compose up 演练通过。
+- 异常边界用例（缺少 `-d`、文件不存在、非法参数等）测试: **通过**。错误提示清晰规范。
 
 ---
 
