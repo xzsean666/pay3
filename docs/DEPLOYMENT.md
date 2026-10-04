@@ -6,7 +6,7 @@
 
 本地 dry-run 入口：
 
-- `Dockerfile`: 多阶段 Rust release build，runtime 非 root 用户，挂载 `/var/lib/pay3` 保存 redb KVDB，默认 healthcheck 调 `/readyz`。
+- `Dockerfile`: 多阶段 Rust release build，runtime 非 root 用户，100% 无状态运行，默认 healthcheck 调 `/readyz`。
 - `docker-compose.yml`: 默认只启动 `pay3` 并要求传入 `DATABASE_URL`；内置 PostgreSQL 只在 `local-db` profile 下启用；暴露 `3000`。
 - `.env.example`: 本地开发/staging dry-run 示例；production 必须改用真实 RPC、外部 signer、RS256/EdDSA JWT key source 和 secret manager。
 - `deploy/prometheus/pay3-alerts.example.yml`: Prometheus 告警 dry-run 示例规则。
@@ -172,9 +172,8 @@ PAY3_ENV_FILE=.env.test docker compose --env-file .env.test config
 
 - `pay3.environment.DATABASE_URL` 是目标 PostgreSQL，不是空值。
 - `pay3.environment.APP_BIND` 在 Compose 下是 `0.0.0.0:3000`。
-- `pay3.environment.KVDB_PATH` 在 Compose 下是 `/var/lib/pay3/pay3.redb`。
 - `pay3.ports` 是否符合预期，例如 `127.0.0.1:3000:3000` 或 `3000:3000`。
-- `pay3.volumes` 包含 `pay3-kvdb:/var/lib/pay3`。
+- 本地 PostgreSQL 数据通过 `./data/postgres` 目录挂载持久化。
 
 ### 4. 启动
 
@@ -261,13 +260,14 @@ PAY3_ENV_FILE=.env.test docker compose --env-file .env.test up -d --build pay3
 docker compose --env-file .env.test logs -f pay3
 ```
 
-保留 `pay3-kvdb` volume 可以让 redb 扫链缓存持续存在。测试环境需要从头重建 KVDB 时才删除 volume：
+本地 PostgreSQL 数据保存在 `./data/postgres` 目录下。测试环境如需彻底清空本地数据库：
 
 ```bash
-docker compose --env-file .env.test down -v
+docker compose --env-file .env.test down
+rm -rf ./data/postgres
 ```
 
-不要在有真实资金风险的环境随意执行 `down -v`。
+不要在有真实资金风险的环境随意删除 `./data/postgres`。
 
 ### `.env.test` 使用结论
 

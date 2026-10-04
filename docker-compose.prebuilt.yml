@@ -21,7 +21,7 @@ services:
     ports:
       - "5432:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
 
   pay3:
     build:
@@ -36,7 +36,6 @@ services:
     environment:
       APP_BIND: 0.0.0.0:3000
       DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in the shell, .env, or docker compose --env-file}
-      KVDB_PATH: /var/lib/pay3/pay3.redb
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:
@@ -51,9 +50,3 @@ services:
       start_period: 30s
     ports:
       - "${PAY3_PORT:-3000}:3000"
-    volumes:
-      - pay3-kvdb:/var/lib/pay3
-
-volumes:
-  postgres-data:
-  pay3-kvdb:

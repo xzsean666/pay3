@@ -53,48 +53,43 @@
      - 在 `RpcRangeSource::transfer_logs` 中引入 `futures_util::future::try_join_all`，将原本多区块头的串行网络 await 改为并发并行批量拉取，大幅降低扫链 RPC 时延；
    - **[LOW-01] LocalMnemonicSigner 路径私钥缓存**:
      - 为测试/开发环境 `LocalMnemonicSigner` 增加按路径缓存的 `signer_cache`，消除对同一子地址多次操作时重复执行 2048 轮 PBKDF2 的 CPU 开销。
+6. **Docker 部署工件与配置中彻底清理 KVDB 遗留与卷挂载优化**:
+   - 彻底移除 `docker-compose.yml`、`docker-compose.prebuilt.yml`、`docker-compose.prebuilt.cn.yml` 中的遗留 `KVDB_PATH` 环境变量与 `pay3-kvdb` 命名卷；
+   - 移除 top-level `volumes:` 块，将 PostgreSQL 数据卷改为 `./data/postgres` 本地相对路径挂载；
+   - 彻底移除 `Dockerfile`、`Dockerfile.prebuilt`、`Dockerfile.prebuilt.cn` 中的 `KVDB_PATH` 与匿名 `VOLUME ["/var/lib/pay3"]` 声明，保持 100% 容器无状态；
+   - `src/config.rs` 中将 `KVDB_PATH` 改为可选注入，`.env.production.example` 移除无用占位符；
+   - `.gitignore` 增加忽略 `data/` 本地持久化目录；更新 `docs/DEPLOYMENT.md` 相关说明。
 
 ---
 
 ## 3. 修改、创建与移除的文件清单
 
-### 创建文件
-- `docs/AI/tasks/TASK-033.md`
-- `src/db/migrations/20261003000300_performance_audit_indexes.sql`
-- `tests/audit_remediation_contract.rs`
-
 ### 修改文件
-- `Cargo.lock`
-- `Cargo.toml`
+- `.env.production.example`
+- `.gitignore`
+- `Dockerfile`
+- `Dockerfile.prebuilt`
+- `Dockerfile.prebuilt.cn`
+- `docker-compose.yml`
+- `docker-compose.prebuilt.yml`
+- `docker-compose.prebuilt.cn.yml`
 - `docs/AI/SESSION_STATE.md`
-- `docs/AI/TASK_INDEX.md`
-- `src/api/mod.rs`
-- `src/auth/jwt.rs`
-- `src/chain/mod.rs`
-- `src/chain/rpc.rs`
-- `src/db/repositories/collections.rs`
-- `src/db/repositories/outbound.rs`
-- `src/domain/permit.rs`
-- `src/error.rs`
-- `src/runtime.rs`
-- `src/services/collections.rs`
-- `src/services/verify/service.rs`
-- `src/signer/local.rs`
-- `src/workers/collector.rs`
-- `src/workers/scanner.rs`
-- `tests/collector_recovery_integration.rs`
-- `tests/migration_contract.rs`
+- `docs/DEPLOYMENT.md`
+- `src/config.rs`
 
 ---
 
 ## 4. 已运行的验证命令及结果
 
 - `cargo check --all-targets`: **通过**。零错误，零警告。
-- `cargo test --test audit_remediation_contract`: **通过**。全部通过。
 - `cargo test --all-targets`: **通过**。全量 240+ 项测试 100% 绿色通过。
+- `docker compose config`（全系列 compose 文件）: **通过**。语法与数据卷绑定完全合规。
+- `bash scripts/verify_production_readiness.sh --env-file .env.production.example --skip-connectivity`: **通过**。
+- `bash scripts/verify_production_readiness.sh --test-violations`: **通过**。8/8 拦截率 100%。
 
 ---
 
 ## 5. 未解决问题与剩余工作
 
-- 无遗留阻断项。所有安全漏洞与性能瓶颈均已彻底修复并形成自动化契约测试保护。
+- 无遗留阻断项。
+

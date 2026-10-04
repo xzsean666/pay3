@@ -24,14 +24,12 @@ RUN apt-get update && \
 
 COPY --from=builder /usr/local/bin/pay3 /usr/local/bin/pay3
 
-ENV APP_BIND=0.0.0.0:3000 \
-    KVDB_PATH=/var/lib/pay3/pay3.redb
+ENV APP_BIND=0.0.0.0:3000
 
 WORKDIR /var/lib/pay3
 USER pay3:pay3
 
 EXPOSE 3000
-VOLUME ["/var/lib/pay3"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD curl -fsS http://127.0.0.1:3000/readyz >/dev/null || exit 1

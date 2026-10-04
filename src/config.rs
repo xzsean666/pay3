@@ -964,7 +964,11 @@ impl AppConfig {
                 url: values.required(&["DATABASE_URL"])?,
             },
             kvdb: KvdbConfig {
-                path: PathBuf::from(values.required(&["KVDB_PATH", "REDB_PATH"])?),
+                path: PathBuf::from(
+                    values
+                        .optional(&["KVDB_PATH", "REDB_PATH"])
+                        .unwrap_or(""),
+                ),
                 manual_rebuild_floor_block: parse_optional_u64_value(
                     &values,
                     &[
