@@ -23,6 +23,32 @@ services:
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
 
+  signer:
+    build:
+      context: ./deploy/signer
+      dockerfile: Dockerfile
+    image: pay3-signer:local
+    restart: unless-stopped
+    profiles:
+      - signer
+    environment:
+      SIGNER_HOST: 0.0.0.0
+      SIGNER_PORT: 8088
+      SIGNER_KEY_REF: ${SIGNER_KEY_REF:-pay3-master}
+      SIGNER_AUTH_TOKEN: ${SIGNER_REMOTE_BEARER_TOKEN:-${SIGNER_AUTH_TOKEN:-}}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import urllib.request, os; sys_token=os.getenv('SIGNER_AUTH_TOKEN', ''); req=urllib.request.Request('http://127.0.0.1:8088/healthz'); req.add_header('Authorization', f'Bearer {sys_token}') if sys_token else None; res=urllib.request.urlopen(req); exit(0 if res.getcode()==200 else 1)\"",
+        ]
+      interval: 10s
+      timeout: 3s
+      start_period: 3s
+      retries: 3
+    ports:
+      - "${SIGNER_PORT_BIND:-127.0.0.1:8088}:8088"
+
   pay3:
     build:
       context: .
@@ -33,7 +59,7 @@ services:
       - ${PAY3_ENV_FILE:-.env.example}
     environment:
       APP_BIND: 0.0.0.0:3000
-      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in the shell, .env, or docker compose --env-file}
+      DATABASE_URL: ${DATABASE_URL:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     healthcheck:

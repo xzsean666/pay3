@@ -26,6 +26,7 @@ TARGET_PARENT_DIR=""
 TARGET_DIR=""
 ENV_FILE=""
 CONFIG_FILE=""
+SERVICE_TARGET="pay3"
 PREBUILT=false
 CN_MIRROR=false
 LOCAL_DB=false
@@ -65,6 +66,15 @@ ${BOLD}Pay3 自动化部署与无损升级工具${NC}
 ${BOLD}用法:${NC}
   $0 [选项]
 
+${BOLD}部署服务与形态:${NC}
+  --service, --target <pay3|signer|all>
+                              指定部署目标服务 (默认: pay3)。
+                              * pay3:   仅部署 Pay3 网关主服务 (+ 可选 local-db 数据库)。
+                              * signer: 仅部署独立 Signer 签名机服务。
+                              * all:    同时部署 Pay3 与 Signer (+ 可选 local-db 数据库)。
+  --with-signer               快捷标志，等同于 --service all (同时部署 Pay3 与 Signer)。
+  --signer-only               快捷标志，等同于 --service signer (仅部署独立 Signer 签名机)。
+
 ${BOLD}部署模式与目标:${NC}
   -m, --mode <local|ssh>      部署模式: local (本地部署) 或 ssh (远程部署)。
                               若指定了 --remote / -s，则默认自动进入 ssh 模式；否则默认为 local。
@@ -89,23 +99,27 @@ ${BOLD}构建与运行选项:${NC}
   --local-db                  强制启用内置 PostgreSQL 容器 (--profile local-db)。
                               若未指定，脚本会在检测到 DATABASE_URL 指向 postgres 容器时自动开启。
   --compose-file <file>       指定自定义 Docker Compose 文件 (覆盖默认判断)。
-  --skip-healthcheck          部署后跳过 /readyz 深度健康检查。
+  --skip-healthcheck          部署后跳过健康自检。
   --timeout <seconds>         就绪健康检查超时时间，默认 90 秒。
   --dry-run                   仅打印部署计划与将要执行的命令，不执行真实操作。
   -h, --help                  显示此帮助信息。
 
 ${BOLD}使用示例:${NC}
-  1. 本地直接部署/升级当前仓库 (使用自定义 env 与 yaml):
+  1. 本地一键部署当前仓库 (默认仅 pay3，免输入目录):
      $0 -e .env.prod -c pay3.prod.yaml
 
-  2. 本地指定目录部署/升级:
+  2. 本地/远程一键一体化全量部署 (Pay3 + Signer + DB 一次性部署完):
+     $0 --with-signer -e .env.prod -c pay3.prod.yaml
+     # 或远程 SSH 一体化部署:
+     $0 --remote root@192.168.1.100 -d /opt --with-signer -e .env.production -c pay3.yaml
+
+  3. 仅部署独立签名机服务 (部署到专用内网机器):
+     $0 --remote root@signer.internal -d /opt --signer-only -e .env.signer
+
+  4. 本地指定目录部署/升级:
      $0 --mode local -d /data/services -e .env.prod -c pay3.prod.yaml
-     # 将在 /data/services/pay3 下部署并保留历史数据
 
-  3. 远程 SSH 部署/升级 (自动创建 /opt/pay3 且保留旧数据库):
-     $0 --remote root@192.168.1.100 -d /opt -e .env.production -c pay3.yaml
-
-  4. 远程 SSH 快速升级 (目标服务器已有配置，仅更新程序版本):
+  5. 远程 SSH 快速升级 (目标服务器已有配置，仅更新程序版本):
      $0 --remote ubuntu@server.example.com -d /var/www -p 2222
 EOF
 }
@@ -115,6 +129,18 @@ EOF
 # ------------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --service|--target)
+      SERVICE_TARGET="$2"
+      shift 2
+      ;;
+    --with-signer|--all)
+      SERVICE_TARGET="all"
+      shift
+      ;;
+    --signer-only)
+      SERVICE_TARGET="signer"
+      shift
+      ;;
     -m|--mode)
       MODE="$2"
       shift 2
@@ -196,6 +222,11 @@ fi
 
 if [[ "$MODE" != "local" && "$MODE" != "ssh" ]]; then
   log_error "不支持的部署模式: $MODE (仅支持 local 或 ssh)"
+  exit 1
+fi
+
+if [[ "$SERVICE_TARGET" != "pay3" && "$SERVICE_TARGET" != "signer" && "$SERVICE_TARGET" != "all" ]]; then
+  log_error "不支持的服务目标: $SERVICE_TARGET (仅支持 pay3, signer 或 all)"
   exit 1
 fi
 
@@ -285,6 +316,7 @@ run_target_sh() {
 # ------------------------------------------------------------------------------
 log_info "=== Pay3 部署准备 ==="
 log_info "部署模式: $MODE"
+log_info "部署目标服务: $SERVICE_TARGET"
 log_info "目标部署目录: $TARGET_DIR"
 log_info "使用 Compose 文件: $COMPOSE_FILE"
 [[ -n "$ENV_FILE" ]] && log_info "指定环境变量文件: $ENV_FILE"
@@ -466,53 +498,114 @@ fi
 # ------------------------------------------------------------------------------
 # 7. 自动化升级与无损启动 (docker compose up -d --build)
 # ------------------------------------------------------------------------------
-# 检测是否需要激活 local-db (Compose 内置 PostgreSQL)
-DETECT_LOCAL_DB_SCRIPT='
-if [ -f .env ] && grep -E "DATABASE_URL=.*postgres(ql)?://pay3:[^@]+@postgres:5432" .env >/dev/null 2>&1; then
-  echo "LOCAL_DB"
-else
-  echo "EXTERNAL_DB"
+COMPOSE_PROFILES=()
+if [[ "$SERVICE_TARGET" == "signer" || "$SERVICE_TARGET" == "all" ]]; then
+  COMPOSE_PROFILES+=(--profile signer)
 fi
-'
+
 USE_LOCAL_DB=false
-if [[ "$LOCAL_DB" == true ]]; then
-  USE_LOCAL_DB=true
-else
-  if [[ "$DRY_RUN" == false ]]; then
-    DB_DETECTION="$(run_target_sh "cd '$TARGET_DIR' && $DETECT_LOCAL_DB_SCRIPT" | tr -d '\r\n')"
-    if [[ "$DB_DETECTION" == *"LOCAL_DB"* ]]; then
-      USE_LOCAL_DB=true
-      log_info "检测到 .env 中使用本地 Compose 内置数据库连接，将自动启用 --profile local-db"
+if [[ "$SERVICE_TARGET" != "signer" ]]; then
+  # 检测是否需要激活 local-db (Compose 内置 PostgreSQL)
+  DETECT_LOCAL_DB_SCRIPT='
+  if [ -f .env ] && grep -E "DATABASE_URL=.*postgres(ql)?://pay3:[^@]+@postgres:5432" .env >/dev/null 2>&1; then
+    echo "LOCAL_DB"
+  else
+    echo "EXTERNAL_DB"
+  fi
+  '
+  if [[ "$LOCAL_DB" == true ]]; then
+    USE_LOCAL_DB=true
+  else
+    if [[ "$DRY_RUN" == false ]]; then
+      DB_DETECTION="$(run_target_sh "cd '$TARGET_DIR' && $DETECT_LOCAL_DB_SCRIPT" | tr -d '\r\n')"
+      if [[ "$DB_DETECTION" == *"LOCAL_DB"* ]]; then
+        USE_LOCAL_DB=true
+        log_info "检测到 .env 中使用本地 Compose 内置数据库连接，将自动启用 --profile local-db"
+      fi
     fi
+  fi
+
+  if [[ "$USE_LOCAL_DB" == true ]]; then
+    COMPOSE_PROFILES+=(--profile local-db)
   fi
 fi
 
-COMPOSE_PROFILE_ARG=""
-if [[ "$USE_LOCAL_DB" == true ]]; then
-  COMPOSE_PROFILE_ARG="--profile local-db"
-fi
-
-log_info "=== 开始执行容器重构与无损升级 ==="
-log_info "核心说明: 本操作仅升级应用镜像，原 ./data/postgres 数据库持久卷完整保留，启动后自动执行 Schema 数据库迁移。"
-
-DEPLOY_UP_SCRIPT="
+if [[ "$SERVICE_TARGET" == "signer" ]]; then
+  log_info "=== 开始执行 Signer 独立签名机容器构建与启动 ==="
+  DEPLOY_UP_SCRIPT="
 cd '$TARGET_DIR'
 export PAY3_ENV_FILE=.env
-$TARGET_COMPOSE_BIN -f '$COMPOSE_FILE' $COMPOSE_PROFILE_ARG up -d --build
+export DATABASE_URL=\${DATABASE_URL:-postgres://placeholder}
+$TARGET_COMPOSE_BIN -f '$COMPOSE_FILE' ${COMPOSE_PROFILES[*]} up -d --build signer
 "
+elif [[ "$SERVICE_TARGET" == "pay3" ]]; then
+  log_info "=== 开始执行 Pay3 网关容器重构与无损升级 ==="
+  log_info "核心说明: 本操作仅升级应用镜像，原 ./data/postgres 数据库持久卷完整保留，启动后自动执行 Schema 数据库迁移。"
+  DEPLOY_UP_SCRIPT="
+cd '$TARGET_DIR'
+export PAY3_ENV_FILE=.env
+$TARGET_COMPOSE_BIN -f '$COMPOSE_FILE' ${COMPOSE_PROFILES[*]} up -d --build pay3 $([[ "$USE_LOCAL_DB" == true ]] && echo "postgres")
+"
+else
+  # all 模式
+  log_info "=== 开始执行 Pay3 + Signer (+ 数据库) 一体化全量容器构建与无损升级 ==="
+  log_info "核心说明: Signer 与 Pay3 容器联合启动并共享内网，./data/postgres 持久卷完整保留，自动执行 Schema 迁移。"
+  DEPLOY_UP_SCRIPT="
+cd '$TARGET_DIR'
+export PAY3_ENV_FILE=.env
+$TARGET_COMPOSE_BIN -f '$COMPOSE_FILE' ${COMPOSE_PROFILES[*]} up -d --build
+"
+fi
 
 run_target_sh "$DEPLOY_UP_SCRIPT"
 
 # ------------------------------------------------------------------------------
-# 8. 服务健康检查与就绪验证 (/readyz)
+# 8. 服务健康检查与就绪验证
 # ------------------------------------------------------------------------------
 if [[ "$SKIP_HEALTHCHECK" == true ]]; then
   log_warn "已跳过就绪健康检查 (--skip-healthcheck)"
 elif [[ "$DRY_RUN" == true ]]; then
-  log_info "[DRY-RUN] 将执行轮询检查 /readyz 接口直到就绪"
+  log_info "[DRY-RUN] 将根据目标服务 ($SERVICE_TARGET) 执行健康自检"
 else
-  log_info "正在等待 Pay3 服务就绪并执行健康检查 (/readyz)..."
-  HEALTH_CHECK_SCRIPT="
+  # 1. Signer 健康检查
+  if [[ "$SERVICE_TARGET" == "signer" || "$SERVICE_TARGET" == "all" ]]; then
+    log_info "正在等待 Signer 签名机服务就绪 (/healthz)..."
+    SIGNER_HEALTH_SCRIPT="
+cd '$TARGET_DIR'
+timeout=$TIMEOUT
+start_time=\$(date +%s)
+ready=0
+
+while [ \$(( \$(date +%s) - start_time )) -lt \$timeout ]; do
+  if $TARGET_COMPOSE_BIN exec -T signer python3 -c \"import urllib.request, os; sys_token=os.getenv('SIGNER_AUTH_TOKEN', ''); req=urllib.request.Request('http://127.0.0.1:8088/healthz'); req.add_header('Authorization', f'Bearer {sys_token}') if sys_token else None; res=urllib.request.urlopen(req); exit(0 if res.getcode()==200 else 1)\" >/dev/null 2>&1; then
+    ready=1
+    break
+  fi
+  sleep 2
+done
+
+if [ \$ready -eq 1 ]; then
+  echo 'SIGNER_OK'
+else
+  echo 'SIGNER_FAILED'
+  echo '--- signer 容器尾部日志 ---'
+  $TARGET_COMPOSE_BIN logs --tail=60 signer
+fi
+"
+    CHECK_OUTPUT="$(run_target_sh "$SIGNER_HEALTH_SCRIPT")"
+    if [[ "$CHECK_OUTPUT" == *"SIGNER_OK"* ]]; then
+      log_success "Signer 签名机启动成功并通过健康检查 (/healthz OK)！"
+    else
+      log_error "Signer 签名机健康检查未通过！详细日志输出如下:"
+      printf "%s\n" "$CHECK_OUTPUT"
+      exit 1
+    fi
+  fi
+
+  # 2. Pay3 网关深度健康检查
+  if [[ "$SERVICE_TARGET" == "pay3" || "$SERVICE_TARGET" == "all" ]]; then
+    log_info "正在等待 Pay3 服务就绪并执行健康检查 (/readyz)..."
+    PAY3_HEALTH_SCRIPT="
 cd '$TARGET_DIR'
 timeout=$TIMEOUT
 start_time=\$(date +%s)
@@ -527,20 +620,21 @@ while [ \$(( \$(date +%s) - start_time )) -lt \$timeout ]; do
 done
 
 if [ \$ready -eq 1 ]; then
-  echo 'HEALTH_OK'
+  echo 'PAY3_OK'
 else
-  echo 'HEALTH_FAILED'
+  echo 'PAY3_FAILED'
   echo '--- pay3 容器尾部日志 ---'
   $TARGET_COMPOSE_BIN logs --tail=60 pay3
 fi
 "
-  CHECK_OUTPUT="$(run_target_sh "$HEALTH_CHECK_SCRIPT")"
-  if [[ "$CHECK_OUTPUT" == *"HEALTH_OK"* ]]; then
-    log_success "Pay3 服务启动成功并通过就绪健康检查 (/readyz OK)！"
-  else
-    log_error "服务健康检查超时或未通过！详细日志输出如下:"
-    printf "%s\n" "$CHECK_OUTPUT"
-    exit 1
+    CHECK_OUTPUT="$(run_target_sh "$PAY3_HEALTH_SCRIPT")"
+    if [[ "$CHECK_OUTPUT" == *"PAY3_OK"* ]]; then
+      log_success "Pay3 服务启动成功并通过就绪健康检查 (/readyz OK)！"
+    else
+      log_error "Pay3 服务健康检查超时或未通过！详细日志输出如下:"
+      printf "%s\n" "$CHECK_OUTPUT"
+      exit 1
+    fi
   fi
 fi
 

@@ -98,42 +98,54 @@ Pay3 提供了开箱即用的自动化部署与无损升级脚本 `scripts/deplo
 1. **本地与远程统一**:
    - 本地部署模式无需指定目录，默认直接部署在当前仓库根目录；
    - 远程 SSH 模式接收目标父级目录（例如 `-d /opt`），自动在远端创建 `/opt/pay3` 目录并部署。
-2. **配置与机密自动化**:
+2. **支持三种部署形态**:
+   - **默认网关模式 (`--service pay3`)**: 仅部署 Pay3 网关（+ 可选 `local-db` 数据库）。
+   - **一体化全量模式 (`--with-signer` / `--service all`)**: 一键同时部署 Pay3 与独立 Signer 签名机（+ 可选 `local-db` 数据库），容器间通过 Docker 内部虚拟局域网通信，满足生产网络隔离同时实现单机一次性部署。
+   - **独立签名机模式 (`--signer-only` / `--service signer`)**: 仅部署独立 Signer 签名机服务，适用于将签名机单独部署在专用隔离物理机的场景。
+3. **配置与机密自动化**:
    - 支持传入指定环境文件（`-e .env.prod`）与业务配置文件（`-c pay3.yaml`）；
    - 自动设置 `.env` 为 `600` 权限安全保护；
    - 若传入了 `pay3.yaml`，脚本会自动维护 `docker-compose.override.yml` 将其只读挂载到容器 `/var/lib/pay3/pay3.yaml`。
-3. **无损升级保证 (Upgrade Without Data Loss)**:
+4. **无损升级保证 (Upgrade Without Data Loss)**:
    - 基于 `rsync` 同步代码，严格排除 `./data/` 目录；
    - 容器启动采用 `docker compose up -d --build` 原地滚动更新，严禁清空 `./data/postgres`；
    - 容器启动后自动执行 SQLx 数据库 schema 迁移，确保历史订单、支付、归集及交易数据 100% 完整保留；
    - 再次运行脚本即为版本升级，无需手动停止或删除数据。
-4. **服务就绪深度校验**:
-   - 部署后自动轮询容器 `/readyz` 接口进行深层依赖（DB、RPC、Signer、Scanner）检查；
-   - 若超时未就绪，自动打印容器尾部日志协助定位故障。
+5. **服务就绪深度校验**:
+   - 部署后自动针对目标服务进行健康检查（Signer 检查 `/healthz`，Pay3 深度检查 `/readyz`）；
+   - 若超时未就绪，自动打印对应容器尾部日志协助定位故障。
 
 ### 常用命令示例
 
 ```bash
-# 1. 本地一键部署当前仓库 (免输入目录)
+# 1. 本地一键部署当前仓库 (默认仅 pay3，免输入目录)
 scripts/deploy.sh -e .env.prod -c pay3.prod.yaml
 
-# 2. 本地指定目录部署/升级 (将在 /data/services/pay3 下部署并保留历史数据)
+# 2. 本地/远程一键一体化全量部署 (Pay3 + Signer + 数据库 一次性全部部署完)
+scripts/deploy.sh --with-signer -e .env.prod -c pay3.prod.yaml
+# 或通过远程 SSH 一体化部署:
+scripts/deploy.sh --remote root@192.168.1.100 -d /opt --with-signer -e .env.production -c pay3.yaml
+
+# 3. 仅部署独立签名机服务 (部署到专用内网物理机)
+scripts/deploy.sh --remote root@signer.internal -d /opt --signer-only -e .env.signer
+
+# 4. 本地指定目录部署/升级 (将在 /data/services/pay3 下部署并保留历史数据)
 scripts/deploy.sh --mode local -d /data/services -e .env.prod -c pay3.prod.yaml
 
-# 3. 远程 SSH 首次部署 (自动在远端创建 /opt/pay3 目录并同步配置与代码)
+# 5. 远程 SSH 首次部署 Pay3 网关 (自动在远端创建 /opt/pay3 目录并同步配置与代码)
 scripts/deploy.sh --remote root@192.168.1.100 -d /opt -e .env.production -c pay3.yaml
 
-# 4. 远程 SSH 快速升级 (远端已存有 .env 与 pay3.yaml，仅更新代码和构建)
+# 6. 远程 SSH 快速升级 (远端已存有 .env 与 pay3.yaml，仅更新代码和构建)
 scripts/deploy.sh --remote root@192.168.1.100 -d /opt
 
-# 5. 指定 SSH 端口与密钥部署
+# 7. 指定 SSH 端口与密钥部署
 scripts/deploy.sh --remote ubuntu@server.example.com -p 2222 -i ~/.ssh/id_rsa -d /data/apps -e .env.prod -c pay3.yaml
 
-# 6. 使用国内镜像加速 (预编译二进制 + 阿里云/DaoCloud 镜像)
+# 8. 使用国内镜像加速 (预编译二进制 + 阿里云/DaoCloud 镜像)
 scripts/deploy.sh --remote root@192.168.1.100 -d /opt --cn -e .env.production -c pay3.yaml
 
-# 7. 部署演练 (Dry-run，仅打印部署动作不执行真实操作)
-scripts/deploy.sh --remote root@192.168.1.100 -d /opt -e .env.prod -c pay3.yaml --dry-run
+# 9. 部署演练 (Dry-run，仅打印部署动作不执行真实操作)
+scripts/deploy.sh --remote root@192.168.1.100 -d /opt --with-signer -e .env.prod -c pay3.yaml --dry-run
 ```
 
 ## 服务器 Docker Compose 手动测试部署

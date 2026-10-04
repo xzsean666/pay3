@@ -6,8 +6,8 @@
 
 ## 1. 当前上下文
 
-- **当前 Goal**: 统一本地与远程 SSH 自动化部署与无损升级体系
-- **当前 Task**: [TASK-034: 统一本地与远程 SSH 自动化部署与无损升级脚本](file:///ssd0/git/pay3/docs/AI/tasks/TASK-034.md)
+- **当前 Goal**: 生产级自动化部署、Signer 独立与一体化极简部署
+- **当前 Task**: [TASK-035: 支持 Signer 独立部署与 Pay3 + Signer 一体化极简部署](file:///ssd0/git/pay3/docs/AI/tasks/TASK-035.md)
 - **当前状态**: `DONE`
 
 ---
@@ -64,17 +64,28 @@
    - 支持部署目录自动规范化：远端或本地指定父级目录时，自动创建并部署至 `<dir>/pay3`；本地模式下默认使用当前仓库，无需输入文件夹；
    - 支持传入机密环境变量（`-e / --env-file`）与业务配置（`-c / --config-file` / `pay3.yaml`），自动设置 `chmod 600` 机密保护并通过 `docker-compose.override.yml` 挂载；
    - 保护数据库持久卷无损升级：`rsync` 增量同步排除 `data/` 目录；采用 `docker compose up -d --build` 原地重启，不执行 `down -v`，启动自动运行 SQLx schema migrations，彻底避免数据丢失；
-   - 包含部署后 `/readyz` 深度就绪检查与超时日志自动回显。
+8. **完成 TASK-035：支持 Signer 独立部署与 Pay3 + Signer 一体化极简部署**:
+   - 在 `docker-compose.yml`、`docker-compose.prebuilt.yml`、`docker-compose.prebuilt.cn.yml` 中新增 `signer` 服务并分配 `signer` profile；
+   - 优化 `DATABASE_URL` 插值在 standalone signer 模式下的兼容性；`deploy/signer/Dockerfile` 支持 `ARG PYTHON_IMAGE`；
+   - 升级 `scripts/deploy.sh` 全面支持三种部署形态：
+     - `--service pay3`（默认）：仅部署 Pay3 网关（+ 可选 `local-db`）；
+     - `--with-signer`（或 `--service all`）：Pay3 + Signer (+ 可选 `local-db`) 一体化全量部署，通过内部 Docker 网络隔离；
+     - `--signer-only`（或 `--service signer`）：仅部署独立 Signer 签名机服务，支持专用隔离物理机部署；
+   - 实现双重差异化健康检查：`signer` 校验 `/healthz`，`pay3` 校验 `/readyz`。
 
 ---
 
 ## 3. 修改、创建与移除的文件清单
 
 ### 新增文件
-- `scripts/deploy.sh`
-- `docs/AI/tasks/TASK-034.md`
+- `docs/AI/tasks/TASK-035.md`
 
 ### 修改文件
+- `deploy/signer/Dockerfile`
+- `docker-compose.yml`
+- `docker-compose.prebuilt.yml`
+- `docker-compose.prebuilt.cn.yml`
+- `scripts/deploy.sh`
 - `docs/DEPLOYMENT.md`
 - `docs/AI/TASK_INDEX.md`
 - `docs/AI/SESSION_STATE.md`
@@ -83,12 +94,13 @@
 
 ## 4. 已运行的验证命令及结果
 
-- `bash -n scripts/deploy.sh`: **通过**。语法静态检查通过。
-- `scripts/deploy.sh --help`: **通过**。帮助文档清晰输出。
-- `scripts/deploy.sh -e .env.example -c pay3.example.yaml --dry-run`: **通过**。本地默认免目录部署演练通过。
-- `scripts/deploy.sh --mode local -d /data -e .env.example --dry-run`: **通过**。本地指定目录自动拼接 `/data/pay3` 演练通过。
-- `scripts/deploy.sh --remote root@192.168.1.100 -d /opt -e .env.example -c pay3.example.yaml --dry-run`: **通过**。远程 SSH 模式自动拼接 `/opt/pay3`、rsync 排除规则、override 生成、compose up 演练通过。
-- 异常边界用例（缺少 `-d`、文件不存在、非法参数等）测试: **通过**。错误提示清晰规范。
+- `bash -n scripts/deploy.sh`: **通过**。语法检查零错误。
+- `scripts/deploy.sh --help`: **通过**。三种部署形态及示例完整展示。
+- `docker compose config` (全量 profile 及 cn 镜像配置): **通过**。
+- `scripts/deploy.sh --with-signer -e .env.example -c pay3.example.yaml --dry-run`: **通过**。全量一体化本地演练通过。
+- `scripts/deploy.sh --remote root@192.168.1.100 -d /opt --with-signer -e .env.example -c pay3.example.yaml --dry-run`: **通过**。全量一体化远程 SSH 演练通过。
+- `scripts/deploy.sh --signer-only --dry-run`: **通过**。本地 Signer 独立部署演练通过。
+- `scripts/deploy.sh --remote root@192.168.1.100 -d /opt --signer-only -e .env.example --dry-run`: **通过**。远程 SSH Signer 独立部署演练通过。
 
 ---
 

@@ -67,4 +67,5 @@ TODO -> IN_PROGRESS -> REVIEW -> DONE
 | **TASK-032** | 原生多链多 Token 统一调度引擎 | 单库单私钥下支持 YAML 编排多 Token 矩阵、独立 RPC/Worker 隔离、动态 Axum 路由分发 | TASK-031 | `DONE` | [TASK-032.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-032.md) |
 | **TASK-033** | 全面安全审计缺陷修复与高并发性能优化 | EIP-2612 安全回退、多链 Worker 强隔离、Reorg 自动自愈、精准日志过滤、全表扫描索引补齐与并发优化 | TASK-032 | `DONE` | [TASK-033.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-033.md) |
 | **TASK-034** | 统一本地与远程 SSH 自动化部署与无损升级脚本 | 本地免输入目录/远程 SSH 自动建 pay3 目录、rsync 保护 data/ 数据无损升级、env 与 pay3.yaml 配置自动挂载 | TASK-032, TASK-033 | `DONE` | [TASK-034.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-034.md) |
+| **TASK-035** | 支持 Signer 独立部署与 Pay3 + Signer 一体化极简部署 | Compose 编排 Signer 服务、deploy.sh 支持 --with-signer 与 --signer-only 模式及专用健康检查 | TASK-034 | `DONE` | [TASK-035.md](file:///ssd0/git/pay3/docs/AI/tasks/TASK-035.md) |
 
