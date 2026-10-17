@@ -14,6 +14,7 @@
           <h1>Pay3 前端测试台</h1>
         </div>
         <div class="top-actions">
+          <button id="faucetTopBtn" class="button faucet-link" type="button">🚰 领水 (Faucet)</button>
           <a class="button faucet-link" href="https://amoy.polygonscan.com/address/0xc252a473DC466de3799149A2616ccc625832F40C" target="_blank" rel="noopener noreferrer">
             USDC (Amoy)
           </a>
@@ -29,6 +30,7 @@
 
       <nav class="tabs" aria-label="Pay3 测试流程">
         <button class="tab active" type="button" data-tab="config">连接</button>
+        <button class="tab" type="button" data-tab="faucet">领水 (Faucet)</button>
         <button class="tab" type="button" data-tab="create">创建订单</button>
         <button class="tab" type="button" data-tab="pay">二维码</button>
         <button class="tab" type="button" data-tab="wait">等待支付</button>
@@ -90,6 +92,88 @@
           </div>
           <textarea id="tokenField" spellcheck="false" rows="5" placeholder="浏览器直连时会使用这里的 Bearer token"></textarea>
           <p id="tokenMeta" class="hint">内置长期测试 token 适配 development JWT 配置。</p>
+        </div>
+      </section>
+
+      <section id="panel-faucet" class="panel" data-panel="faucet">
+        <div class="panel-head">
+          <div>
+            <h2>🚰 Polygon Amoy 测试币领水 (Faucet)</h2>
+            <p>连接 Web3 钱包（MetaMask / OKX / Rabby）一键领取 1,000 测试代币，或直接将代币添加到钱包中查看。</p>
+          </div>
+          <div class="button-row">
+            <button id="connectWalletBtn" type="button" class="button primary">连接 Web3 钱包</button>
+            <button id="switchNetworkBtn" type="button" class="button">切换 Amoy 网络</button>
+          </div>
+        </div>
+
+        <div class="status-strip">
+          <div>
+            <span class="label">连接钱包地址</span>
+            <strong id="faucetWalletAddress" style="word-break: break-all; font-size: 13px;">未连接</strong>
+          </div>
+          <div>
+            <span class="label">POL (Gas)</span>
+            <strong id="faucetPolBalance">-</strong>
+          </div>
+          <div>
+            <span class="label">MockUSDC 余额</span>
+            <strong id="faucetUsdcBalance">-</strong>
+          </div>
+          <div>
+            <span class="label">MockUSDT 余额</span>
+            <strong id="faucetUsdtBalance">-</strong>
+          </div>
+        </div>
+
+        <div class="faucet-cards" style="display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; margin-top: 18px;">
+          <!-- MockUSDC Card -->
+          <div class="card" style="border: 1px solid var(--line); border-radius: 8px; padding: 18px; background: #fafbfc;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+              <h3 style="margin: 0; font-size: 18px; color: var(--blue);">💵 MockUSDC</h3>
+              <span class="badge ok">EIP-3009 免Gas</span>
+            </div>
+            <p class="hint" style="margin-bottom: 8px; word-break: break-all;">
+              合约地址: <code id="faucetUsdcAddrText">0xc252a473DC466de3799149A2616ccc625832F40C</code>
+            </p>
+            <p class="hint" style="margin-bottom: 14px;">
+              Circle 原生标准：支持 <code>transferWithAuthorization</code> 免 Gas 签名支付，公测水龙头单次领取 1,000 USDC。
+            </p>
+            <div class="button-row">
+              <button id="claimUsdcBtn" type="button" class="button primary">一键领取 1,000 USDC</button>
+              <button id="watchUsdcBtn" type="button" class="button">🦊 加到小狐狸</button>
+              <a class="button" href="https://amoy.polygonscan.com/address/0xc252a473DC466de3799149A2616ccc625832F40C#writeContract" target="_blank" rel="noopener noreferrer">合约调用</a>
+            </div>
+          </div>
+
+          <!-- MockUSDT Card -->
+          <div class="card" style="border: 1px solid var(--line); border-radius: 8px; padding: 18px; background: #fafbfc;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+              <h3 style="margin: 0; font-size: 18px; color: var(--green);">💵 MockUSDT</h3>
+              <span class="badge ok">Polygon MetaTx 免Gas</span>
+            </div>
+            <p class="hint" style="margin-bottom: 8px; word-break: break-all;">
+              合约地址: <code id="faucetUsdtAddrText">0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31</code>
+            </p>
+            <p class="hint" style="margin-bottom: 14px;">
+              Polygon 官方标准：支持 <code>executeMetaTransaction</code> 原生元交易，公测水龙头单次领取 1,000 USDT。
+            </p>
+            <div class="button-row">
+              <button id="claimUsdtBtn" type="button" class="button primary">一键领取 1,000 USDT</button>
+              <button id="watchUsdtBtn" type="button" class="button">🦊 加到小狐狸</button>
+              <a class="button" href="https://amoy.polygonscan.com/address/0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31#writeContract" target="_blank" rel="noopener noreferrer">合约调用</a>
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top: 22px; padding: 18px; border: 1px dashed var(--line); border-radius: 8px; background: #fff;">
+          <h3 style="margin-bottom: 8px;">🛠️ 更多领水方式与开发测试账号</h3>
+          <ul style="margin: 0; padding-left: 20px; color: var(--muted); line-height: 1.8;">
+            <li><strong>内置付款钱包（已充值 100 万测试币）</strong>: <code>0x285bd8C75C7647b7da1C1154776633804d4ff5eC</code></li>
+            <li><strong>铸造/部署钱包（已充值 1000 万测试币 + 11.4 POL）</strong>: <code>0x55193778A808426Eb4024fADAd1aC3c0968E8AF2</code></li>
+            <li><strong>命令行直接领水</strong>: 运行 <code>./deploy/faucet_transfer.sh &lt;你的钱包地址&gt; 1000</code>，自动从部署者钱包划拨 1,000 USDC &amp; USDT。</li>
+            <li><strong>Polygonscan 直接调用</strong>: 访问上方合约链接并在 Write Contract 标签页连接钱包，直接调用 <code>faucet()</code> 或 <code>mint(to, amount)</code>。</li>
+          </ul>
         </div>
       </section>
 

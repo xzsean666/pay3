@@ -109,6 +109,17 @@ function collectEls() {
     "downloadLogsBtn",
     "logList",
     "toast",
+    "faucetTopBtn",
+    "connectWalletBtn",
+    "switchNetworkBtn",
+    "faucetWalletAddress",
+    "faucetPolBalance",
+    "faucetUsdcBalance",
+    "faucetUsdtBalance",
+    "claimUsdcBtn",
+    "claimUsdtBtn",
+    "watchUsdcBtn",
+    "watchUsdtBtn",
   ]) {
     els[id] = document.getElementById(id);
   }
@@ -180,6 +191,14 @@ function bindEvents() {
     renderLogs();
   });
   els.downloadLogsBtn.addEventListener("click", downloadLogs);
+
+  els.faucetTopBtn?.addEventListener("click", () => setTab("faucet"));
+  els.connectWalletBtn?.addEventListener("click", connectFaucetWallet);
+  els.switchNetworkBtn?.addEventListener("click", () => switchAmoyNetwork(true));
+  els.claimUsdcBtn?.addEventListener("click", () => claimFaucetToken("USDC"));
+  els.claimUsdtBtn?.addEventListener("click", () => claimFaucetToken("USDT"));
+  els.watchUsdcBtn?.addEventListener("click", () => watchFaucetAsset("USDC"));
+  els.watchUsdtBtn?.addEventListener("click", () => watchFaucetAsset("USDT"));
 }
 
 async function loadRuntimeConfig() {
@@ -1206,3 +1225,174 @@ function escapeHtml(value) {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#039;");
 }
+
+/* ==============================================================================
+   Web3 Faucet & Wallet Integration
+   ============================================================================== */
+
+const AMOY_CHAIN_ID_HEX = "0x13882"; // 80002
+const AMOY_PARAMS = {
+  chainId: AMOY_CHAIN_ID_HEX,
+  chainName: "Polygon Amoy Testnet",
+  nativeCurrency: { name: "POL", symbol: "POL", decimals: 18 },
+  rpcUrls: ["https://polygon-amoy-bor-rpc.publicnode.com", "https://polygon-amoy.drpc.org"],
+  blockExplorerUrls: ["https://amoy.polygonscan.com/"],
+};
+
+const FAUCET_TOKENS = {
+  USDC: {
+    address: "0xc252a473DC466de3799149A2616ccc625832F40C",
+    symbol: "USDC",
+    decimals: 6,
+  },
+  USDT: {
+    address: "0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31",
+    symbol: "USDT",
+    decimals: 6,
+  },
+};
+
+let currentWalletAddress = null;
+
+async function connectFaucetWallet() {
+  if (!window.ethereum) {
+    toast("未检测到 Web3 钱包，请在安装 MetaMask / OKX 等钱包插件后重试");
+    return;
+  }
+  try {
+    const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+    if (!accounts || !accounts.length) {
+      toast("未获取到钱包地址");
+      return;
+    }
+    currentWalletAddress = accounts[0];
+    if (els.faucetWalletAddress) {
+      els.faucetWalletAddress.textContent = currentWalletAddress;
+    }
+    toast(`已连接: ${currentWalletAddress.slice(0, 6)}...${currentWalletAddress.slice(-4)}`);
+    await switchAmoyNetwork(false);
+    await refreshFaucetBalances();
+  } catch (err) {
+    toast(`连接失败: ${err.message || err}`);
+  }
+}
+
+async function switchAmoyNetwork(notify = true) {
+  if (!window.ethereum) return;
+  try {
+    await window.ethereum.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: AMOY_CHAIN_ID_HEX }],
+    });
+    if (notify) toast("已切换到 Polygon Amoy 网络");
+  } catch (switchError) {
+    if (switchError.code === 4902 || switchError.data?.originalError?.code === 4902) {
+      try {
+        await window.ethereum.request({
+          method: "wallet_addEthereumChain",
+          params: [AMOY_PARAMS],
+        });
+        if (notify) toast("已添加并切换到 Polygon Amoy 网络");
+      } catch (addError) {
+        toast(`添加网络失败: ${addError.message || addError}`);
+      }
+    } else {
+      if (notify) toast(`切换网络失败: ${switchError.message || switchError}`);
+    }
+  }
+}
+
+async function refreshFaucetBalances() {
+  if (!window.ethereum || !currentWalletAddress) return;
+  try {
+    const polHex = await window.ethereum.request({
+      method: "eth_getBalance",
+      params: [currentWalletAddress, "latest"],
+    });
+    const polWei = BigInt(polHex);
+    const polFormatted = (Number(polWei / 1000000000000n) / 1000000).toFixed(4);
+    if (els.faucetPolBalance) els.faucetPolBalance.textContent = `${polFormatted} POL`;
+
+    const paddedAddr = currentWalletAddress.toLowerCase().replace("0x", "").padStart(64, "0");
+    const balanceOfData = "0x70a08231" + paddedAddr;
+
+    const usdcBalHex = await window.ethereum.request({
+      method: "eth_call",
+      params: [{ to: FAUCET_TOKENS.USDC.address, data: balanceOfData }, "latest"],
+    });
+    const usdcRaw = BigInt(usdcBalHex || "0x0");
+    const usdcFormatted = (Number(usdcRaw) / 1e6).toFixed(2);
+    if (els.faucetUsdcBalance) els.faucetUsdcBalance.textContent = `${usdcFormatted} USDC`;
+
+    const usdtBalHex = await window.ethereum.request({
+      method: "eth_call",
+      params: [{ to: FAUCET_TOKENS.USDT.address, data: balanceOfData }, "latest"],
+    });
+    const usdtRaw = BigInt(usdtBalHex || "0x0");
+    const usdtFormatted = (Number(usdtRaw) / 1e6).toFixed(2);
+    if (els.faucetUsdtBalance) els.faucetUsdtBalance.textContent = `${usdtFormatted} USDT`;
+  } catch (err) {
+    console.error("Failed to query balances:", err);
+  }
+}
+
+async function claimFaucetToken(symbol) {
+  if (!window.ethereum) {
+    toast("请先安装 Web3 钱包插件");
+    return;
+  }
+  if (!currentWalletAddress) {
+    await connectFaucetWallet();
+    if (!currentWalletAddress) return;
+  }
+  const token = FAUCET_TOKENS[symbol];
+  if (!token) return;
+
+  try {
+    toast(`正在发起领取 1,000 ${symbol}...`);
+    const txHash = await window.ethereum.request({
+      method: "eth_sendTransaction",
+      params: [
+        {
+          from: currentWalletAddress,
+          to: token.address,
+          data: "0xde5f72fd", // faucet() selector
+        },
+      ],
+    });
+    toast(`领水交易已广播: ${txHash.slice(0, 10)}... 请等待区块确认`);
+    setTimeout(refreshFaucetBalances, 4000);
+    setTimeout(refreshFaucetBalances, 8000);
+  } catch (err) {
+    toast(`领水失败: ${err.message || err}`);
+  }
+}
+
+async function watchFaucetAsset(symbol) {
+  if (!window.ethereum) {
+    toast("请先安装 Web3 钱包插件");
+    return;
+  }
+  const token = FAUCET_TOKENS[symbol];
+  if (!token) return;
+
+  try {
+    const wasAdded = await window.ethereum.request({
+      method: "wallet_watchAsset",
+      params: {
+        type: "ERC20",
+        options: {
+          address: token.address,
+          symbol: token.symbol,
+          decimals: token.decimals,
+        },
+      },
+    });
+    if (wasAdded) {
+      toast(`已成功添加 ${symbol} 到钱包`);
+    }
+  } catch (err) {
+    toast(`添加代币失败: ${err.message || err}`);
+  }
+}
+
