@@ -612,8 +612,8 @@ pub fn build_multi_token_router(
 
     for entry in &tokens {
         let token_router = token_service_router_from_state(entry.state.clone());
-        let lower_addr = entry.token_address.to_string().to_ascii_lowercase();
-        let checksum_addr = entry.token_address.to_string();
+        let lower_addr = entry.token_address.to_lower_hex();
+        let checksum_addr = entry.token_address.to_checksum_hex();
 
         main_router = main_router.nest(&format!("/{lower_addr}"), token_router.clone());
         if checksum_addr != lower_addr {

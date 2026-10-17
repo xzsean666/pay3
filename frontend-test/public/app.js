@@ -200,6 +200,7 @@ function loadPrefs() {
   if (!raw) {
     state.useProxy = state.config.defaultMode !== "direct";
     state.token = state.config.testJwt || "";
+    els.autoVerify.checked = true;
     return;
   }
 
@@ -212,7 +213,7 @@ function loadPrefs() {
     els.apiBaseUrl.value = prefs.apiBaseUrl || state.config.apiBaseUrl || "";
     els.successRedirectUrl.value = prefs.successRedirectUrl || "";
     els.pollIntervalMs.value = String(prefs.pollIntervalMs || 3000);
-    els.autoVerify.checked = Boolean(prefs.autoVerify);
+    els.autoVerify.checked = typeof prefs.autoVerify === "boolean" ? prefs.autoVerify : true;
   } catch (error) {
     log("config", "Failed to parse stored preferences", errorMessage(error));
     state.useProxy = state.config.defaultMode !== "direct";
@@ -279,7 +280,7 @@ function setCallMode(mode) {
 
 function orderApiPrefix() {
   const token = state.order?.payment?.token_address;
-  return token ? `/${token}` : "";
+  return token ? `/${token.toLowerCase()}` : "";
 }
 
 async function refreshStoredOrder() {
@@ -350,18 +351,9 @@ async function createOrder() {
 
   setBusy(els.createOrderBtn, true, "创建中");
   try {
-    const selectedToken = els.tokenSelect ? els.tokenSelect.value : "";
-    let order;
-    try {
-      const endpoint = selectedToken ? `/${selectedToken}/v1/orders` : "/v1/orders";
-      order = await apiRequest(endpoint, { method: "POST", body });
-    } catch (err) {
-      if (selectedToken && err.status === 404) {
-        order = await apiRequest("/v1/orders", { method: "POST", body });
-      } else {
-        throw err;
-      }
-    }
+    const selectedToken = els.tokenSelect ? els.tokenSelect.value.trim().toLowerCase() : "";
+    const endpoint = selectedToken ? `/${selectedToken}/v1/orders` : "/v1/orders";
+    const order = await apiRequest(endpoint, { method: "POST", body });
     state.order = order;
     state.verifyResult = null;
     savePrefs();

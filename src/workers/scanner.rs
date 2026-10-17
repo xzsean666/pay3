@@ -280,15 +280,16 @@ where
         let canonical_head = self.head_reader.latest_head().await?;
         let target_block = canonical_head.number;
 
+        if let Some(outcome) = self.sweep_confirmations(matcher_config).await? {
+            self.record_scanner_lag(
+                target_block,
+                lease.last_scanned_block,
+                matcher_config.min_confirmations,
+            );
+            return Ok(outcome);
+        }
+
         if lease.last_scanned_block >= target_block {
-            if let Some(outcome) = self.sweep_confirmations(matcher_config).await? {
-                self.record_scanner_lag(
-                    target_block,
-                    lease.last_scanned_block,
-                    matcher_config.min_confirmations,
-                );
-                return Ok(outcome);
-            }
             self.record_scanner_lag(
                 target_block,
                 lease.last_scanned_block,

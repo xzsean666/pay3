@@ -106,6 +106,22 @@
        * 扫链入账: 监听 12 确认数后标记 `paid`
        * 免 Gas 归集确认: 归集记录 `73ce93ad-2977-4f7f-a450-b07245983a10` 标记 `confirmed`
        * 归集结果: +6 USDT 准确划转至 Treasury `0x55193778A808426Eb4024fADAd1aC3c0968E8AF2` (余额: 10,000,006 USDT)；
+   - **自动化无头浏览器（Headless Chrome）前端真实环境全链路实测**:
+     - 编写基于 `puppeteer-core` 的端到端浏览器实测脚本，直连测试网前端 `https://home-10010.002788.xyz`；
+     - **MockUSDC 完整 UI 支付闭环**:
+       * 页面动态拉取代币列表并选中 USDC，提交创建订单 `fe-usdc-1792243048422` (金额 2.00 USDC)；
+       * 页面正确渲染订单详情与转账二维码 URI，动态派生收款地址 `0x3d70619dadb7d48aef02ed4409a0e4e12773c62c`；
+       * 链上实付 2 USDC (`0x3b5e20eddc40c7bc11b30f8c67d51a15e2a75ac2ebef89a4c315c4a5186647d3`)，前端进入“等待支付”页自动轮询；
+       * 扫链入账后，页面在 12 秒内**自动跳入“成功页”**，显示绿色“支付成功”徽标与支付详情（订单已支付，paid_amount_raw: 2000000），截图保存为 `02_frontend_usdc_success.png`；
+     - **MockUSDT 完整 UI 支付闭环**:
+       * 点击“再创建一笔”，切换为 USDT 代币，提交创建订单 `fe-usdt-1792243066149` (金额 3.00 USDT)；
+       * 动态派生独立收款地址 `0x21fadc5911d0054e41b16df808784ae60f901757`，截图保存为 `03_frontend_usdt_qr.png`；
+       * 链上实付 3 USDT (`0x2233462b985de118da1805436d0c6e7f2197e5c4154e6a267e0b81c98f4970bc`)；
+       * 前端自动轮询并在 11.9 秒内**自动跳入“成功页”**，状态显示“已支付”，截图保存为 `04_frontend_usdt_success.png`；
+     - **排查并根治两大核心隐藏缺陷**:
+       1. **路由大小写与 EIP-55 校验和匹配**: 为 `EvmAddress` 引入 `to_checksum_hex()`，Axum 路由同时挂载全小写与 Checksum 格式，根治前端或第三方传入大小写混合地址导致的 404；
+       2. **高频出块链确认扫描饥饿 (Confirmation Sweep Starvation)**: 修复 `PaymentScannerWorker::tick`，使成熟观察支付的确认扫描（`sweep_confirmations`）在每个 tick 优先执行，彻底消除高频出块（如 Polygon 2s 出块）导致 `last_scanned_block >= target_block` 条件几乎无法满足的扫链延迟；
+       3. **前端体验优化**: 前端控制台默认勾选 `autoVerify`，兼顾秒级主动链上探测与后台全自动无感知扫链双保险。
 
 ---
 
@@ -128,9 +144,12 @@
 - `src/api/mod.rs`
 - `src/config.rs`
 - `src/health.rs`
+- `src/domain/address.rs`
+- `src/workers/scanner.rs`
 - `src/db/repositories/collections.rs`
 - `src/db/repositories/outbound.rs`
 - `scripts/deploy.sh`
+- `deploy/prebuilt/pay3`
 - `docker-compose.prebuilt.yml`
 - `docker-compose.yml`
 - `frontend-test/public/index.html`
@@ -149,6 +168,7 @@
 - `curl -I https://home-10010.002788.xyz`: **HTTP 200 OK**。前端静态页面正常提供服务。
 - `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 cargo test --test deployed_api_acceptance -- --ignored --nocapture`: **1 passed, 0 failed** (MockUSDC 真实环境 E2E 验收通过，耗时 100.77s)。
 - `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 PAY3_API_TOKEN_PREFIX=0x2c2e569e3df89c55ba46ce52248ae180379d0b31 TOKEN_ADDRESS=0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31 TOKEN_SYMBOL=USDT cargo test --test deployed_api_acceptance -- --ignored --nocapture`: **1 passed, 0 failed** (MockUSDT 真实环境 E2E 验收通过，耗时 101.96s)。
+- `node scratch/test_frontend.js`: **ALL FRONTEND TESTS PASSED SUCCESSFULLY!** (自动化无头浏览器对前端测试台真实界面全流程交互、二维码渲染、链上付款、自动轮询及成功页跳转双币种验收全部通过)。
 
 ---
 

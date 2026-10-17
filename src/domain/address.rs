@@ -48,6 +48,10 @@ impl EvmAddress {
         encode_lower_prefixed(self.as_bytes())
     }
 
+    pub fn to_checksum_hex(self) -> String {
+        self.0.to_checksum(None)
+    }
+
     pub fn parse_hex(s: &str) -> Result<Self, HexParseError> {
         s.parse()
     }
