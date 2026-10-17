@@ -72,39 +72,72 @@
      - `--with-signer`（或 `--service all`）：Pay3 + Signer (+ 可选 `local-db`) 一体化全量部署，通过内部 Docker 网络隔离；
      - `--signer-only`（或 `--service signer`）：仅部署独立 Signer 签名机服务，支持专用隔离物理机部署；
    - 实现双重差异化健康检查：`signer` 校验 `/healthz`，`pay3` 校验 `/readyz`。
+9. **完成测试网 Polygon Amoy 免 Gas 代币部署、远程服务无损升级、测试前端更新与真实链 E2E 验证**:
+   - **自动化代币部署**:
+     - 编写 Foundry 合约：`deploy/tokens/src/MockUSDC.sol` (实现 EIP-3009 `receiveWithAuthorization` 完整免 Gas 归集与 Faucet) 与 `deploy/tokens/src/MockUSDT.sol` (实现 Polygon `executeMetaTransaction` NativeMetaTransaction 完整免 Gas 归集与 Faucet)；
+     - 编写部署脚本 `deploy/deploy_test_tokens.sh` 并成功将合约部署至 Polygon Amoy 测试网（Chain ID 80002）：
+       * `MockUSDC`: `0xc252a473DC466de3799149A2616ccc625832F40C`
+       * `MockUSDT`: `0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31`
+     - 自动为测试付款钱包 `0x285bd8C75C7647b7da1C1154776633804d4ff5eC` 铸造各 1,000,000 代币，并自动为各 Relayer 分配充足原生 POL Gas；
+   - **远程服务升级与 Bugfix**:
+     - 修复 `src/health.rs`：移除已被无状态扫描器取代的过时 `TransferLogIngestor` Worker 依赖，消除 `/readyz` 503 报错；
+     - 修复 `src/db/repositories/outbound.rs`：补全 `claim_signed_collect_tx_for_broadcast` 与 `claim_broadcast_collect_tx_for_receipt` 中缺失的 `o.gas_limit`、`o.max_fee_per_gas`、`o.max_priority_fee_per_gas` 字段查询；
+     - 修复 `src/db/repositories/collections.rs`：在 `create_collection_idempotent` 中增加对子地址已存在活跃归集的优雅捕获并返回已有记录，避免被并发 auto-enqueuer 触发 `one_active_collection_per_child` 唯一键冲突；
+     - 提高默认归集 Gas Limit 至 150,000，并在 `src/config.rs` 与 `pay3.yaml` 中支持按 Token 配置独立的 `gas_limit`；
+     - 增强 `src/api/mod.rs`：多 Token 模式下默认将主代币路由自动 merge 挂载至根路径 `/v1/...`，同时保留各币种独立前缀路径；
+     - 引入 `tower-http` permissive CORS 跨域支持，方便前端直接向网关跨域发起请求；
+     - 升级 `scripts/deploy.sh`：自动检测并在存在 `docker-compose.override.yml` 时联动传递参数，实现 `pay3.yaml` 的零配置挂载。
+   - **测试前端升级**:
+     - 更新 `frontend-test/public/index.html` 与 `app.js`：添加 MockUSDC 和 MockUSDT 在 Polygonscan 上的链上快捷链接，增加币种动态切换下拉菜单；
+     - 容器化配置 `frontend-test` Nginx 静态托管及反向代理，暴露端口 10010（通过 Cloudflare Tunnel `https://home-10010.002788.xyz` 访问）；
+   - **全链路真实链 E2E 验证**:
+     - 运行 `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 cargo test --test deployed_api_acceptance -- --ignored --nocapture`；
+     - 成功通过真实链全生命周期测试（耗时 98s）：动态派生子收款地址 -> 真实广播代币转账 -> 无状态扫链器监听并确认 12 区块更新为 `paid` -> Relayer 自动免 Gas 广播 EIP-3009 归集交易 -> 成功归集至 Treasury 地址并确认！
 
 ---
 
 ## 3. 修改、创建与移除的文件清单
 
 ### 新增文件
-- `docs/AI/tasks/TASK-035.md`
+- `deploy/tokens/src/MockUSDC.sol`
+- `deploy/tokens/src/MockUSDT.sol`
+- `deploy/tokens/test/MockTokens.t.sol`
+- `deploy/deploy_test_tokens.sh`
+- `deploy/tokens_amoy.env`
+- `deploy/tokens_amoy.json`
+- `frontend-test/nginx.conf`
+- `pay3.yaml`
 
 ### 修改文件
-- `deploy/signer/Dockerfile`
-- `docker-compose.yml`
-- `docker-compose.prebuilt.yml`
-- `docker-compose.prebuilt.cn.yml`
+- `Cargo.toml`
+- `src/main.rs`
+- `src/api/mod.rs`
+- `src/config.rs`
+- `src/health.rs`
+- `src/db/repositories/collections.rs`
+- `src/db/repositories/outbound.rs`
 - `scripts/deploy.sh`
-- `docs/DEPLOYMENT.md`
-- `docs/AI/TASK_INDEX.md`
+- `docker-compose.prebuilt.yml`
+- `docker-compose.yml`
+- `frontend-test/public/index.html`
+- `frontend-test/public/app.js`
+- `frontend-test/wrangler.toml`
+- `tests/deployed_api_acceptance.rs`
 - `docs/AI/SESSION_STATE.md`
 
 ---
 
 ## 4. 已运行的验证命令及结果
 
-- `bash -n scripts/deploy.sh`: **通过**。语法检查零错误。
-- `scripts/deploy.sh --help`: **通过**。三种部署形态及示例完整展示。
-- `docker compose config` (全量 profile 及 cn 镜像配置): **通过**。
-- `scripts/deploy.sh --with-signer -e .env.example -c pay3.example.yaml --dry-run`: **通过**。全量一体化本地演练通过。
-- `scripts/deploy.sh --remote root@192.168.1.100 -d /opt --with-signer -e .env.example -c pay3.example.yaml --dry-run`: **通过**。全量一体化远程 SSH 演练通过。
-- `scripts/deploy.sh --signer-only --dry-run`: **通过**。本地 Signer 独立部署演练通过。
-- `scripts/deploy.sh --remote root@192.168.1.100 -d /opt --signer-only -e .env.example --dry-run`: **通过**。远程 SSH Signer 独立部署演练通过。
+- `cargo test --lib`: **212 passed, 0 failed**。全量单元测试通过。
+- `curl -fsS https://home-10030.002788.xyz/readyz`: **HTTP 200 OK**。所有组件健康。
+- `curl -fsS https://home-10030.002788.xyz/v1/tokens`: **HTTP 200 OK**。正常返回 USDC 与 USDT 双代币配置。
+- `curl -I https://home-10010.002788.xyz`: **HTTP 200 OK**。前端静态页面正常提供服务。
+- `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 cargo test --test deployed_api_acceptance -- --ignored --nocapture`: **1 passed, 0 failed**。真实 Polygon Amoy 测试网及部署实例全流程验收通过。
 
 ---
 
 ## 5. 未解决问题与剩余工作
 
-- 无遗留阻断项。
+- 无遗留阻断项。全部目标均已达成。
 

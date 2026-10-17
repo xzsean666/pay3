@@ -88,7 +88,6 @@ pub enum DependencyName {
     RpcChainId,
     Signer,
     WorkerLease,
-    TransferLogIngestor,
     PaymentScanner,
     CollectionCollector,
 }
@@ -111,7 +110,6 @@ impl DependencyName {
             DependencyName::RpcChainId => "rpc_chain_id",
             DependencyName::Signer => "signer",
             DependencyName::WorkerLease => "worker_lease",
-            DependencyName::TransferLogIngestor => "transfer_log_ingestor",
             DependencyName::PaymentScanner => "payment_scanner",
             DependencyName::CollectionCollector => "collection_collector",
         }
@@ -262,21 +260,18 @@ impl DependencyRegistry for RuntimeDependencyRegistry {
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum WorkerName {
-    TransferLogIngestor,
     PaymentScanner,
     CollectionCollector,
 }
 
 impl WorkerName {
-    pub const ALL: [WorkerName; 3] = [
-        WorkerName::TransferLogIngestor,
+    pub const ALL: [WorkerName; 2] = [
         WorkerName::PaymentScanner,
         WorkerName::CollectionCollector,
     ];
 
     pub fn as_str(self) -> &'static str {
         match self {
-            WorkerName::TransferLogIngestor => "transfer_log_ingestor",
             WorkerName::PaymentScanner => "payment_scanner",
             WorkerName::CollectionCollector => "collection_collector",
         }
@@ -284,7 +279,6 @@ impl WorkerName {
 
     pub const fn dependency_name(self) -> DependencyName {
         match self {
-            WorkerName::TransferLogIngestor => DependencyName::TransferLogIngestor,
             WorkerName::PaymentScanner => DependencyName::PaymentScanner,
             WorkerName::CollectionCollector => DependencyName::CollectionCollector,
         }
@@ -292,7 +286,6 @@ impl WorkerName {
 
     pub fn lag_metric_name(self) -> Option<&'static str> {
         match self {
-            WorkerName::TransferLogIngestor => Some("pay3_log_ingestor_lag_blocks"),
             WorkerName::PaymentScanner => Some("pay3_payment_scanner_lag_blocks"),
             WorkerName::CollectionCollector => None,
         }
@@ -727,10 +720,6 @@ mod tests {
                 && !dependency.status.is_healthy()
                 && dependency.message.as_deref() == Some("rpc timeout")
         }));
-        assert!(checks.iter().any(|dependency| {
-            dependency.name == DependencyName::TransferLogIngestor
-                && !dependency.status.is_healthy()
-        }));
 
         let readiness = ReadinessReport::new(checks);
         let body = metrics.render_prometheus(&readiness);
@@ -749,7 +738,6 @@ mod tests {
         assert!(
             body.contains("pay3_worker_consecutive_failures{worker=\"collection_collector\"} 1")
         );
-        assert!(body.contains("pay3_log_ingestor_lag_blocks 0"));
         assert!(body.contains("pay3_payment_scanner_lag_blocks 7"));
         assert!(
             body.contains("pay3_readyz_dependency_status{dependency=\"collection_collector\"} 0")
@@ -759,13 +747,13 @@ mod tests {
     #[test]
     fn worker_lag_exceeding_threshold_fails_readiness() {
         let metrics = MetricsRecorder::default();
-        metrics.record_worker_success(WorkerName::TransferLogIngestor, Duration::from_millis(1));
-        metrics.record_worker_lag(WorkerName::TransferLogIngestor, 25, 24);
+        metrics.record_worker_success(WorkerName::PaymentScanner, Duration::from_millis(1));
+        metrics.record_worker_lag(WorkerName::PaymentScanner, 25, 24);
 
         let checks = metrics.worker_dependency_checks();
 
         assert!(checks.iter().any(|dependency| {
-            dependency.name == DependencyName::TransferLogIngestor
+            dependency.name == DependencyName::PaymentScanner
                 && !dependency.status.is_healthy()
                 && dependency
                     .message
@@ -788,7 +776,7 @@ mod tests {
 
         assert!(readiness.is_ready());
         assert!(readiness.dependencies.iter().any(|dependency| {
-            dependency.name == DependencyName::TransferLogIngestor && dependency.status.is_healthy()
+            dependency.name == DependencyName::PaymentScanner && dependency.status.is_healthy()
         }));
     }
 }

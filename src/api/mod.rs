@@ -632,9 +632,9 @@ pub fn build_multi_token_router(
         }
     }
 
-    if tokens.len() == 1 {
-        let single_token_router = token_service_router_from_state(tokens[0].state.clone());
-        main_router = main_router.merge(single_token_router);
+    if !tokens.is_empty() {
+        let default_token_router = token_service_router_from_state(tokens[0].state.clone());
+        main_router = main_router.merge(default_token_router);
     }
 
     main_router

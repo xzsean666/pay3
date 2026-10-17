@@ -76,3 +76,13 @@ services:
       start_period: 30s
     ports:
       - "${PAY3_PORT:-3000}:3000"
+
+  frontend-test:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "${FRONTEND_PORT:-10010}:80"
+    volumes:
+      - ./frontend-test/public:/usr/share/nginx/html:ro
+      - ./frontend-test/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+

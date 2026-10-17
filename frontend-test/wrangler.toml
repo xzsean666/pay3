@@ -9,11 +9,11 @@ binding = "ASSETS"
 [vars]
 # Local Wrangler dev can proxy to a local Pay3 API. For Cloudflare deploys,
 # replace this with a staging API URL that Cloudflare can reach.
-PAY3_API_BASE_URL = "http://127.0.0.1:3000"
+PAY3_API_BASE_URL = "https://home-10030.002788.xyz"
 
-# Default mode is proxy. The page still exposes an explicit browser-direct
+# Default mode is direct. The page still exposes an explicit browser-direct
 # switch because this is a test console.
-PAY3_DEFAULT_MODE = "proxy"
+PAY3_DEFAULT_MODE = "direct"
 PAY3_PROXY_ENABLED = "true"
 PAY3_DIRECT_ENABLED = "true"
 
@@ -21,10 +21,10 @@ PAY3_DIRECT_ENABLED = "true"
 # Set both PAY3_DIRECT_ENABLED and PAY3_EXPOSE_TEST_JWT to false for the
 # normal non-direct test deployment posture.
 PAY3_EXPOSE_TEST_JWT = "true"
-PAY3_TEST_JWT_EXPIRES_AT = "2030-01-01T00:00:00Z"
+PAY3_TEST_JWT_EXPIRES_AT = "2027-10-17T13:10:27Z"
 
-# Signed with .env.example development JWT settings:
+# Signed with .env.test development JWT settings:
 # iss=pay3, aud=pay3-api, kid=pay3-dev-key-1,
-# secret=dev-dry-run-jwt-secret-000000000000
+# secret=dev-dry-run-jwt-secret-000000000000666
 # scopes=orders:create orders:read orders:verify
-PAY3_TEST_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InBheTMtZGV2LWtleS0xIn0.eyJleHAiOjE4OTM0NTYwMDAsIm5iZiI6MTc3ODIwNTkxNSwiaWF0IjoxNzc4MjA1OTc1LCJpc3MiOiJwYXkzIiwiYXVkIjoicGF5My1hcGkiLCJzdWIiOiJmcm9udGVuZC10ZXN0Iiwic2NvcGUiOiJvcmRlcnM6Y3JlYXRlIG9yZGVyczpyZWFkIG9yZGVyczp2ZXJpZnkifQ.Moo5s7BYsMaPEpXDoliBA0P8MKrvK5oUellfR2GUOV0"
+PAY3_TEST_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InBheTMtZGV2LWtleS0xIn0.eyJleHAiOjE4MjM3NDk4MjcsIm5iZiI6MTc5MjIxMzc2NywiaWF0IjoxNzkyMjEzODI3LCJpc3MiOiJwYXkzIiwiYXVkIjoicGF5My1hcGkiLCJzdWIiOiJmcm9udGVuZC10ZXN0Iiwic2NvcGUiOiJvcmRlcnM6Y3JlYXRlIG9yZGVyczpyZWFkIG9yZGVyczp2ZXJpZnkifQ.ukB5St4XmRDYdvumtUjjnr0kIhPg1haYVJWxjWTeyDc"

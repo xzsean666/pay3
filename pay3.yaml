@@ -1,0 +1,57 @@
+server:
+  bind_addr: "0.0.0.0:3000"
+  profile: "development"
+  role: "all"
+
+database:
+  url: "${DATABASE_URL:-postgres://sean:sean15430@192.168.31.33:15430/MyDB}"
+
+signer:
+  mode: "local"
+  key_ref: "pay3-amoy-master"
+  allow_local_signer: true
+  mnemonic: "picnic castle recall royal this repair champion play length fly behave only"
+  relayer_base_derivation_path: "m/44'/60'/99'/0"
+
+auth:
+  issuer: "pay3"
+  audience: "pay3-api"
+  jwt_secret: "dev-dry-run-jwt-secret-000000000000666"
+  jwt_key_id: "pay3-dev-key-1"
+
+tokens:
+  - chain_id: 80002
+    token_address: "0xc252a473DC466de3799149A2616ccc625832F40C"
+    token_symbol: "USDC"
+    token_decimals: 6
+    treasury_address: "0xD9Df2f0be7c8f42De89dDE8869D0090Af57490ce"
+    problem_funds_address: "0x315d0eC4c9b7DeCEfCD91e45f9EBD8945e20C6De"
+    rpc_http_urls:
+      - "https://polygon-amoy.drpc.org"
+      - "https://polygon-amoy-bor-rpc.publicnode.com"
+      - "https://polygon-amoy.gateway.tenderly.co"
+      - "https://api.zan.top/polygon-amoy"
+    start_block: 50391060
+    min_confirmations: 12
+    collection_method: "eip3009"
+    token_name: "USD Coin"
+    token_version: "2"
+    gas_limit: 150000
+
+  - chain_id: 80002
+    token_address: "0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31"
+    token_symbol: "USDT"
+    token_decimals: 6
+    treasury_address: "0xD9Df2f0be7c8f42De89dDE8869D0090Af57490ce"
+    problem_funds_address: "0x315d0eC4c9b7DeCEfCD91e45f9EBD8945e20C6De"
+    rpc_http_urls:
+      - "https://polygon-amoy.drpc.org"
+      - "https://polygon-amoy-bor-rpc.publicnode.com"
+      - "https://polygon-amoy.gateway.tenderly.co"
+      - "https://api.zan.top/polygon-amoy"
+    start_block: 50391060
+    min_confirmations: 12
+    collection_method: "polygon_meta_tx"
+    token_name: "(PoS) Tether USD"
+    token_version: "1"
+    gas_limit: 150000

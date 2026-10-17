@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{CollectionMethod, EvmAddress, RawAmount};
 
-const DEFAULT_COLLECTION_GAS_LIMIT: u64 = 80_000;
+const DEFAULT_COLLECTION_GAS_LIMIT: u64 = 150_000;
 const DEFAULT_COLLECTION_MAX_FEE_PER_GAS_WEI: u64 = 0;
 const DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI: u64 = 0;
 const DEFAULT_COLLECTION_RELAYER_DERIVATION_PATH: &str = "m/44'/60'/0'/0/0";
@@ -541,6 +541,8 @@ pub struct TokenYamlConfig {
     pub token_name: Option<String>,
     #[serde(default)]
     pub token_version: Option<String>,
+    #[serde(default)]
+    pub gas_limit: Option<u64>,
 }
 
 pub(crate) fn expand_env_vars(raw: &str) -> String {
@@ -834,7 +836,7 @@ impl AppConfig {
                 allow_full_history_replay: false,
             };
             let collection = CollectionConfig {
-                gas_limit: DEFAULT_COLLECTION_GAS_LIMIT,
+                gas_limit: t.gas_limit.unwrap_or(DEFAULT_COLLECTION_GAS_LIMIT),
                 max_fee_per_gas_wei: RawAmount::from(DEFAULT_COLLECTION_MAX_FEE_PER_GAS_WEI),
                 max_priority_fee_per_gas_wei: RawAmount::from(
                     DEFAULT_COLLECTION_MAX_PRIORITY_FEE_PER_GAS_WEI,

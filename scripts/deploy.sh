@@ -385,7 +385,8 @@ RSYNC_EXCLUDES=(
   --exclude='target/'
   --exclude='data/'          # 核心保护：数据库与挂载数据卷绝不同步删除！
   --exclude='.cargo/'
-  --exclude='frontend-test/'
+  --exclude='frontend-test/node_modules/'
+  --exclude='frontend-test/.wrangler/'
   --exclude='node_modules/'
   --exclude='*.log'
   --exclude='.env*'          # 单独同步指定的 env 文件，避免误覆盖生产机密
@@ -530,21 +531,30 @@ if [[ "$SERVICE_TARGET" != "signer" ]]; then
   fi
 fi
 
+COMPOSE_FILES=(-f "$COMPOSE_FILE")
+if [[ "$HAS_YAML_CONFIG" == true ]]; then
+  COMPOSE_FILES+=(-f docker-compose.override.yml)
+fi
+
 if [[ "$SERVICE_TARGET" == "signer" ]]; then
   log_info "=== 开始执行 Signer 独立签名机容器构建与启动 ==="
   DEPLOY_UP_SCRIPT="
 cd '$TARGET_DIR'
 export PAY3_ENV_FILE=.env
 export DATABASE_URL=\${DATABASE_URL:-postgres://placeholder}
-$TARGET_COMPOSE_BIN -f '$COMPOSE_FILE' ${COMPOSE_PROFILES[*]} up -d --build signer
+$TARGET_COMPOSE_BIN ${COMPOSE_FILES[*]} ${COMPOSE_PROFILES[*]} up -d --build signer
 "
 elif [[ "$SERVICE_TARGET" == "pay3" ]]; then
   log_info "=== 开始执行 Pay3 网关容器重构与无损升级 ==="
   log_info "核心说明: 本操作仅升级应用镜像，原 ./data/postgres 数据库持久卷完整保留，启动后自动执行 Schema 数据库迁移。"
+  LOCAL_DB_ARG=""
+  if [[ "$USE_LOCAL_DB" == true ]]; then
+    LOCAL_DB_ARG="postgres"
+  fi
   DEPLOY_UP_SCRIPT="
 cd '$TARGET_DIR'
 export PAY3_ENV_FILE=.env
-$TARGET_COMPOSE_BIN -f '$COMPOSE_FILE' ${COMPOSE_PROFILES[*]} up -d --build pay3 $([[ "$USE_LOCAL_DB" == true ]] && echo "postgres")
+$TARGET_COMPOSE_BIN ${COMPOSE_FILES[*]} ${COMPOSE_PROFILES[*]} up -d --build pay3 frontend-test $LOCAL_DB_ARG
 "
 else
   # all 模式
@@ -553,7 +563,7 @@ else
   DEPLOY_UP_SCRIPT="
 cd '$TARGET_DIR'
 export PAY3_ENV_FILE=.env
-$TARGET_COMPOSE_BIN -f '$COMPOSE_FILE' ${COMPOSE_PROFILES[*]} up -d --build
+$TARGET_COMPOSE_BIN ${COMPOSE_FILES[*]} ${COMPOSE_PROFILES[*]} up -d --build
 "
 fi
 

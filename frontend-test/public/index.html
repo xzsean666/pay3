@@ -14,8 +14,11 @@
           <h1>Pay3 前端测试台</h1>
         </div>
         <div class="top-actions">
-          <a class="button faucet-link" href="https://usdt-s-faucet.pages.dev/" target="_blank" rel="noopener noreferrer">
-            USDT-S Faucet
+          <a class="button faucet-link" href="https://amoy.polygonscan.com/address/0xc252a473DC466de3799149A2616ccc625832F40C" target="_blank" rel="noopener noreferrer">
+            USDC (Amoy)
+          </a>
+          <a class="button faucet-link" href="https://amoy.polygonscan.com/address/0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31" target="_blank" rel="noopener noreferrer">
+            USDT (Amoy)
           </a>
           <div class="top-status">
             <span id="modeBadge" class="badge">代理模式</span>
@@ -100,6 +103,13 @@
         </div>
 
         <form id="createOrderForm" class="form-grid">
+          <label class="field span-2">
+            <span>选择代币 (Token)</span>
+            <select id="tokenSelect" name="token">
+              <option value="0xc252a473DC466de3799149A2616ccc625832F40C" selected>USDC (0xc252...F40C) - 免Gas (EIP-3009)</option>
+              <option value="0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31">USDT (0x2C2e...0B31) - 免Gas (Polygon MetaTx)</option>
+            </select>
+          </label>
           <label class="field">
             <span>external_id</span>
             <input id="externalId" name="external_id" required />

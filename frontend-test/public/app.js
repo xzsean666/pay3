@@ -3,16 +3,16 @@ const STORE_KEY = "pay3.frontend-test.v1";
 
 const state = {
   config: {
-    apiBaseUrl: "",
+    apiBaseUrl: "https://home-10030.002788.xyz",
     proxyPath: "/api/pay3",
-    defaultMode: "proxy",
+    defaultMode: "direct",
     proxyEnabled: true,
-    directEnabled: false,
-    exposeTestJwt: false,
-    testJwt: "",
-    testJwtExpiresAt: "",
+    directEnabled: true,
+    exposeTestJwt: true,
+    testJwt: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InBheTMtZGV2LWtleS0xIn0.eyJleHAiOjE4MjM3NDk4MjcsIm5iZiI6MTc5MjIxMzc2NywiaWF0IjoxNzkyMjEzODI3LCJpc3MiOiJwYXkzIiwiYXVkIjoicGF5My1hcGkiLCJzdWIiOiJmcm9udGVuZC10ZXN0Iiwic2NvcGUiOiJvcmRlcnM6Y3JlYXRlIG9yZGVyczpyZWFkIG9yZGVyczp2ZXJpZnkifQ.ukB5St4XmRDYdvumtUjjnr0kIhPg1haYVJWxjWTeyDc",
+    testJwtExpiresAt: "2027-10-17T13:10:27Z",
   },
-  useProxy: true,
+  useProxy: false,
   qrMode: "uri",
   token: "",
   order: null,
@@ -34,9 +34,10 @@ async function init() {
   await loadRuntimeConfig();
   loadPrefs();
   applyConfigToControls();
+  await loadAvailableTokens();
   await refreshStoredOrder();
   renderAll();
-  setTab("config");
+  setTab("create");
   setInterval(renderCountdown, 1000);
 }
 
@@ -55,6 +56,7 @@ function collectEls() {
     "copyTokenBtn",
     "tokenField",
     "tokenMeta",
+    "tokenSelect",
     "createOrderForm",
     "newOrderBtn",
     "externalId",
@@ -275,13 +277,18 @@ function setCallMode(mode) {
   renderTopStatus();
 }
 
+function orderApiPrefix() {
+  const token = state.order?.payment?.token_address;
+  return token ? `/${token}` : "";
+}
+
 async function refreshStoredOrder() {
   if (!state.order?.id) {
     return;
   }
 
   try {
-    state.order = await apiRequest(`/v1/orders/${state.order.id}`);
+    state.order = await apiRequest(`${orderApiPrefix()}/v1/orders/${state.order.id}`);
     syncManualOrderFromCurrent();
     state.lastPollAt = new Date();
     savePrefs();
@@ -307,6 +314,20 @@ function newExternalId() {
   return `frontend-test-${stamp}-${random}`;
 }
 
+async function loadAvailableTokens() {
+  try {
+    const res = await apiRequest("/v1/tokens");
+    if (res && Array.isArray(res.tokens) && res.tokens.length > 0 && els.tokenSelect) {
+      els.tokenSelect.innerHTML = res.tokens.map((t) => {
+        const desc = t.token_symbol === "USDC" ? "免Gas (EIP-3009)" : t.token_symbol === "USDT" ? "免Gas (Polygon MetaTx)" : "";
+        return `<option value="${t.token_address}">${t.token_symbol} (${t.token_address.slice(0, 6)}...${t.token_address.slice(-4)}) ${desc ? `- ${desc}` : ""}</option>`;
+      }).join("");
+    }
+  } catch {
+    // ignore
+  }
+}
+
 async function createOrder() {
   pullControlsToState();
   const metadata = parseMetadata();
@@ -329,7 +350,18 @@ async function createOrder() {
 
   setBusy(els.createOrderBtn, true, "创建中");
   try {
-    const order = await apiRequest("/v1/orders", { method: "POST", body });
+    const selectedToken = els.tokenSelect ? els.tokenSelect.value : "";
+    let order;
+    try {
+      const endpoint = selectedToken ? `/${selectedToken}/v1/orders` : "/v1/orders";
+      order = await apiRequest(endpoint, { method: "POST", body });
+    } catch (err) {
+      if (selectedToken && err.status === 404) {
+        order = await apiRequest("/v1/orders", { method: "POST", body });
+      } else {
+        throw err;
+      }
+    }
     state.order = order;
     state.verifyResult = null;
     savePrefs();
@@ -377,7 +409,7 @@ async function pollOrder({ verifyFirst = els.autoVerify.checked } = {}) {
       }
     }
 
-    state.order = await apiRequest(`/v1/orders/${state.order.id}`);
+    state.order = await apiRequest(`${orderApiPrefix()}/v1/orders/${state.order.id}`);
     syncManualOrderFromCurrent();
     state.lastPollAt = new Date();
     savePrefs();
@@ -397,7 +429,7 @@ async function verifyOnce({ quiet = false } = {}) {
     return;
   }
 
-  const result = await apiRequest(`/v1/orders/${state.order.id}/verify`, { method: "POST" });
+  const result = await apiRequest(`${orderApiPrefix()}/v1/orders/${state.order.id}/verify`, { method: "POST" });
   state.verifyResult = result;
   els.verifyResult.textContent = JSON.stringify(result, null, 2);
   if (!quiet) {
@@ -419,7 +451,7 @@ async function acceptProblemPayment() {
 
   try {
     setBusy(els.acceptProblemPaymentBtn, true, "处理中");
-    state.order = await apiRequest(`/v1/orders/${state.order.id}/accept-problem-payment`, {
+    state.order = await apiRequest(`${orderApiPrefix()}/v1/orders/${state.order.id}/accept-problem-payment`, {
       method: "POST",
       body: { reason: "frontend-test manual accept problem payment" },
     });

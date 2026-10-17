@@ -25,7 +25,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = runtime::build_api_runtime(config.clone()).await?;
 
     if config.runtime.api_enabled() {
-        let app = runtime.router().layer(TraceLayer::new_for_http());
+        let cors = tower_http::cors::CorsLayer::permissive();
+        let app = runtime
+            .router()
+            .layer(TraceLayer::new_for_http())
+            .layer(cors);
         let listener = tokio::net::TcpListener::bind(config.http.bind_addr).await?;
 
         tracing::info!(addr = %config.http.bind_addr, "pay3 api listening");

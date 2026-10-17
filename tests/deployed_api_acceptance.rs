@@ -15,8 +15,8 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 use pay3::{
     auth::{Audience, Claims},
     chain::{
-        ChainHeaderReader, Eip1559FeeEstimator, Erc20ChainClient, NativeBalanceReader,
-        PendingNonceReader, RpcRangeSource, TransactionStatus,
+        ChainHeaderReader, Eip1559FeeEstimate, Eip1559FeeEstimator, Erc20ChainClient,
+        NativeBalanceReader, PendingNonceReader, RpcRangeSource, TransactionStatus,
     },
     domain::{EvmAddress, RawAmount, TxHash},
     signer::{LocalMnemonicSigner, SignedTx, SignerProvider, UnsignedTx},
@@ -142,6 +142,17 @@ async fn deployed_api_order_payment_collection_flow() -> Result<(), AnyError> {
     ensure_native_balance_nonzero(&rpc_source, chain_id, payer_address, "payer").await?;
 
     let fee_estimate = rpc_source.estimate_eip1559_fees().await?;
+    let min_amoy_priority = RawAmount::new(U256::from(30_000_000_000u64));
+    let min_amoy_max = RawAmount::new(U256::from(45_000_000_000u64));
+    let fee_estimate = Eip1559FeeEstimate {
+        max_priority_fee_per_gas: fee_estimate
+            .max_priority_fee_per_gas
+            .max(min_amoy_priority),
+        max_fee_per_gas: fee_estimate
+            .max_fee_per_gas
+            .max(min_amoy_max)
+            .max(fee_estimate.max_priority_fee_per_gas.max(min_amoy_priority)),
+    };
     let payment_tx_hash = send_token_transfer(
         &payer,
         &rpc_source,
@@ -219,7 +230,12 @@ async fn deployed_api_order_payment_collection_flow() -> Result<(), AnyError> {
             true,
         )
         .await?;
-    assert_status(&collection, StatusCode::CREATED, "create collection")?;
+    if collection.status != StatusCode::CREATED && collection.status != StatusCode::OK {
+        return Err(helper_error(format!(
+            "create collection returned {}, expected 201 Created or 200 OK: {}",
+            collection.status, collection.body
+        )));
+    }
     let collection_id = json_str(&collection.body, "id")?.to_string();
     eprintln!(
         "[deployed-api] collection created collection_id={} status={}",

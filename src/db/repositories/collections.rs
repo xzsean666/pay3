@@ -114,6 +114,16 @@ impl CollectionRepository for PgCollectionRepository {
             return Ok(existing);
         }
 
+        if let Some(existing_active) = select_active_collection_by_child_account(
+            &mut tx,
+            command.child_account_id,
+        )
+        .await?
+        {
+            tx.commit().await?;
+            return Ok(existing_active);
+        }
+
         lock_collectable_order(&mut tx, &command).await?;
         let inserted = insert_collection(&mut tx, &command).await?;
 
@@ -310,6 +320,29 @@ async fn select_collection_by_idempotency_key(
     sqlx::query(&sql)
         .bind(owner_sub)
         .bind(idempotency_key)
+        .fetch_optional(&mut **tx)
+        .await?
+        .map(|row| collection_record_from_row(&row))
+        .transpose()
+}
+
+async fn select_active_collection_by_child_account(
+    tx: &mut Transaction<'_, Postgres>,
+    child_account_id: Uuid,
+) -> Result<Option<CollectionRecord>, RepositoryError> {
+    let sql = format!(
+        r#"
+        SELECT {COLLECTION_COLUMNS}
+        FROM collections
+        WHERE child_account_id = $1
+          AND status IN ('queued', 'transferring', 'replacing', 'confirming')
+        ORDER BY created_at DESC
+        LIMIT 1
+        "#
+    );
+
+    sqlx::query(&sql)
+        .bind(child_account_id)
         .fetch_optional(&mut **tx)
         .await?
         .map(|row| collection_record_from_row(&row))

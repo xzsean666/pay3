@@ -1,0 +1,25 @@
+{
+  "chainId": 80002,
+  "deployedAt": "2026-10-17T05:07:10Z",
+  "startBlock": 50391069,
+  "rpcUrl": "https://polygon-amoy-bor-rpc.publicnode.com",
+  "deployer": "0x55193778A808426Eb4024fADAd1aC3c0968E8AF2",
+  "tokens": {
+    "USDC": {
+      "address": "0xc252a473DC466de3799149A2616ccc625832F40C",
+      "symbol": "USDC",
+      "decimals": 6,
+      "collectionMethod": "eip3009",
+      "name": "USD Coin",
+      "version": "2"
+    },
+    "USDT": {
+      "address": "0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31",
+      "symbol": "USDT",
+      "decimals": 6,
+      "collectionMethod": "polygon_meta_tx",
+      "name": "(PoS) Tether USD",
+      "version": "1"
+    }
+  }
+}
