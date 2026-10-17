@@ -1,0 +1,67 @@
+# ==============================================================================
+# Pay3 Configuration Example: Polygon PoS USDT with PolygonMetaTx (Gasless)
+# ==============================================================================
+# 该配置演示如何在 Polygon PoS (Chain ID 137) 上使用官方 USDT 并开启 PolygonMetaTx 免 Gas 归集。
+#
+# 特性与核心原理：
+# 1. 归集策略 (collection_method) 设为 "polygon_meta_tx" (或 "auto")；
+# 2. 收款子地址无需充入任何 POL/MATIC 原生代币作为 Gas，实现 100% 零垫资；
+# 3. 系统使用 Master Signer 离线签署 EIP-712 MetaTransaction；
+# 4. 由系统 Relayer (relayer_base_derivation_path) 统一向链上广播 executeMetaTransaction 并代付主网 Gas；
+# 5. 支持多 RPC 节点 Round-Robin 轮询与熔断 CD 冷却。
+#
+# 使用方式：
+#   1. 环境变量注入机密 (可选)：
+#      export DATABASE_URL="postgres://pay3:password@127.0.0.1:5432/pay3"
+#      export SIGNER_REMOTE_BEARER_TOKEN="your_vault_token"
+#   2. 指定配置文件启动：
+#      PAY3_CONFIG_FILE=examples/pay3.polygon-usdt.yaml pay3
+#      或直接复制到运行根目录: cp examples/pay3.polygon-usdt.yaml pay3.yaml
+# ==============================================================================
+
+server:
+  bind_addr: "0.0.0.0:8080"
+  profile: "production"    # "development" | "staging" | "production"
+  role: "all"              # "all" | "api" | "workers"
+
+database:
+  # 隐私机密：推荐通过环境变量 ${DATABASE_URL} 动态注入
+  url: "${DATABASE_URL:-postgres://pay3:pay3_dev_password@127.0.0.1:5432/pay3}"
+
+signer:
+  # Master Signer: 所有代币共享单一 Master Signer / 母私钥派生
+  # 生产环境强制使用 "external" | "kms" | "hsm" 外部签名机，严禁明文私钥
+  mode: "external"
+  key_ref: "master-key"
+  endpoint: "${SIGNER_REMOTE_ENDPOINT:-https://vault-signer.internal:8443}"
+  bearer_token: "${SIGNER_REMOTE_BEARER_TOKEN}"
+  # 各代币独立 Relayer 派生基准路径（自动按 m/44'/60'/99'/0/{index} 分配，杜绝 Nonce 竞争）
+  relayer_base_derivation_path: "m/44'/60'/99'/0"
+
+auth:
+  issuer: "https://auth.company.internal"
+  audience: "pay3-api"
+  jwks_url: "https://auth.company.internal/.well-known/jwks.json"
+
+tokens:
+  # ----------------------------------------------------------------------------
+  # Token: USDT on Polygon PoS (Chain ID 137)
+  # ----------------------------------------------------------------------------
+  - chain_id: 137
+    token_address: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F"
+    token_symbol: "USDT"
+    token_decimals: 6
+    treasury_address: "${TREASURY_ADDRESS:-0x71C7656EC7ab88b098defB751B7401B5f6d8976F}"
+    problem_funds_address: "${PROBLEM_FUNDS_ADDRESS:-0x8ba1f109551bD432803012645Ac136ddd64DBA72}"
+    rpc_http_urls:
+      - "https://polygon-rpc.com"
+      - "https://rpc.ankr.com/polygon"
+      - "https://1rpc.io/matic"
+    start_block: 65000000
+    min_confirmations: 64
+    # 指定免 Gas 归集方式为 polygon_meta_tx
+    collection_method: "polygon_meta_tx"
+    # Polygon PoS USDT NativeMetaTransaction 规范 EIP-712 域参数
+    token_name: "(PoS) Tether USD"
+    token_version: "1"
+    # Relayer 自动派生地址路径默认为: m/44'/60'/99'/0/0

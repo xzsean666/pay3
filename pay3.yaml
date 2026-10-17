@@ -24,7 +24,7 @@ tokens:
     token_address: "0xc252a473DC466de3799149A2616ccc625832F40C"
     token_symbol: "USDC"
     token_decimals: 6
-    treasury_address: "0xD9Df2f0be7c8f42De89dDE8869D0090Af57490ce"
+    treasury_address: "0x55193778A808426Eb4024fADAd1aC3c0968E8AF2"
     problem_funds_address: "0x315d0eC4c9b7DeCEfCD91e45f9EBD8945e20C6De"
     rpc_http_urls:
       - "https://polygon-amoy.drpc.org"
@@ -42,7 +42,7 @@ tokens:
     token_address: "0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31"
     token_symbol: "USDT"
     token_decimals: 6
-    treasury_address: "0xD9Df2f0be7c8f42De89dDE8869D0090Af57490ce"
+    treasury_address: "0x55193778A808426Eb4024fADAd1aC3c0968E8AF2"
     problem_funds_address: "0x315d0eC4c9b7DeCEfCD91e45f9EBD8945e20C6De"
     rpc_http_urls:
       - "https://polygon-amoy.drpc.org"

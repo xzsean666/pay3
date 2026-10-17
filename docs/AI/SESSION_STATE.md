@@ -90,9 +90,22 @@
    - **测试前端升级**:
      - 更新 `frontend-test/public/index.html` 与 `app.js`：添加 MockUSDC 和 MockUSDT 在 Polygonscan 上的链上快捷链接，增加币种动态切换下拉菜单；
      - 容器化配置 `frontend-test` Nginx 静态托管及反向代理，暴露端口 10010（通过 Cloudflare Tunnel `https://home-10010.002788.xyz` 访问）；
-   - **全链路真实链 E2E 验证**:
-     - 运行 `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 cargo test --test deployed_api_acceptance -- --ignored --nocapture`；
-     - 成功通过真实链全生命周期测试（耗时 98s）：动态派生子收款地址 -> 真实广播代币转账 -> 无状态扫链器监听并确认 12 区块更新为 `paid` -> Relayer 自动免 Gas 广播 EIP-3009 归集交易 -> 成功归集至 Treasury 地址并确认！
+   - **全链路真实链 E2E 验证 (MockUSDC & MockUSDT 双验证)**:
+     - 将归集目标 Treasury 地址修正为 `.env.key` 私钥对应的实际链上地址 `0x55193778A808426Eb4024fADAd1aC3c0968E8AF2`；
+     - 更新 `pay3.yaml`、`.env.test`，并为 `tests/deployed_api_acceptance.rs` 增加归集到账地址强制校验与 `PAY3_API_TOKEN_PREFIX` 路由支持；
+     - 使用 `scripts/deploy.sh` 远程增量热升级并重载远端配置，`/v1/tokens` 成功暴露新 Treasury 地址；
+     - **MockUSDC (EIP-3009 免 Gas 归集) 真实链验证通过**:
+       * 订单 ID: `9be13a64-d07d-45cc-a67e-dd48dc624171`
+       * 付款 Tx: `0xeab4c08ba5fa1256762d26c81edaea1f5281868e6a10c620a23517f2d4fb1cef`
+       * 扫链入账: 监听 12 确认数后标记 `paid`
+       * 免 Gas 归集 Tx: `0x81d6140fa810c2d4a92a6159659b4d5bf686f602d3075951f870d98a1cb29c6b` (Block 50411875)
+       * 归集结果: +6 USDC 准确划转至 Treasury `0x55193778A808426Eb4024fADAd1aC3c0968E8AF2` (余额: 10,000,006 USDC)；
+     - **MockUSDT (Polygon Meta-Tx 免 Gas 归集) 真实链验证通过**:
+       * 订单 ID: `310c7e1b-b56d-40ec-950c-36c1d9208b11`
+       * 付款 Tx: `0xff2feb1dfa6bb99387a0e2157dafdf4746a88b0d8aa8ce8520fb9c726ebac2c6`
+       * 扫链入账: 监听 12 确认数后标记 `paid`
+       * 免 Gas 归集确认: 归集记录 `73ce93ad-2977-4f7f-a450-b07245983a10` 标记 `confirmed`
+       * 归集结果: +6 USDT 准确划转至 Treasury `0x55193778A808426Eb4024fADAd1aC3c0968E8AF2` (余额: 10,000,006 USDT)；
 
 ---
 
@@ -105,6 +118,7 @@
 - `deploy/deploy_test_tokens.sh`
 - `deploy/tokens_amoy.env`
 - `deploy/tokens_amoy.json`
+- `examples/pay3.polygon-usdt.yaml`
 - `frontend-test/nginx.conf`
 - `pay3.yaml`
 
@@ -131,9 +145,10 @@
 
 - `cargo test --lib`: **212 passed, 0 failed**。全量单元测试通过。
 - `curl -fsS https://home-10030.002788.xyz/readyz`: **HTTP 200 OK**。所有组件健康。
-- `curl -fsS https://home-10030.002788.xyz/v1/tokens`: **HTTP 200 OK**。正常返回 USDC 与 USDT 双代币配置。
+- `curl -fsS https://home-10030.002788.xyz/v1/tokens`: **HTTP 200 OK**。正常返回 USDC 与 USDT 双代币配置，Treasury 为 `0x55193778a808426eb4024fadad1ac3c0968e8af2`。
 - `curl -I https://home-10010.002788.xyz`: **HTTP 200 OK**。前端静态页面正常提供服务。
-- `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 cargo test --test deployed_api_acceptance -- --ignored --nocapture`: **1 passed, 0 failed**。真实 Polygon Amoy 测试网及部署实例全流程验收通过。
+- `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 cargo test --test deployed_api_acceptance -- --ignored --nocapture`: **1 passed, 0 failed** (MockUSDC 真实环境 E2E 验收通过，耗时 100.77s)。
+- `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 PAY3_API_TOKEN_PREFIX=0x2c2e569e3df89c55ba46ce52248ae180379d0b31 TOKEN_ADDRESS=0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31 TOKEN_SYMBOL=USDT cargo test --test deployed_api_acceptance -- --ignored --nocapture`: **1 passed, 0 failed** (MockUSDT 真实环境 E2E 验收通过，耗时 101.96s)。
 
 ---
 

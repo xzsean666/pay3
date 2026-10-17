@@ -52,7 +52,11 @@ async fn deployed_api_order_payment_collection_flow() -> Result<(), AnyError> {
         .unwrap_or_else(|_| DEFAULT_ENV_FILE.to_string());
     let values = EnvValues::load(&env_file)?;
     let settings = TestSettings::from_env(&values)?;
-    let api = ApiClient::new(settings.api_base_url.clone(), settings.jwt.clone())?;
+    let api = ApiClient::new(
+        settings.api_base_url.clone(),
+        settings.token_prefix.clone(),
+        settings.jwt.clone(),
+    )?;
 
     eprintln!(
         "[deployed-api] testing {} with external_id={}",
@@ -264,7 +268,7 @@ async fn deployed_api_order_payment_collection_flow() -> Result<(), AnyError> {
     assert_status(&collection_view, StatusCode::OK, "get collection")?;
     assert_eq_json_string(&collection_view.body, "id", &collection_id)?;
 
-    wait_for_collection_confirmed(
+    let confirmed_collection = wait_for_collection_confirmed(
         &api,
         &collection_id,
         settings.collection_timeout,
@@ -273,11 +277,24 @@ async fn deployed_api_order_payment_collection_flow() -> Result<(), AnyError> {
     .await?;
     eprintln!("[deployed-api] collection confirmed collection_id={collection_id}");
 
+    if let Some(expected_treasury) = values.optional("TREASURY_ADDRESS") {
+        let to_address = json_str(&confirmed_collection, "to_address")?;
+        if !to_address.eq_ignore_ascii_case(expected_treasury) {
+            return Err(helper_error(format!(
+                "collection to_address {to_address} does not match expected treasury {expected_treasury}"
+            )));
+        }
+        eprintln!(
+            "[deployed-api] verified collection to_address={to_address} matches treasury={expected_treasury}"
+        );
+    }
+
     Ok(())
 }
 
 struct TestSettings {
     api_base_url: String,
+    token_prefix: String,
     jwt: String,
     run_id: Uuid,
     external_id: String,
@@ -312,6 +329,10 @@ impl TestSettings {
             .optional("PAY3_API_TEST_AMOUNT")
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| raw_to_decimal_string(payment_amount_raw, token_decimals));
+        let token_prefix = values
+            .optional_any(&["PAY3_API_TOKEN_PREFIX", "TOKEN_PREFIX"])
+            .unwrap_or("")
+            .to_string();
 
         Ok(Self {
             api_base_url: values
@@ -322,6 +343,7 @@ impl TestSettings {
                 ])?
                 .trim_end_matches('/')
                 .to_string(),
+            token_prefix,
             jwt: jwt_from_env(values)?,
             run_id,
             external_id: values
@@ -437,6 +459,7 @@ fn jwt_from_env(values: &EnvValues) -> Result<String, AnyError> {
 
 struct ApiClient {
     base_url: String,
+    token_prefix: String,
     token: String,
     client: reqwest::Client,
 }
@@ -447,12 +470,13 @@ struct JsonHttpResponse {
 }
 
 impl ApiClient {
-    fn new(base_url: String, token: String) -> Result<Self, AnyError> {
+    fn new(base_url: String, token_prefix: String, token: String) -> Result<Self, AnyError> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()?;
         Ok(Self {
             base_url,
+            token_prefix,
             token,
             client,
         })
@@ -503,11 +527,21 @@ impl ApiClient {
     }
 
     fn url(&self, path: &str) -> String {
-        format!(
-            "{}/{}",
-            self.base_url.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        )
+        let trimmed_path = path.trim_start_matches('/');
+        if !self.token_prefix.is_empty() && trimmed_path.starts_with("v1/") {
+            format!(
+                "{}/{}/{}",
+                self.base_url.trim_end_matches('/'),
+                self.token_prefix.trim_matches('/'),
+                trimmed_path
+            )
+        } else {
+            format!(
+                "{}/{}",
+                self.base_url.trim_end_matches('/'),
+                trimmed_path
+            )
+        }
     }
 }
 
