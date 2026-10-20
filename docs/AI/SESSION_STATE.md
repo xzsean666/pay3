@@ -123,6 +123,14 @@
        2. **高频出块链确认扫描饥饿 (Confirmation Sweep Starvation)**: 修复 `PaymentScannerWorker::tick`，使成熟观察支付的确认扫描（`sweep_confirmations`）在每个 tick 优先执行，彻底消除高频出块（如 Polygon 2s 出块）导致 `last_scanned_block >= target_block` 条件几乎无法满足的扫链延迟；
        3. **前端体验优化**: 前端控制台默认勾选 `autoVerify`，兼顾秒级主动链上探测与后台全自动无感知扫链双保险。
 
+7. **完成 TASK-036：全流程闭环本地集成 E2E 测试套件与人工操作模拟**:
+   - 编写完全本地化、全业务流程闭环的高可用端到端测试套件 `tests/local_e2e.rs`，100% 本地运行且零外部网络依赖；
+   - 包含 Anvil 私有 EVM 链动态部署 MockERC20，结合 PostgreSQL 临时隔离 Schema 与真实 Axum HTTP Server 运行时；
+   - 实现了 6 大闭环用例，覆盖标准支付流、模拟人工注资 Gas 垫付、模拟人工即时核验 (`POST /v1/orders/{id}/verify`)、模拟人工迟到付款特批 (`POST /v1/orders/{id}/accept-problem-payment`)、部分付款追加至全额、超额支付、卡单同 Nonce 替换等全部场景；
+   - 修复 `tests/anvil_e2e.rs` 中 `CollectionCollectorConfig` 缺失 `with_chain` 的问题；
+   - 扩展 `tests/support/anvil.rs` 中的 `send_native_transfer` 辅助工具；
+   - 创建 `docs/AI/SKILL.md` 知识与集成指南。
+
 ---
 
 ## 3. 修改、创建与移除的文件清单
@@ -134,9 +142,11 @@
 - `deploy/deploy_test_tokens.sh`
 - `deploy/tokens_amoy.env`
 - `deploy/tokens_amoy.json`
+- `docs/AI/SKILL.md`
 - `examples/pay3.polygon-usdt.yaml`
 - `frontend-test/nginx.conf`
 - `pay3.yaml`
+- `tests/local_e2e.rs`
 
 ### 修改文件
 - `Cargo.toml`
@@ -155,13 +165,17 @@
 - `frontend-test/public/index.html`
 - `frontend-test/public/app.js`
 - `frontend-test/wrangler.toml`
+- `tests/anvil_e2e.rs`
 - `tests/deployed_api_acceptance.rs`
+- `tests/support/anvil.rs`
 - `docs/AI/SESSION_STATE.md`
 
 ---
 
 ## 4. 已运行的验证命令及结果
 
+- `cargo test --test local_e2e -- --test-threads=1`: **6 passed, 0 failed**。全部本地 E2E 测试闭环通过。
+- `cargo test --test anvil_e2e`: **2 passed, 0 failed**。Anvil 集成测试通过。
 - `cargo test --lib`: **212 passed, 0 failed**。全量单元测试通过。
 - `curl -fsS https://home-10030.002788.xyz/readyz`: **HTTP 200 OK**。所有组件健康。
 - `curl -fsS https://home-10030.002788.xyz/v1/tokens`: **HTTP 200 OK**。正常返回 USDC 与 USDT 双代币配置，Treasury 为 `0x55193778a808426eb4024fadad1ac3c0968e8af2`。

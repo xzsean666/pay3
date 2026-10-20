@@ -176,6 +176,7 @@ async fn anvil_mock_erc20_end_to_end_flow() -> Result<(), AnyError> {
             outbound_repo,
             rpc_source.clone(),
             CollectionCollectorConfig::new("collector-e2e")
+                .with_chain(chain_id, token_address)
                 .with_replacement_stuck_after(StdDuration::from_secs(3600)),
         );
 
@@ -436,6 +437,7 @@ async fn anvil_collect_replacement_flow_rebroadcasts_stuck_tx() -> Result<(), An
             outbound_repo,
             rpc_source.clone(),
             CollectionCollectorConfig::new("collector-replacement-e2e")
+                .with_chain(chain_id, token_address)
                 .with_replacement_stuck_after(StdDuration::from_secs(1)),
         );
 

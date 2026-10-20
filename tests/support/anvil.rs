@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     error::Error,
     fmt, fs,
@@ -418,6 +420,32 @@ pub async fn send_erc20_transfer(
     .await?;
     let tx_hash = send_raw_transaction(rpc_url, &raw_tx).await?;
     Ok(tx_hash)
+}
+
+pub async fn send_native_transfer(
+    rpc_url: &str,
+    from: EvmAddress,
+    recipient: EvmAddress,
+    value_wei: RawAmount,
+) -> Result<TxHash, AnyError> {
+    let payload = rpc_request(
+        rpc_url,
+        "eth_sendTransaction",
+        json!([{
+            "from": from.to_string(),
+            "to": recipient.to_string(),
+            "value": format!("0x{:x}", value_wei.value()),
+        }]),
+    )
+    .await?;
+
+    let tx_hash_str = payload
+        .get("result")
+        .and_then(Value::as_str)
+        .ok_or_else(|| helper_error(format!("eth_sendTransaction missing result: {payload}")))?;
+    tx_hash_str
+        .parse::<TxHash>()
+        .map_err(|error| helper_error(format!("invalid tx hash {tx_hash_str}: {error}")))
 }
 
 async fn sign_unsigned_tx_with_cast(
