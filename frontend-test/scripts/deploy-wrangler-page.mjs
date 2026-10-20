@@ -105,8 +105,8 @@ function deployPages({ projectName, branch, deployVars, dryRun, createPagesProje
 
   try {
     const secretResult = spawnSync(
-      "pnpm",
-      ["dlx", "wrangler@4.90.0", "pages", "secret", "bulk", varsFile, "--project-name", projectName],
+      "npx",
+      ["--yes", "wrangler@4.90.0", "pages", "secret", "bulk", varsFile, "--project-name", projectName],
       { cwd: frontendRoot, stdio: "inherit", env: process.env }
     );
     if ((secretResult.status ?? 1) !== 0) {
@@ -114,7 +114,7 @@ function deployPages({ projectName, branch, deployVars, dryRun, createPagesProje
     }
 
     const deployArgs = [
-      "dlx",
+      "--yes",
       "wrangler@4.90.0",
       "pages",
       "deploy",
@@ -127,7 +127,7 @@ function deployPages({ projectName, branch, deployVars, dryRun, createPagesProje
       deployArgs.push("--branch", branch);
     }
 
-    const deployResult = spawnSync("pnpm", deployArgs, {
+    const deployResult = spawnSync("npx", deployArgs, {
       cwd: frontendRoot,
       stdio: "inherit",
       env: process.env,
@@ -139,7 +139,7 @@ function deployPages({ projectName, branch, deployVars, dryRun, createPagesProje
 }
 
 function ensurePagesProject(projectName, productionBranch) {
-  const listResult = spawnSync("pnpm", ["dlx", "wrangler@4.90.0", "pages", "project", "list"], {
+  const listResult = spawnSync("npx", ["--yes", "wrangler@4.90.0", "pages", "project", "list"], {
     cwd: frontendRoot,
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
@@ -159,9 +159,9 @@ function ensurePagesProject(projectName, productionBranch) {
 
   console.log(`Creating Pages project: ${projectName}`);
   const createResult = spawnSync(
-    "pnpm",
+    "npx",
     [
-      "dlx",
+      "--yes",
       "wrangler@4.90.0",
       "pages",
       "project",
