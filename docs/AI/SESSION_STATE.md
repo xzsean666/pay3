@@ -183,6 +183,7 @@
 - `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 cargo test --test deployed_api_acceptance -- --ignored --nocapture`: **1 passed, 0 failed** (MockUSDC 真实环境 E2E 验收通过，耗时 100.77s)。
 - `PAY3_RUN_DEPLOYED_API_ACCEPTANCE=1 PAY3_API_TOKEN_PREFIX=0x2c2e569e3df89c55ba46ce52248ae180379d0b31 TOKEN_ADDRESS=0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31 TOKEN_SYMBOL=USDT cargo test --test deployed_api_acceptance -- --ignored --nocapture`: **1 passed, 0 failed** (MockUSDT 真实环境 E2E 验收通过，耗时 101.96s)。
 - `node scratch/test_frontend.js`: **ALL FRONTEND TESTS PASSED SUCCESSFULLY!** (自动化无头浏览器对前端测试台真实界面全流程交互、二维码渲染、链上付款、自动轮询及成功页跳转双币种验收全部通过)。
+- `node scratch/run_frontend_test.js`: **ALL FRONTEND TESTS PASSED SUCCESSFULLY!** (自动化无头浏览器验证领水 Faucet UI 与跳转、MockUSDC 真实支付闭环 11.3s 自动跳入成功页、MockUSDT 真实支付闭环 14.6s 自动跳入成功页；并在链上实测 `faucet()` 与 `./deploy/faucet_transfer.sh` 划拨双币种均 100% 成功到账)。
 
 ---
 

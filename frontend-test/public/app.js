@@ -109,6 +109,7 @@ function collectEls() {
     "downloadLogsBtn",
     "logList",
     "toast",
+    "gotoFaucetLink",
     "faucetTopBtn",
     "connectWalletBtn",
     "switchNetworkBtn",
@@ -193,6 +194,10 @@ function bindEvents() {
   els.downloadLogsBtn.addEventListener("click", downloadLogs);
 
   els.faucetTopBtn?.addEventListener("click", () => setTab("faucet"));
+  els.gotoFaucetLink?.addEventListener("click", (e) => {
+    e.preventDefault();
+    setTab("faucet");
+  });
   els.connectWalletBtn?.addEventListener("click", connectFaucetWallet);
   els.switchNetworkBtn?.addEventListener("click", () => switchAmoyNetwork(true));
   els.claimUsdcBtn?.addEventListener("click", () => claimFaucetToken("USDC"));
@@ -1344,6 +1349,8 @@ async function claimFaucetToken(symbol) {
   if (!currentWalletAddress) {
     await connectFaucetWallet();
     if (!currentWalletAddress) return;
+  } else {
+    await switchAmoyNetwork(false);
   }
   const token = FAUCET_TOKENS[symbol];
   if (!token) return;

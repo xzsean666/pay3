@@ -188,7 +188,10 @@
 
         <form id="createOrderForm" class="form-grid">
           <label class="field span-2">
-            <span>选择代币 (Token)</span>
+            <span style="display: flex; justify-content: space-between; align-items: center;">
+              <span>选择代币 (Token)</span>
+              <a href="#" id="gotoFaucetLink" style="font-size: 13px; color: var(--blue); text-decoration: underline; font-weight: normal;">没有测试代币？点此前往一键领水 🚰</a>
+            </span>
             <select id="tokenSelect" name="token">
               <option value="0xc252a473DC466de3799149A2616ccc625832F40C" selected>USDC (0xc252...F40C) - 免Gas (EIP-3009)</option>
               <option value="0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31">USDT (0x2C2e...0B31) - 免Gas (Polygon MetaTx)</option>
