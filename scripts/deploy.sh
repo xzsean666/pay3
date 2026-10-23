@@ -554,7 +554,7 @@ elif [[ "$SERVICE_TARGET" == "pay3" ]]; then
   DEPLOY_UP_SCRIPT="
 cd '$TARGET_DIR'
 export PAY3_ENV_FILE=.env
-$TARGET_COMPOSE_BIN ${COMPOSE_FILES[*]} ${COMPOSE_PROFILES[*]} up -d --build pay3 frontend-test $LOCAL_DB_ARG
+$TARGET_COMPOSE_BIN ${COMPOSE_FILES[*]} ${COMPOSE_PROFILES[*]} up -d --build pay3 $LOCAL_DB_ARG
 "
 else
   # all 模式

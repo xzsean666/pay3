@@ -1,6 +1,6 @@
-# Pay3 Polygon Amoy 测试币支付网关与前端测试台对接指南
+# Pay3 Polygon Amoy 测试币支付网关与 Cloudflare Pages 前端测试台对接指南
 
-本文档记录了部署在测试服务器（`192.168.31.33`）上的 **Pay3 ERC20 支付网关（Polygon Amoy 测试网）**及配套**前端测试收银台（`frontend-test`）**的全部配置细节、代币参数、鉴权方式、业务交互时序、API 接口规格与多语言对接示例。
+本文档记录了部署在测试服务器（`192.168.31.33`）上的 **Pay3 ERC20 支付网关（Polygon Amoy 测试网）**及托管在 Cloudflare 上的**前端测试收银台（`pay3-frontend-test.pages.dev`）**的全部配置细节、代币参数、鉴权方式、业务交互时序、API 接口规格与多语言对接示例。
 
 后续任何业务系统、前端应用或第三方项目若需集成 Web3 ERC20（USDC / USDT）免 Gas 归接收款功能，均可直接参考本指南完成联调与测试。
 
@@ -25,12 +25,16 @@
   - [7.1 Node.js / TypeScript 示例](#71-nodejs--typescript-示例)
   - [7.2 Python 示例](#72-python-示例)
   - [7.3 cURL 命令行快捷验证](#73-curl-命令行快捷验证)
-- [8. 前端测试收银台使用指南](#8-前端测试收银台使用指南)
+- [8. 前端测试收银台使用指南 (Cloudflare Pages)](#8-前端测试收银台使用指南-cloudflare-pages)
 - [9. 服务器部署结构与运维排错](#9-服务器部署结构与运维排错)
 
 ---
 
 ## 1. 部署架构与访问端点速查
+
+系统采用 **前后端解耦架构**：
+- **前端测试台**：由 **Cloudflare Pages** 全球边缘 CDN 托管，集成 Cloudflare Pages Functions 边缘 Worker，提供零配置免鉴权 API 代理。
+- **后端支付网关**：部署在私有服务器 `192.168.31.33`，通过 Cloudflare Tunnel (`homecf`) 将 API 安全映射至公网域名 `https://home-10030.002788.xyz`，服务器端纯无状态运行，不挂载任何前端 Nginx 容器。
 
 ### 1.1 系统拓扑图
 
@@ -41,15 +45,15 @@ flowchart TD
         Browser["用户浏览器 / Web3 钱包"]
     end
 
-    subgraph TestServer["测试服务器 (192.168.31.33 / home-*.002788.xyz)"]
-        Tunnel["Cloudflare Tunnel (homecf)"]
-        
-        subgraph FrontContainer["前端测试台 (pay3-frontend-test-1:10010)"]
-            Nginx["Nginx Web Server"]
-            ProxyRule["/api/pay3/ 自动注入 Bearer Token 代理"]
-        end
+    subgraph CFPages["Cloudflare 全球边缘网络 (Pages & Functions)"]
+        PagesUI["前端测试收银台 UI<br/>pay3-frontend-test.pages.dev"]
+        EdgeProxy["Pages Functions 边缘代理<br/>/api/pay3/* 自动注入 Bearer Token"]
+    end
 
-        subgraph Pay3Gateway["Pay3 支付核心 (pay3-pay3-1:10030)"]
+    subgraph TestServer["测试服务器 (192.168.31.33)"]
+        Tunnel["Cloudflare Tunnel 客户端 (homecf)"]
+
+        subgraph Pay3Gateway["Pay3 支付网关核心 (pay3-pay3-1:10030)"]
             AxumAPI["Axum HTTP REST API"]
             Scanner["Direct-to-Postgres 链上扫块器"]
             Collector["免 Gas 资金归集器 (Collector)"]
@@ -68,12 +72,13 @@ flowchart TD
         TreasuryAcc["Treasury 归集总账钱包"]
     end
 
-    Browser -->|访问前端页面| Tunnel
-    Tunnel -->|反向代理 10010| Nginx
-    App -->|免鉴权代理调用 /api/pay3/| ProxyRule
-    ProxyRule -->|携带内置 Bearer Token| AxumAPI
-    App -->|直连 API 请求 (携带 JWT)| Tunnel
-    Tunnel -->|反向代理 10030| AxumAPI
+    Browser -->|1. 访问收银台 UI| PagesUI
+    PagesUI -->|同源请求 /api/pay3/| EdgeProxy
+    App -->|免鉴权代理调用 /api/pay3/| EdgeProxy
+    EdgeProxy -->|携带内置测试 JWT| Tunnel
+    
+    App -->|直连 API 请求 (自备 JWT)| Tunnel
+    Tunnel -->|转发本地 10030| AxumAPI
     
     AxumAPI <--> Postgres
     Scanner <--> Postgres
@@ -89,14 +94,13 @@ flowchart TD
 
 ### 1.2 端点速查表
 
-| 服务名称 | 网络环境 | 访问 URL / 宿主机端口 | 说明 |
+| 服务名称 | 部署平台 / 环境 | 访问 URL / 端口 | 说明 |
 | :--- | :--- | :--- | :--- |
-| **Pay3 后端 API (公网)** | 公网 HTTPS | `https://home-10030.002788.xyz` | 标准 REST API，直连调用需带 `Authorization: Bearer <JWT>` |
-| **Pay3 后端 API (内网)** | 局域网 HTTP | `http://192.168.31.33:10030` | 容器端口映射 `10030 -> 3000` |
-| **前端测试台 UI (公网)** | 公网 HTTPS | `https://home-10010.002788.xyz` | 可视化测试台，支持一键领水、扫码支付、轮询监控 |
-| **前端测试台 UI (内网)** | 局域网 HTTP | `http://192.168.31.33:10010` | 容器端口映射 `10010 -> 80` |
-| **前端免鉴权代理 API** | 公网 HTTPS | `https://home-10010.002788.xyz/api/pay3` | **最简对接路径**：Nginx 自动注入 Bearer Token，调用方无需自签 JWT |
-| **PostgreSQL 数据库** | 局域网 TCP | `192.168.31.33:15430` | 数据库 `MyDB`，用户名 `sean` |
+| **前端测试台 UI** | Cloudflare Pages | [https://pay3-frontend-test.pages.dev](https://pay3-frontend-test.pages.dev) | 可视化收银台，支持领水、建单、扫码、轮询 |
+| **免鉴权代理 API** | Cloudflare Pages 边缘函数 | `https://pay3-frontend-test.pages.dev/api/pay3` | **最简对接路径**：边缘函数自动注入 Bearer Token，调用方无需自签 JWT |
+| **Pay3 后端 API (公网)** | 服务器 + Cloudflare 隧道 | `https://home-10030.002788.xyz` | 标准 REST API，直连调用需带 `Authorization: Bearer <JWT>` |
+| **Pay3 后端 API (内网)** | 服务器局域网 HTTP | `http://192.168.31.33:10030` | 容器端口映射 `10030 -> 3000` |
+| **PostgreSQL 数据库** | 服务器局域网 TCP | `192.168.31.33:15430` | 数据库 `MyDB`，用户名 `sean` |
 
 ---
 
@@ -154,9 +158,9 @@ flowchart TD
 
 为了方便其他项目测试付款，测试网合约与前端均提供了简便的测试币获取途径。
 
-### 方式 1：前端测试台一键领水（推荐）
+### 方式 1：Cloudflare Pages 前端一键领水（推荐）
 
-1. 在浏览器中打开 [https://home-10010.002788.xyz](https://home-10010.002788.xyz)
+1. 在浏览器中打开 [https://pay3-frontend-test.pages.dev](https://pay3-frontend-test.pages.dev)
 2. 点击顶部栏或导航栏中的 **「🚰 领水 (Faucet)」** 标签。
 3. 点击 **「连接 Web3 钱包」**（支持 MetaMask、OKX Wallet、Rabby 等），页面会自动提示切换网络至 Polygon Amoy（Chain ID 80002）。
 4. 点击 **「领取 1,000 USDC」** 或 **「领取 1,000 USDT」**，钱包签名广播后，1,000 枚测试代币将直接铸造到您的当前钱包中。
@@ -210,7 +214,7 @@ Pay3 API 采用标准 HTTP `Authorization: Bearer <JWT>` 鉴权，支持细粒�
 
 | 对接模式 | 目标 URL | 鉴权方式 | 适用场景 |
 | :--- | :--- | :--- | :--- |
-| **A. 免鉴权代理模式 (推荐前端/轻量测试)** | `https://home-10010.002788.xyz/api/pay3/...` | **无需配置 Header**（Nginx 反向代理层自动注入合法 Bearer Token） | 快速前端演示、测试脚本、本地 Demo |
+| **A. 免鉴权代理模式 (推荐前端/轻量测试)** | `https://pay3-frontend-test.pages.dev/api/pay3/...` | **无需配置 Header**（Cloudflare Pages Functions 边缘层自动注入合法 Bearer Token 并转发至后端） | 快速前端演示、测试脚本、本地 Demo |
 | **B. 直连网关鉴权模式 (推荐后端服务)** | `https://home-10030.002788.xyz/...`<br/>或 `http://192.168.31.33:10030/...` | 请求头必须包含：<br/>`Authorization: Bearer <JWT_TOKEN>` | 正式后端对接、微服务通信、生产模拟 |
 
 ### 4.2 长期有效测试 JWT Token
@@ -412,7 +416,7 @@ stateDiagram-v2
 - **URL**:
   - 创建 **USDC** 订单: `POST https://home-10030.002788.xyz/v1/orders`
   - 创建 **USDT** 订单: `POST https://home-10030.002788.xyz/0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31/v1/orders`
-  - 或通过前端免签代理: `POST https://home-10010.002788.xyz/api/pay3/v1/orders`
+  - 或通过 Cloudflare Pages 免签代理: `POST https://pay3-frontend-test.pages.dev/api/pay3/v1/orders`
 - **Headers**:
   - `Content-Type: application/json`
   - `Authorization: Bearer <TOKEN>` *(代理模式下可省略)*
@@ -563,8 +567,8 @@ stateDiagram-v2
 ```typescript
 import axios from "axios";
 
-// 选项 A：走免鉴权 Nginx 代理通道（最简）
-const API_BASE = "https://home-10010.002788.xyz/api/pay3";
+// 选项 A：走 Cloudflare Pages 免鉴权代理通道（最简）
+const API_BASE = "https://pay3-frontend-test.pages.dev/api/pay3";
 const AUTH_HEADER = {};
 
 // 选项 B：走公网网关直连通道（需要填入 Bearer Token）
@@ -631,7 +635,7 @@ createAndPollPayment().catch(console.error);
 import time
 import requests
 
-API_BASE = "https://home-10010.002788.xyz/api/pay3"
+API_BASE = "https://pay3-frontend-test.pages.dev/api/pay3"
 HEADERS = {"Content-Type": "application/json"}
 
 # 1. 创建订单 (以 2.00 USDT 为例，使用指定代币路径)
@@ -677,7 +681,7 @@ while True:
 
 #### 快速建单 (USDC)
 ```bash
-curl -sS -X POST "https://home-10010.002788.xyz/api/pay3/v1/orders" \
+curl -sS -X POST "https://pay3-frontend-test.pages.dev/api/pay3/v1/orders" \
   -H "Content-Type: application/json" \
   -d '{
     "external_id": "test-curl-001",
@@ -688,7 +692,7 @@ curl -sS -X POST "https://home-10010.002788.xyz/api/pay3/v1/orders" \
 
 #### 快速建单 (USDT)
 ```bash
-curl -sS -X POST "https://home-10010.002788.xyz/api/pay3/0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31/v1/orders" \
+curl -sS -X POST "https://pay3-frontend-test.pages.dev/api/pay3/0x2C2e569e3Df89c55Ba46Ce52248Ae180379d0B31/v1/orders" \
   -H "Content-Type: application/json" \
   -d '{
     "external_id": "test-curl-usdt-001",
@@ -699,21 +703,22 @@ curl -sS -X POST "https://home-10010.002788.xyz/api/pay3/0x2C2e569e3Df89c55Ba46C
 
 #### 查询订单状态
 ```bash
-curl -sS "https://home-10010.002788.xyz/api/pay3/v1/orders/by-external-id/test-curl-001" | jq
+curl -sS "https://pay3-frontend-test.pages.dev/api/pay3/v1/orders/by-external-id/test-curl-001" | jq
 ```
 
 ---
 
-## 8. 前端测试收银台使用指南
+## 8. 前端测试收银台使用指南 (Cloudflare Pages)
 
-测试收银台是一个功能完备的单页测试应用（SPA），专为开发者联调体验所设计。
+前端收银台完全托管在 **Cloudflare Pages** 边缘网络上，天然具备全球低时延与高可用能力。
 
-- **公网访问入口**: [https://home-10010.002788.xyz](https://home-10010.002788.xyz)
-- **内网访问入口**: [http://192.168.31.33:10010](http://192.168.31.33:10010)
+- **线上访问入口**: [https://pay3-frontend-test.pages.dev](https://pay3-frontend-test.pages.dev)
+- **部署维护脚本**: `scripts/deploy-frontend-test-cloudflare.sh`
+- **源码目录**: `frontend-test/`
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ Pay3 前端测试台                                            [🚰 领水] [代理模式]│
+│ Pay3 前端测试台 (Cloudflare Pages)                         [🚰 领水] [代理模式]│
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ [连接] | [🚰 领水] | [创建订单] | [二维码] | [等待支付] | [人工处理] | [成功页] | [日志]│
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -729,7 +734,7 @@ curl -sS "https://home-10010.002788.xyz/api/pay3/v1/orders/by-external-id/test-c
 ### 核心功能面板说明
 
 1. **连接设置 (Config)**:
-   - 切换 **Worker/Nginx 代理模式** 或 **直连模式**。
+   - 切换 **Worker 代理模式** 或 **浏览器直连模式**。
    - 自动拉取或填入内置开发 JWT，测试连接健康度。
 2. **领水台 (Faucet)**:
    - 检查已连接钱包在 Polygon Amoy 上的 POL、USDC 与 USDT 余额。
@@ -753,6 +758,13 @@ curl -sS "https://home-10010.002788.xyz/api/pay3/v1/orders/by-external-id/test-c
 8. **调试日志 (Logs)**:
    - 记录页面发起的所有 HTTP 请求、响应载荷、时延及异常日志，支持导出为 JSON。
 
+### Cloudflare Pages 更新部署命令
+
+如需更新前端静态资源或 Pages Functions 逻辑，在本地项目根目录运行：
+```bash
+./scripts/deploy-frontend-test-cloudflare.sh --api-base-url https://home-10030.002788.xyz
+```
+
 ---
 
 ## 9. 服务器部署结构与运维排错
@@ -766,18 +778,18 @@ curl -sS "https://home-10010.002788.xyz/api/pay3/v1/orders/by-external-id/test-c
 - **部署主目录**: `/home/apps/pay3`
   - `pay3.yaml`: 核心业务配置文件（配置代币、RPC 列表、Treasury 地址、扫块起始高度等）。
   - `.env`: 容器环境变量文件（包含数据库连接、JWT 秘钥等）。
-  - `docker-compose.prebuilt.yml`: Docker Compose 编排文件。
+  - `docker-compose.prebuilt.yml`: 后端 Docker Compose 编排文件。
   - `docker-compose.override.yml`: 卷挂载与配置文件覆盖。
-  - `frontend-test/`: 前端静态文件及 Nginx 配置文件。
 
-### 9.2 Docker 容器状态
+### 9.2 Docker 容器状态（纯后端网关架构）
+
+服务器上仅运行核心支付网关与数据库，无冗余静态服务容器：
 
 | 容器名称 | 镜像 | 映射端口 | 容器作用 |
 | :--- | :--- | :--- | :--- |
 | `pay3-pay3-1` | `pay3:prebuilt` | `10030:3000` | Rust 编写的 Pay3 API 核心网关与扫链归集服务 |
-| `pay3-frontend-test-1` | `nginx:alpine` | `10010:80` | 前端测试收银台静态托管与 `/api/pay3/` 代理 |
 | `postgresql-15430` | `48ebba8b80dc` | `15430:5432` | 独立 PostgreSQL 16 数据库实例 |
-| `homecf` | `cloudflare/cloudflared` | host 模式 | 负责将 `*.002788.xyz` 域名映射到本地端口 |
+| `homecf` | `cloudflare/cloudflared` | host 模式 | 负责将 `home-10030.002788.xyz` 域名映射到本地端口 |
 
 ### 9.3 常用运维与巡检命令
 
@@ -786,12 +798,7 @@ curl -sS "https://home-10010.002788.xyz/api/pay3/v1/orders/by-external-id/test-c
 docker logs -f --tail 100 pay3-pay3-1
 ```
 
-#### 查看前端 Nginx 访问与代理日志
-```bash
-docker logs -f --tail 100 pay3-frontend-test-1
-```
-
-#### 重启服务
+#### 重启网关服务
 ```bash
 cd /home/apps/pay3
 docker compose -f docker-compose.prebuilt.yml -f docker-compose.override.yml restart pay3
@@ -830,7 +837,7 @@ docker exec postgresql-15430 psql -U sean -d MyDB -c \
    - 确认请求头格式为 `Authorization: Bearer <TOKEN>`（注意 Bearer 后面有空格）。
    - 若自行生成 JWT，确认 `iss` 为 `pay3`，`aud` 为 `pay3-api`，`kid` 为 `pay3-dev-key-1`，算法为 `HS256`。
    - 可直接使用本文档第 4.2 节提供的内置长期 Token。
-   - 或者直接将请求地址前缀替换为 `https://home-10010.002788.xyz/api/pay3`（免鉴权代理）。
+   - 或者直接将请求地址前缀替换为 `https://pay3-frontend-test.pages.dev/api/pay3`（Cloudflare 边缘免鉴权代理）。
 3. **API 请求返回 `429 Too Many Requests`**：
    - 测试环境默认配置的接口限流速率为 `120 次/分钟`，请适当调整轮询间隔（推荐轮询间隔 `>= 2000ms`）。
 4. **订单变为 `paid` 后，为什么归集记录（Collection）失败或未上链？**：

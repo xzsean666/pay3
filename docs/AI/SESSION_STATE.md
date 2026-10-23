@@ -130,14 +130,17 @@
    - 修复 `tests/anvil_e2e.rs` 中 `CollectionCollectorConfig` 缺失 `with_chain` 的问题；
    - 扩展 `tests/support/anvil.rs` 中的 `send_native_transfer` 辅助工具；
    - 创建 `docs/AI/SKILL.md` 知识与集成指南。
-8. **完成 Polygon Amoy 测试网支付环境与前端收银台对接文档编写**:
-   - 创建 [docs/deployment/test/README.md](file:///ssd0/git/pay3/docs/deployment/test/README.md)；
-   - 详尽收录 `192.168.31.33` 上的测试环境部署拓扑、端口（10030/10010/15430）、公网隧道域名（`home-10030.002788.xyz` / `home-10010.002788.xyz`）；
+8. **完成 Polygon Amoy 测试网支付环境与前端收银台对接文档编写与服务器前端清理**:
+   - 创建并完善 [docs/deployment/test/README.md](file:///ssd0/git/pay3/docs/deployment/test/README.md)；
+   - 移除服务器 `192.168.31.33` 上的冗余 Nginx 前端容器 `pay3-frontend-test-1` 及 10010 端口占用；
+   - 清理 `docker-compose.yml`、`docker-compose.prebuilt.yml` 及 `scripts/deploy.sh` 中的 `frontend-test` 服务块，保持服务器端 100% 纯网关运行；
+   - 将所有前端接入规范更新为 Cloudflare Pages（`https://pay3-frontend-test.pages.dev`）与边缘代理路由 `/api/pay3/...`；
+   - 详尽收录 `192.168.31.33` 上的测试环境部署拓扑、端口（10030/15430）、公网隧道域名（`home-10030.002788.xyz`）；
    - 详细记录 Polygon Amoy (Chain ID 80002) 链上双代币（USDC EIP-3009 免 Gas 归集 / USDT Polygon Meta-Tx 免 Gas 归集）合约地址与参数；
-   - 完整阐述测试代币领水方式（前端一键领水、合约 public `faucet()` 调用、管理员脚本划拨）；
-   - 详细说明两种对接鉴权模式（免 Token 的 Nginx 反向代理模式与标准 Bearer JWT 直连模式），并提供内置长期有效开发 Token；
+   - 完整阐述测试代币领水方式（Cloudflare Pages 一键领水、合约 public `faucet()` 调用、管理员脚本划拨）；
+   - 详细说明两种对接鉴权模式（Cloudflare Pages 免 Token 边缘代理模式与标准 Bearer JWT 直连模式），并提供内置长期有效开发 Token；
    - 给出完整支付业务时序图、状态机流转图、全套 REST API 规格及 Node.js / Python / cURL 实战调用示例；
-   - 提供前端收银台（`frontend-test`）8 大功能面板使用指南及服务器运维排错手册。
+   - 提供前端收银台（`pay3-frontend-test.pages.dev`）8 大功能面板使用指南及服务器运维排错手册。
 
 ---
 
