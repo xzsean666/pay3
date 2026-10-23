@@ -204,58 +204,104 @@ cd /home/apps/pay3
 
 ---
 
-## 4. API 认证与鉴权 (JWT)
+## 4. API 认证与鉴权 (JWT) 与测试环境全景透明化
 
-Pay3 API 采用标准 HTTP `Authorization: Bearer <JWT>` 鉴权，支持细粒度的权限范围控制（Scopes）。
+Pay3 API 采用标准 HTTP `Authorization: Bearer <JWT>` 鉴权，支持细粒度的权限范围控制（Scopes）。由于当前为测试网开发联调环境，所有秘钥、数据库连接、助记词及参数全部透明公开，方便本地及其他微服务项目无缝对接。
 
-### 4.1 对接模式选择
+---
 
-其他系统对接时可根据业务架构选择以下两种方式之一：
+### 4.1 JWT Secret 物理存放位置与生效规则
+
+Pay3 的 JWT 签名与验签秘钥存放在以下位置：
+
+| 位置 | 物理文件路径 | 配置字段 / 变量名 | 默认值 / 明文 |
+| :--- | :--- | :--- | :--- |
+| **服务器端 (主配置)** | `/home/apps/pay3/pay3.yaml` | `auth.jwt_secret` | `dev-dry-run-jwt-secret-000000000000666` |
+| **服务器端 (环境变量)** | `/home/apps/pay3/.env` | `JWT_SECRET` | `dev-dry-run-jwt-secret-000000000000666` |
+| **代码仓库 (YAML 模板)** | `pay3.yaml` | `auth.jwt_secret` | `dev-dry-run-jwt-secret-000000000000666` |
+| **代码仓库 (Env 模板)** | `.env.test` | `JWT_SECRET` | `dev-dry-run-jwt-secret-000000000000666` |
+
+#### 配置加载优先级机制
+1. Pay3 容器启动时通过环境变量 `PAY3_CONFIG_FILE=/var/lib/pay3/pay3.yaml` 挂载配置文件。
+2. 若 `pay3.yaml` 中定义了 `auth.jwt_secret`，系统**最高优先级**采用 YAML 中的秘钥。
+3. 若 `pay3.yaml` 中未定义，则自动回退读取环境变量 `JWT_SECRET`（来自 `.env`）。
+
+#### 关键鉴权元数据速查
+- **算法 (`alg`)**: `HS256` (HMAC-SHA256 对称签名)
+- **Key ID (`kid`)**: `pay3-dev-key-1` *(必须与网关配置的 `JWT_KEY_ID` 严格一致)*
+- **签发者 (`iss`)**: `pay3`
+- **接收受众 (`aud`)**: `pay3-api`
+- **有效权限范围 (`scopes`)**:
+  - `orders:create`: 创建订单权限
+  - `orders:read`: 查询订单状态及诊断信息
+  - `orders:verify`: 触发即时链上扫块核验
+  - `collections:create`: 触发资金归集
+  - `collections:read`: 查询归集记录
+
+---
+
+### 4.2 永不过期永久测试 JWT Token (开箱即用)
+
+根据 RFC 7519 规范，Pay3 的 `jsonwebtoken` 模块严格校验 `exp`、`nbf`、`iat`、`iss`、`aud`、`sub` 字段，且要求 `exp > now`。
+
+为了让其他测试项目**免去频繁更新 Token 的麻烦、实现真正意义上的“永久有效 / 永不过期”**，我们将 `exp` 设置为一个极大的时间戳：`253402300799`（对应 UTC 时间 **9999-12-31T23:59:59Z**，跨越数千年）。同时授予了系统全部 5 个 scope。
+
+#### 永久有效测试 Token (可直接复制使用)：
+```text
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InBheTMtZGV2LWtleS0xIn0.eyJleHAiOjI1MzQwMjMwMDc5OSwibmJmIjoxNzAwMDAwMDAwLCJpYXQiOjE3MDAwMDAwMDAsImlzcyI6InBheTMiLCJhdWQiOiJwYXkzLWFwaSIsInN1YiI6ImxvY2FsLWRldi1jbGllbnQiLCJzY29wZSI6Im9yZGVyczpjcmVhdGUgb3JkZXJzOnJlYWQgb3JkZXJzOnZlcmlmeSBjb2xsZWN0aW9uczpjcmVhdGUgY29sbGVjdGlvbnM6cmVhZCJ9.Oae_tIyVz6ReptbA9WE7bLmSyHsXbauNANC3JTmxmlg
+```
+
+#### Token 解密载荷详情
+- **Header**:
+  ```json
+  { "alg": "HS256", "typ": "JWT", "kid": "pay3-dev-key-1" }
+  ```
+- **Payload**:
+  ```json
+  {
+    "exp": 253402300799,
+    "nbf": 1700000000,
+    "iat": 1700000000,
+    "iss": "pay3",
+    "aud": "pay3-api",
+    "sub": "local-dev-client",
+    "scope": "orders:create orders:read orders:verify collections:create collections:read"
+  }
+  ```
+
+任何外部项目在向 `https://home-10030.002788.xyz` 或 `http://192.168.31.33:10030` 发起 HTTP 请求时，只要带上 Header：
+`Authorization: Bearer <上述TOKEN>`，即可永久享有最高读写权限，永久有效。
+
+---
+
+### 4.3 对接模式选择
 
 | 对接模式 | 目标 URL | 鉴权方式 | 适用场景 |
 | :--- | :--- | :--- | :--- |
-| **A. 免鉴权代理模式 (推荐前端/轻量测试)** | `https://pay3-frontend-test.pages.dev/api/pay3/...` | **无需配置 Header**（Cloudflare Pages Functions 边缘层自动注入合法 Bearer Token 并转发至后端） | 快速前端演示、测试脚本、本地 Demo |
-| **B. 直连网关鉴权模式 (推荐后端服务)** | `https://home-10030.002788.xyz/...`<br/>或 `http://192.168.31.33:10030/...` | 请求头必须包含：<br/>`Authorization: Bearer <JWT_TOKEN>` | 正式后端对接、微服务通信、生产模拟 |
+| **A. 免鉴权代理模式 (推荐前端/轻量测试)** | `https://pay3-frontend-test.pages.dev/api/pay3/...` | **无需配置 Header**（Cloudflare Pages 边缘 Worker 自动注入永久 Bearer Token 并转发） | 快速前端演示、测试脚本、本地 Demo |
+| **B. 直连网关鉴权模式 (推荐后端服务)** | `https://home-10030.002788.xyz/...`<br/>或 `http://192.168.31.33:10030/...` | 请求头必须包含：<br/>`Authorization: Bearer <永久TOKEN>` | 正式后端对接、微服务通信、生产模拟 |
 
-### 4.2 长期有效测试 JWT Token
+---
 
-测试环境内置了长期有效的开发 JWT Token（有效期至 **2027-10-17**），包含了订单创建、查询与链上核验所需的所有 scope：
+### 4.4 自主签发永久 / 自定义 Token 脚本
 
-```text
-eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InBheTMtZGV2LWtleS0xIn0.eyJleHAiOjE4MjM3NDk4MjcsIm5iZiI6MTc5MjIxMzc2NywiaWF0IjoxNzkyMjEzODI3LCJpc3MiOiJwYXkzIiwiYXVkIjoicGF5My1hcGkiLCJzdWIiOiJmcm9udGVuZC10ZXN0Iiwic2NvcGUiOiJvcmRlcnM6Y3JlYXRlIG9yZGVyczpyZWFkIG9yZGVyczp2ZXJpZnkifQ.ukB5St4XmRDYdvumtUjjnr0kIhPg1haYVJWxjWTeyDc
-```
+如果接入方项目希望以独立的 `sub`（例如各自的业务系统标识 `shop-service` 或 `nft-market`）隔离各自名下的订单数据，可以使用以下脚本签发永不过期的 Token：
 
-Token 解密详情：
-- **Header**: `{"alg": "HS256", "typ": "JWT", "kid": "pay3-dev-key-1"}`
-- **Issuer (`iss`)**: `pay3`
-- **Audience (`aud`)**: `pay3-api`
-- **Subject (`sub`)**: `frontend-test` *(对应订单数据的归属者 tenant/user)*
-- **Scopes (`scope`)**: `orders:create orders:read orders:verify`
-
-### 4.3 自主签发 JWT Token（若接入方需要独立 `sub` 隔离）
-
-如果接入方项目希望以独立的 `sub`（例如各自的业务系统标识 `shop-backend`）隔离订单数据，可使用测试环境密钥自主签名生成 JWT：
-
-- **Secret**: `dev-dry-run-jwt-secret-000000000000666`
-- **Key ID (`kid`)**: `pay3-dev-key-1`
-- **Algorithm**: `HS256`
-
-Node.js 快速生成脚本：
+#### Node.js 脚本
 ```javascript
 import crypto from "node:crypto";
 
-function createJwt(sub = "my-project", scopes = "orders:create orders:read orders:verify") {
+function generatePermanentJwt(subject = "my-custom-project") {
   const secret = "dev-dry-run-jwt-secret-000000000000666";
   const header = { alg: "HS256", typ: "JWT", kid: "pay3-dev-key-1" };
-  const now = Math.floor(Date.now() / 1000);
   const payload = {
-    exp: now + 3600 * 24 * 365, // 1 年有效
-    nbf: now - 10,
-    iat: now,
+    exp: 253402300799, // 9999-12-31T23:59:59Z (永久有效)
+    nbf: 1700000000,
+    iat: 1700000000,
     iss: "pay3",
     aud: "pay3-api",
-    sub,
-    scope: scopes,
+    sub: subject,
+    scope: "orders:create orders:read orders:verify collections:create collections:read",
   };
   const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64url");
   const signInput = `${b64(header)}.${b64(payload)}`;
@@ -263,8 +309,76 @@ function createJwt(sub = "my-project", scopes = "orders:create orders:read order
   return `${signInput}.${sig}`;
 }
 
-console.log("Bearer " + createJwt());
+console.log("Authorization: Bearer " + generatePermanentJwt("shop-backend"));
 ```
+
+#### Python 脚本
+```python
+import json, base64, hmac, hashlib
+
+def generate_permanent_jwt(subject="my-custom-project"):
+    secret = b"dev-dry-run-jwt-secret-000000000000666"
+    header = {"alg": "HS256", "typ": "JWT", "kid": "pay3-dev-key-1"}
+    payload = {
+        "exp": 253402300799,  # 9999-12-31T23:59:59Z (永久有效)
+        "nbf": 1700000000,
+        "iat": 1700000000,
+        "iss": "pay3",
+        "aud": "pay3-api",
+        "sub": subject,
+        "scope": "orders:create orders:read orders:verify collections:create collections:read"
+    }
+    b64 = lambda data: base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
+    h_b64 = b64(json.dumps(header, separators=(",", ":")).encode("utf-8"))
+    p_b64 = b64(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    sign_input = f"{h_b64}.{p_b64}".encode("utf-8")
+    sig = b64(hmac.new(secret, sign_input, hashlib.sha256).digest())
+    return f"{h_b64}.{p_b64}.{sig}"
+
+print("Authorization: Bearer " + generate_permanent_jwt("shop-backend"))
+```
+
+---
+
+### 4.5 测试网其他环境细节全透视 (本地项目无缝对接)
+
+为了让本地运行的其他微服务无障碍联调，以下是测试网环境的所有底层配置与核心参数：
+
+#### 1. PostgreSQL 数据库直连
+测试网数据库部署在服务器局域网内，已对外开放 `15430` 端口，允许测试机器直连查询对账：
+- **Host**: `192.168.31.33`
+- **Port**: `15430`
+- **Database**: `MyDB`
+- **User**: `sean`
+- **Password**: `sean15430`
+- **JDBC / URL**: `postgres://sean:sean15430@192.168.31.33:15430/MyDB`
+- **核心数据表**:
+  - `orders`: 订单主表（包含 `id`, `external_id`, `status`, `paid_amount_raw`, `expected_amount_raw` 等）。
+  - `payments`: 扫链入账明细（包含 `tx_hash`, `from_address`, `to_address`, `amount_raw`, `confirmations` 等）。
+  - `collections`: 资金归集记录（包含 `outbound_tx_id`, `status`, `amount_raw`, `to_address` 等）。
+  - `chain_cursors`: 扫链进度游标（可查看当前已扫区块高度）。
+
+#### 2. 母账号 HD 助记词与一单一地址规则
+- **母助记词**: `"picnic castle recall royal this repair champion play length fly behave only"`
+- **派生分段**: `m/44'/60'/0'/0/{index}`
+- **严格不复用**: 每次请求 `POST /v1/orders`，系统均会原子递增索引派生独立子地址，该地址终生绑定该订单。
+
+#### 3. 自动化测试打款钱包 (Payer)
+测试环境预置了一个拥有充足测试 POL 和双代币余额的自动付款钱包，可供接入方自动化脚本调用：
+- **私钥**: `0xa010561d0ee36587adb4c9d81f4d19d84dc8b2246a9b7b8fd0665d1f8b15d844`
+- **钱包地址**: `0x285bd8C75C7647b7da1C1154776633804d4ff5eC`
+- **测试币余额**: 充足的 POL、USDC 与 USDT。
+
+#### 4. 免 Gas 归集与 Treasury 总账
+- **Treasury 地址**: `0x55193778A808426Eb4024fADAd1aC3c0968E8AF2`
+- **USDC Relayer**: `0x3ce91f5c429fcc9d928d06e5fc697cf0b5bdc1c1` (EIP-3009 划转)
+- **USDT Relayer**: `0xbd5cbf8ebef8c7439600a382b34ec97de8b4dcc0` (Polygon Meta-Tx 划转)
+- 收款子地址无需充入任何 POL 主币，Relayer 会自动发起免 Gas 划转将代币归集到 Treasury。
+
+#### 5. CORS 跨域与限流规则
+- **CORS 跨域**: Pay3 网关已内置开启宽容 CORS 策略，允许任意本地前端端口（如 `http://localhost:3000`、`http://localhost:5173` 等）直接发起跨域 Ajax / Fetch 请求。
+- **速率限制**: 默认单 IP `120 请求/分钟`（配置于 `API_RATE_LIMIT_PER_MINUTE=120`），建议轮询时间间隔设置为 `2000ms ~ 3000ms`。
+
 
 ---
 
@@ -571,10 +685,10 @@ import axios from "axios";
 const API_BASE = "https://pay3-frontend-test.pages.dev/api/pay3";
 const AUTH_HEADER = {};
 
-// 选项 B：走公网网关直连通道（需要填入 Bearer Token）
+// 选项 B：走公网网关直连通道（使用开箱即用的永久测试 Bearer Token）
 // const API_BASE = "https://home-10030.002788.xyz";
 // const AUTH_HEADER = {
-//   Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InBheTMtZGV2LWtleS0xIn0.eyJleHAiOjE4MjM3NDk4MjcsIm5iZiI6MTc5MjIxMzc2NywiaWF0IjoxNzkyMjEzODI3LCJpc3MiOiJwYXkzIiwiYXVkIjoicGF5My1hcGkiLCJzdWIiOiJmcm9udGVuZC10ZXN0Iiwic2NvcGUiOiJvcmRlcnM6Y3JlYXRlIG9yZGVyczpyZWFkIG9yZGVyczp2ZXJpZnkifQ.ukB5St4XmRDYdvumtUjjnr0kIhPg1haYVJWxjWTeyDc",
+//   Authorization: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InBheTMtZGV2LWtleS0xIn0.eyJleHAiOjI1MzQwMjMwMDc5OSwibmJmIjoxNzAwMDAwMDAwLCJpYXQiOjE3MDAwMDAwMDAsImlzcyI6InBheTMiLCJhdWQiOiJwYXkzLWFwaSIsInN1YiI6ImxvY2FsLWRldi1jbGllbnQiLCJzY29wZSI6Im9yZGVyczpjcmVhdGUgb3JkZXJzOnJlYWQgb3JkZXJzOnZlcmlmeSBjb2xsZWN0aW9uczpjcmVhdGUgY29sbGVjdGlvbnM6cmVhZCJ9.Oae_tIyVz6ReptbA9WE7bLmSyHsXbauNANC3JTmxmlg",
 // };
 
 async function createAndPollPayment() {

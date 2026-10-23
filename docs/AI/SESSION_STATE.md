@@ -135,12 +135,9 @@
    - 移除服务器 `192.168.31.33` 上的冗余 Nginx 前端容器 `pay3-frontend-test-1` 及 10010 端口占用；
    - 清理 `docker-compose.yml`、`docker-compose.prebuilt.yml` 及 `scripts/deploy.sh` 中的 `frontend-test` 服务块，保持服务器端 100% 纯网关运行；
    - 将所有前端接入规范更新为 Cloudflare Pages（`https://pay3-frontend-test.pages.dev`）与边缘代理路由 `/api/pay3/...`；
-   - 详尽收录 `192.168.31.33` 上的测试环境部署拓扑、端口（10030/15430）、公网隧道域名（`home-10030.002788.xyz`）；
-   - 详细记录 Polygon Amoy (Chain ID 80002) 链上双代币（USDC EIP-3009 免 Gas 归集 / USDT Polygon Meta-Tx 免 Gas 归集）合约地址与参数；
-   - 完整阐述测试代币领水方式（Cloudflare Pages 一键领水、合约 public `faucet()` 调用、管理员脚本划拨）；
-   - 详细说明两种对接鉴权模式（Cloudflare Pages 免 Token 边缘代理模式与标准 Bearer JWT 直连模式），并提供内置长期有效开发 Token；
-   - 给出完整支付业务时序图、状态机流转图、全套 REST API 规格及 Node.js / Python / cURL 实战调用示例；
-   - 提供前端收银台（`pay3-frontend-test.pages.dev`）8 大功能面板使用指南及服务器运维排错手册。
+   - 详尽公开并记录 JWT Secret 的具体物理文件路径（`/home/apps/pay3/pay3.yaml` 与 `/home/apps/pay3/.env`）、加载优先级与配置明文；
+   - 提供开箱即用、全权限（Orders + Collections 5 项权限全部涵盖）、有效期跨越数千年至 9999 年的**永不过期永久测试 Token**，并附带自主签发脚本；
+   - 详尽记录测试环境数据库局域网直连连接串（`192.168.31.33:15430` / `MyDB`）、母账号 HD 助记词与一单一地址规则、自动测试付款钱包私钥、免 Gas 归集与 Treasury 总账钱包、宽容 CORS 策略与限流规则。
 
 ---
 

@@ -21,10 +21,10 @@ PAY3_DIRECT_ENABLED = "true"
 # Set both PAY3_DIRECT_ENABLED and PAY3_EXPOSE_TEST_JWT to false for the
 # normal non-direct test deployment posture.
 PAY3_EXPOSE_TEST_JWT = "true"
-PAY3_TEST_JWT_EXPIRES_AT = "2027-10-17T13:10:27Z"
+PAY3_TEST_JWT_EXPIRES_AT = "9999-12-31T23:59:59Z"
 
-# Signed with .env.test development JWT settings:
+# Permanent test JWT with all 5 scopes (orders + collections), expires in year 9999:
 # iss=pay3, aud=pay3-api, kid=pay3-dev-key-1,
 # secret=dev-dry-run-jwt-secret-000000000000666
-# scopes=orders:create orders:read orders:verify
-PAY3_TEST_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InBheTMtZGV2LWtleS0xIn0.eyJleHAiOjE4MjM3NDk4MjcsIm5iZiI6MTc5MjIxMzc2NywiaWF0IjoxNzkyMjEzODI3LCJpc3MiOiJwYXkzIiwiYXVkIjoicGF5My1hcGkiLCJzdWIiOiJmcm9udGVuZC10ZXN0Iiwic2NvcGUiOiJvcmRlcnM6Y3JlYXRlIG9yZGVyczpyZWFkIG9yZGVyczp2ZXJpZnkifQ.ukB5St4XmRDYdvumtUjjnr0kIhPg1haYVJWxjWTeyDc"
+# scopes=orders:create orders:read orders:verify collections:create collections:read
+PAY3_TEST_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6InBheTMtZGV2LWtleS0xIn0.eyJleHAiOjI1MzQwMjMwMDc5OSwibmJmIjoxNzAwMDAwMDAwLCJpYXQiOjE3MDAwMDAwMDAsImlzcyI6InBheTMiLCJhdWQiOiJwYXkzLWFwaSIsInN1YiI6ImxvY2FsLWRldi1jbGllbnQiLCJzY29wZSI6Im9yZGVyczpjcmVhdGUgb3JkZXJzOnJlYWQgb3JkZXJzOnZlcmlmeSBjb2xsZWN0aW9uczpjcmVhdGUgY29sbGVjdGlvbnM6cmVhZCJ9.Oae_tIyVz6ReptbA9WE7bLmSyHsXbauNANC3JTmxmlg"
