@@ -1,13 +1,13 @@
 # Pay3 当前会话状态 (Session State)
 
-更新时间：2026-10-04
+更新时间：2026-10-23
 
 ---
 
 ## 1. 当前上下文
 
-- **当前 Goal**: 生产级自动化部署、Signer 独立与一体化极简部署
-- **当前 Task**: [TASK-035: 支持 Signer 独立部署与 Pay3 + Signer 一体化极简部署](file:///ssd0/git/pay3/docs/AI/tasks/TASK-035.md)
+- **当前 Goal**: 测试环境建设、多代币真实链部署与全流程外部项目对接文档
+- **当前 Task**: 编写 Polygon Amoy 测试币支付网关与前端测试台对接指南
 - **当前状态**: `DONE`
 
 ---
@@ -130,6 +130,14 @@
    - 修复 `tests/anvil_e2e.rs` 中 `CollectionCollectorConfig` 缺失 `with_chain` 的问题；
    - 扩展 `tests/support/anvil.rs` 中的 `send_native_transfer` 辅助工具；
    - 创建 `docs/AI/SKILL.md` 知识与集成指南。
+8. **完成 Polygon Amoy 测试网支付环境与前端收银台对接文档编写**:
+   - 创建 [docs/deployment/test/README.md](file:///ssd0/git/pay3/docs/deployment/test/README.md)；
+   - 详尽收录 `192.168.31.33` 上的测试环境部署拓扑、端口（10030/10010/15430）、公网隧道域名（`home-10030.002788.xyz` / `home-10010.002788.xyz`）；
+   - 详细记录 Polygon Amoy (Chain ID 80002) 链上双代币（USDC EIP-3009 免 Gas 归集 / USDT Polygon Meta-Tx 免 Gas 归集）合约地址与参数；
+   - 完整阐述测试代币领水方式（前端一键领水、合约 public `faucet()` 调用、管理员脚本划拨）；
+   - 详细说明两种对接鉴权模式（免 Token 的 Nginx 反向代理模式与标准 Bearer JWT 直连模式），并提供内置长期有效开发 Token；
+   - 给出完整支付业务时序图、状态机流转图、全套 REST API 规格及 Node.js / Python / cURL 实战调用示例；
+   - 提供前端收银台（`frontend-test`）8 大功能面板使用指南及服务器运维排错手册。
 
 ---
 
@@ -143,6 +151,7 @@
 - `deploy/tokens_amoy.env`
 - `deploy/tokens_amoy.json`
 - `docs/AI/SKILL.md`
+- `docs/deployment/test/README.md`
 - `examples/pay3.polygon-usdt.yaml`
 - `frontend-test/nginx.conf`
 - `pay3.yaml`
